@@ -60,6 +60,9 @@ language version revisions.
 
 ## Language
 
+See [reference fields in structs](docs/struct_reference_fields.md) for APIs that
+access existing state through named aliases.
+
 ### Core language
 
 Some of the main ideas behind the language are listed here, where applicable with a comparison to the status-quo in

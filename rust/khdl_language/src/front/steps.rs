@@ -285,7 +285,7 @@ impl TargetSteps<TargetStep> {
                         let field_index = ty_info.field_index(refs, curr_ty.span, Spanned::new(step_span, *field))?;
 
                         let step_ir = IrTargetStep::Scalar(IrTargetStepScalar::StructField(field_index));
-                        let field_ty = ty_info.fields[field_index].1.inner.clone();
+                        let field_ty = ty_info.fields[field_index].ty.inner.clone();
                         (Ok(step_ir), field_ty)
                     }
                 },
