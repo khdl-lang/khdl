@@ -1011,7 +1011,7 @@ impl CompileItemContext<'_, '_> {
                         fields_eval.insert(id_eval.inner, ElaboratedStructField { id: id_eval, ty, ref_ });
                     }
                     StructBodyItem::Method(method) => match method.params.slf.inner {
-                        ParameterSelfKind::Slf => {
+                        ParameterSelfKind::Slf | ParameterSelfKind::RefSlf => {
                             let id = match method.id {
                                 MaybeIdentifier::Dummy { .. } => return Ok(()),
                                 MaybeIdentifier::Identifier(id) => id,
@@ -1150,6 +1150,13 @@ impl CompileItemContext<'_, '_> {
                     variants_eval.insert(id.inner, variant_info);
                 }
                 EnumBodyItem::Method(method) => {
+                    if matches!(method.params.slf.inner, ParameterSelfKind::RefSlf) {
+                        return Err(diags.report_error_simple(
+                            "reference receivers are only supported on struct methods",
+                            method.params.slf.span,
+                            "enum reference receivers are not supported yet",
+                        ));
+                    }
                     let id = match method.id {
                         MaybeIdentifier::Dummy { .. } => return Ok(()),
                         MaybeIdentifier::Identifier(id) => id,
@@ -1247,7 +1254,10 @@ fn collect_static_members_from_body(
                                 Err(diags.report_error_internal(span, "unexpected member named value kind"))
                             }
                         },
-                        ScopedEntry::Item(_) | ScopedEntry::Captured(_) | ScopedEntry::Value(_) => {
+                        ScopedEntry::Item(_)
+                        | ScopedEntry::Captured(_)
+                        | ScopedEntry::Value(_)
+                        | ScopedEntry::Alias(_) => {
                             Err(diags.report_error_internal(span, "unexpected member scoped entry kind"))
                         }
                     }
