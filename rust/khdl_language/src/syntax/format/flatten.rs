@@ -512,6 +512,7 @@ impl Context<'_> {
         let first = slf.as_parameter_self().map(|slf| {
             let node = match slf.inner {
                 ParameterSelfKind::Slf => token(TT::Slf),
+                ParameterSelfKind::RefSlf => HNode::Sequence(vec![token(TT::Ref), HNode::Space, token(TT::Slf)]),
             };
             (slf.span, HNodeAndComma { node, comma: true })
         });

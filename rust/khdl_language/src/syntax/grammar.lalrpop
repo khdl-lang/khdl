@@ -501,6 +501,7 @@ ParametersSelf: Parameters<ParameterSelf> = {
 ParameterSelf = Spanned<ParameterSelfKind>;
 ParameterSelfKind: ParameterSelfKind = {
     "self" => ParameterSelfKind::Slf,
+    "ref" "self" => ParameterSelfKind::RefSlf,
 }
 
 Parameter: Parameter = {

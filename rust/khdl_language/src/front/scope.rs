@@ -3,7 +3,7 @@ use crate::front::diagnostic::{DiagError, DiagResult, DiagnosticError, Diagnosti
 use crate::front::expression::LeftInterfaceInfo;
 use crate::front::flow::{Flow, Variable};
 use crate::front::signal::Signal;
-use crate::front::value::{CompileValue, Value};
+use crate::front::value::{CompileValue, ReferenceWrapper, Value};
 use crate::syntax::ast::MaybeIdentifier;
 use crate::syntax::parsed::AstRefItem;
 use crate::syntax::pos::{HasSpan, Span, Spanned};
@@ -60,6 +60,8 @@ pub enum ScopedEntry {
     Captured(CapturedValue),
     /// Simple value.
     Value(Value),
+    /// A receiver alias, retaining target identity when the scope is captured.
+    Alias(ReferenceWrapper),
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +362,7 @@ impl<'p> Scope<'p> {
                                 value: cap.value.clone(),
                             })),
                             ScopedEntry::Value(v) => Ok(ScopedEntry::Value(v.clone())),
+                            ScopedEntry::Alias(rf) => Ok(ScopedEntry::Alias(rf.clone())),
                         };
 
                         DeclaredValue::Once {
