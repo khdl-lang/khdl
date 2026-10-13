@@ -15,6 +15,7 @@ use crate::front::value::{
 };
 use crate::mid::ir::{IrExpression, IrExpressionLarge, IrLargeArena, IrSignals, IrVariables};
 use crate::mid::steps::{InvalidScalarAfterSlice, IrTargetStep, IrTargetStepScalar, IrTargetStepSlice, IrTargetSteps};
+use crate::syntax::ast::ParameterSelfKind;
 use crate::syntax::pos::{HasSpan, Span, Spanned};
 use crate::util::ResultExt;
 use crate::util::big_int::{BigInt, BigUint};
@@ -883,6 +884,13 @@ fn eval_dot_index_id(
 
         // try method
         if let Some(method) = info.methods_self.get(&index.inner) {
+            if matches!(method.func_decl.params.slf.inner, ParameterSelfKind::RefSlf) {
+                return Err(diags.report_error_simple(
+                    "reference method receiver must be a mutable whole variable",
+                    base.span,
+                    "this expression provides a value rather than a receiver target",
+                ));
+            }
             let bound = BoundMethod {
                 self_type: base_ty,
                 self_value: Box::new(base.inner.into_value()),
@@ -926,6 +934,13 @@ fn eval_dot_index_id(
 
         // try method
         if let Some(method) = info.methods_self.get(&index.inner) {
+            if matches!(method.func_decl.params.slf.inner, ParameterSelfKind::RefSlf) {
+                return Err(diags.report_error_simple(
+                    "reference method receiver must be a mutable whole variable",
+                    base.span,
+                    "this expression provides a value rather than a receiver target",
+                ));
+            }
             let bound = BoundMethod {
                 self_type: base_ty,
                 self_value: Box::new(base.inner.into_value()),

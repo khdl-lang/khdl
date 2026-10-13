@@ -66,7 +66,7 @@ impl CompileItemContext<'_, '_> {
         let id = self.eval_id(scope, flow, id)?;
 
         // eval named
-        let named = self.eval_scoped_as_named(scope, id)?;
+        let named = self.eval_scoped_as_named(scope, flow, id)?;
 
         // get type
         let ty = match named {

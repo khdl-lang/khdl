@@ -25,7 +25,8 @@ use crate::mid::ir::{
 };
 use crate::syntax::ast::{
     Arg, ArrayComprehension, ArrayLiteralElement, BinaryOp, BlockExpression, DomainKind, DotIndexKind, Expression,
-    ExpressionKind, Identifier, IntLiteral, MaybeIdentifier, RangeLiteral, SimpleIdentifier, SyncDomain, UnaryOp,
+    ExpressionKind, Identifier, IntLiteral, MaybeIdentifier, ParameterSelfKind, RangeLiteral, SimpleIdentifier,
+    SyncDomain, UnaryOp,
 };
 use crate::syntax::pos::{HasSpan, Span, Spanned};
 use crate::util::big_int::{AnyInt, BigInt, BigUint, IsZero};
@@ -163,12 +164,13 @@ impl<'a> CompileItemContext<'a, '_> {
     pub fn eval_scoped_as_lr(
         &mut self,
         scope: &Scope,
+        flow: &mut impl Flow,
         key: impl Into<ScopeKey<Spanned<Id>, Span>>,
     ) -> DiagResult<LrValue> {
         let key = key.into();
         let key_span = key.span();
 
-        let named = self.eval_scoped_as_named(scope, key)?;
+        let named = self.eval_scoped_as_named(scope, flow, key)?;
         let result = match named {
             NamedOrValue::Named(named_inner) => LrValue::from_named(key_span, named_inner),
             NamedOrValue::Value(value) => LrValue::Right(ValueWithImplications::simple(value)),
@@ -179,6 +181,7 @@ impl<'a> CompileItemContext<'a, '_> {
     pub fn eval_scoped_as_named(
         &mut self,
         scope: &Scope,
+        flow: &mut impl Flow,
         key: impl Into<ScopeKey<Spanned<Id>, Span>>,
     ) -> DiagResult<NamedOrValue> {
         let refs = self.refs;
@@ -204,6 +207,21 @@ impl<'a> CompileItemContext<'a, '_> {
                 }
             }
             ScopedEntry::Value(value) => NamedOrValue::Value(value),
+            ScopedEntry::Alias(rf) => {
+                let target = self.deref_value(
+                    flow,
+                    key_span,
+                    key_span,
+                    Spanned::new(key_span, Value::Simple(SimpleCompileValue::Reference(rf))),
+                )?;
+                match target {
+                    LrValue::LeftTarget(target) => match target.base.inner {
+                        SignalOrVariable::Variable(var) => NamedOrValue::Named(NamedValue::Variable(var)),
+                        _ => return Err(diags.report_error_internal(key_span, "receiver alias is not a variable")),
+                    },
+                    _ => return Err(diags.report_error_internal(key_span, "receiver alias is not a target")),
+                }
+            }
         };
         Ok(result)
     }
@@ -289,7 +307,7 @@ impl<'a> CompileItemContext<'a, '_> {
                 LrValue::Right(ValueWithImplications::simple(Value::Hardware(result)))
             }
             ExpressionKind::Type => LrValue::Right(Value::new_ty(Type::Type)),
-            ExpressionKind::Slf => self.eval_scoped_as_lr(scope, ScopeKey::Slf(expr.span))?,
+            ExpressionKind::Slf => self.eval_scoped_as_lr(scope, flow, ScopeKey::Slf(expr.span))?,
             &ExpressionKind::Builtin { span_keyword, ref args } => {
                 let result = self.eval_builtin(scope, flow, expr.span, span_keyword, args)?;
                 LrValue::Right(ValueWithImplications::simple(result))
@@ -317,7 +335,7 @@ impl<'a> CompileItemContext<'a, '_> {
             }
             &ExpressionKind::Id(id) => {
                 let id = self.eval_id(scope, flow, id)?;
-                self.eval_scoped_as_lr(scope, id)?
+                self.eval_scoped_as_lr(scope, flow, id)?
             }
             ExpressionKind::IntLiteral(pattern) => {
                 let parsed = match *pattern {
@@ -725,14 +743,8 @@ impl<'a> CompileItemContext<'a, '_> {
                             }
                             SignalOrVariable::Variable(var) => {
                                 match &flow.var_info(Spanned::new(target.base.span, var))?.ty {
-                                    Some(ty) => Some(ty.inner.clone()),
-                                    None => Some(
-                                        flow.var_eval_without_copy(
-                                            &mut self.large,
-                                            Spanned::new(target.base.span, var),
-                                        )?
-                                        .ty(),
-                                    ),
+                                    Some(ty) if ty.inner != Type::Any => Some(ty.inner.clone()),
+                                    _ => Some(flow.type_of(self, target.base)?),
                                 }
                             }
                         };
@@ -742,59 +754,123 @@ impl<'a> CompileItemContext<'a, '_> {
                     LrValue::Right(value) => Some(value.ty()),
                     LrValue::LeftInterface(_) => None,
                 };
-                let is_ref_field = match (&base_ty, &index) {
+                // Preserve the receiver's place until its type selects the method mode.
+                // Inferred types can be inspected without reading/copying the receiver.
+                let ref_method = match (&base_ty, &index) {
                     (Some(Type::Struct(elab)), Either::Left(index)) => refs
                         .shared
                         .elaboration_arenas
                         .struct_info(*elab)
-                        .fields
+                        .methods_self
                         .get(index)
-                        .is_some_and(|field| field.ref_.is_some()),
-                    _ => false,
+                        .filter(|method| matches!(method.func_decl.params.slf.inner, ParameterSelfKind::RefSlf))
+                        .map(|method| (*elab, Arc::clone(method))),
+                    _ => None,
                 };
-                if is_ref_field {
-                    let mut steps = TargetSteps::single(index_to_step(index));
-                    let binding = match base {
-                        LrValue::LeftTarget(mut target) => {
-                            target.steps.steps.append(&mut steps.steps);
-                            flow.signal_or_var_eval(self, target.base, &target.steps)?
+                if let Some((elab, method)) = ref_method {
+                    let target = match base {
+                        LrValue::LeftTarget(target) => target,
+                        _ => {
+                            return Err(diags.report_error_simple(
+                                "reference method receiver must be a mutable whole variable",
+                                base_span,
+                                "temporary values have no supported receiver target",
+                            ));
                         }
-                        LrValue::Right(value) => {
-                            steps.apply_to_value(self, &Type::Any, Spanned::new(base_span, value))?
-                        }
-                        LrValue::LeftInterface(_) => unreachable!(),
                     };
-                    self.deref_value(
-                        flow,
-                        expr.span,
-                        index_span,
-                        Spanned::new(expr.span, binding.into_value()),
-                    )?
+                    if !target.steps.is_empty() {
+                        return Err(diags.report_error_simple(
+                            "reference method receivers with target steps are not supported yet",
+                            base_span,
+                            "use a mutable whole variable instead of a field or indexed element",
+                        ));
+                    }
+                    let var = match target.base.inner {
+                        SignalOrVariable::Variable(var) => var,
+                        _ => {
+                            return Err(diags.report_error_simple(
+                                "reference method receiver must be a mutable whole variable",
+                                base_span,
+                                "signal and port receivers are not supported yet",
+                            ));
+                        }
+                    };
+                    let var_info = flow.var_info(Spanned::new(base_span, var))?;
+                    let ty = var_info.ty.as_ref().map_or(Type::Any, |ty| ty.inner.clone());
+                    let rf = ReferenceWrapper::new_variable(
+                        flow.root_id(),
+                        var,
+                        Arc::new(ty),
+                        var_info.span_decl,
+                        base_span,
+                    );
+                    self.check_reference_receiver(flow, base_span, &rf, &Type::Struct(elab))?;
+                    LrValue::Right(ValueWithImplications::simple(Value::Compound(
+                        MixedCompoundValue::BoundMethod(BoundMethod {
+                            self_type: Type::Struct(elab),
+                            self_value: Box::new(Value::Simple(SimpleCompileValue::Reference(rf))),
+                            method,
+                        }),
+                    )))
                 } else {
-                    match base {
-                        LrValue::LeftTarget(base) => {
-                            let mut result = base;
-                            result.steps.push(index_to_step(index));
-                            LrValue::LeftTarget(result)
-                        }
-                        LrValue::LeftInterface(base) => {
-                            let index = index.left().ok_or_else(|| {
-                                DiagnosticError::new(
-                                    "cannot tuple index into interface",
-                                    expr.span,
-                                    "trying to tuple index here",
-                                )
-                                .add_info(base_span, "base evaluates to an interface")
-                                .add_info(base.span_decl(self), "interface declared here")
-                                .report(diags)
-                            })?;
+                    let is_ref_field = match (&base_ty, &index) {
+                        (Some(Type::Struct(elab)), Either::Left(index)) => refs
+                            .shared
+                            .elaboration_arenas
+                            .struct_info(*elab)
+                            .fields
+                            .get(index)
+                            .is_some_and(|field| field.ref_.is_some()),
+                        _ => false,
+                    };
+                    if is_ref_field {
+                        let mut steps = TargetSteps::single(index_to_step(index));
+                        let binding = match base {
+                            LrValue::LeftTarget(mut target) => {
+                                target.steps.steps.append(&mut steps.steps);
+                                flow.signal_or_var_eval(self, target.base, &target.steps)?
+                            }
+                            LrValue::Right(value) => {
+                                steps.apply_to_value(self, &Type::Any, Spanned::new(base_span, value))?
+                            }
+                            LrValue::LeftInterface(_) => unreachable!(),
+                        };
+                        self.deref_value(
+                            flow,
+                            expr.span,
+                            index_span,
+                            Spanned::new(expr.span, binding.into_value()),
+                        )?
+                    } else {
+                        match base {
+                            LrValue::LeftTarget(base) => {
+                                let mut result = base;
+                                result.steps.push(index_to_step(index));
+                                LrValue::LeftTarget(result)
+                            }
+                            LrValue::LeftInterface(base) => {
+                                let index = index.left().ok_or_else(|| {
+                                    DiagnosticError::new(
+                                        "cannot tuple index into interface",
+                                        expr.span,
+                                        "trying to tuple index here",
+                                    )
+                                    .add_info(base_span, "base evaluates to an interface")
+                                    .add_info(base.span_decl(self), "interface declared here")
+                                    .report(diags)
+                                })?;
 
-                            let signal = base.get_signal(self, base_span, Spanned::new(index_span, index))?;
-                            LrValue::LeftTarget(AssignmentTarget::simple(Spanned::new(expr.span, signal.into())))
-                        }
-                        LrValue::Right(base) => {
-                            let steps = TargetSteps::new(vec![index_to_step(index)]);
-                            LrValue::Right(steps.apply_to_value(self, expected_ty, Spanned::new(base_span, base))?)
+                                let signal = base.get_signal(self, base_span, Spanned::new(index_span, index))?;
+                                LrValue::LeftTarget(AssignmentTarget::simple(Spanned::new(expr.span, signal.into())))
+                            }
+                            LrValue::Right(base) => {
+                                let steps = TargetSteps::new(vec![index_to_step(index)]);
+                                LrValue::Right(steps.apply_to_value(
+                                    self,
+                                    expected_ty,
+                                    Spanned::new(base_span, base),
+                                )?)
+                            }
                         }
                     }
                 }
@@ -1015,6 +1091,55 @@ impl<'a> CompileItemContext<'a, '_> {
                 return Err(diag);
             }
         })
+    }
+
+    pub(super) fn check_reference_receiver(
+        &mut self,
+        flow: &mut impl Flow,
+        span: Span,
+        rf: &ReferenceWrapper,
+        expected_ty: &Type,
+    ) -> DiagResult {
+        let target = self
+            .deref_value(
+                flow,
+                span,
+                span,
+                Spanned::new(span, Value::Simple(SimpleCompileValue::Reference(rf.clone()))),
+            )?
+            .into_target(self, span)?;
+        let var = match target.base.inner {
+            SignalOrVariable::Variable(var) => var,
+            _ => {
+                return Err(self
+                    .refs
+                    .diags
+                    .report_error_internal(span, "reference method receiver is not a variable"));
+            }
+        };
+        let info = flow.var_info(Spanned::new(span, var))?;
+        if !info.mutable {
+            return Err(DiagnosticError::new(
+                "reference method receiver must be mutable",
+                span,
+                "cannot borrow an immutable variable as ref self",
+            )
+            .add_info(info.span_decl, "immutable variable declared here")
+            .report(self.refs.diags));
+        }
+        let actual_ty = flow.type_of(self, target.base)?;
+        if &actual_ty != expected_ty {
+            return Err(self.refs.diags.report_error_simple(
+                "reference method receiver type changed",
+                span,
+                format!(
+                    "expected `{}`, found `{}`",
+                    expected_ty.value_string(self.refs),
+                    actual_ty.value_string(self.refs)
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub fn eval_call(
@@ -1364,7 +1489,9 @@ impl<'a> CompileItemContext<'a, '_> {
             }
             ExpressionKind::Id(id) => {
                 let id = self.eval_id(scope, flow, id).map_err(Either::Right)?;
-                let named = self.eval_scoped_as_named(scope, id).map_err(|e| Either::Right(e))?;
+                let named = self
+                    .eval_scoped_as_named(scope, flow, id)
+                    .map_err(|e| Either::Right(e))?;
 
                 match named {
                     NamedOrValue::Value(_) => Err(build_err("a value")),

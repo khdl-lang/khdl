@@ -201,7 +201,7 @@ pub type ParameterSelf = Spanned<ParameterSelfKind>;
 #[derive(Debug, Copy, Clone)]
 pub enum ParameterSelfKind {
     Slf,
-    // RefSlf
+    RefSlf,
 }
 
 #[derive(Debug, Clone)]

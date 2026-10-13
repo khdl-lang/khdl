@@ -62,6 +62,8 @@ language version revisions.
 
 See [reference fields in structs](docs/struct_reference_fields.md) for APIs that
 access existing state through named aliases.
+[Reference method receivers](docs/reference_method_receivers.md) allow methods
+to mutate ordinary fields in a caller-owned variable.
 
 ### Core language
 

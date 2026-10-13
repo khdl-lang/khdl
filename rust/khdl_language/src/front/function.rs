@@ -13,12 +13,13 @@ use crate::front::scope::{FrozenScope, NamedValue, Scope, ScopeKey, ScopedEntry}
 use crate::front::types::{HardwareType, Type};
 use crate::front::value::{
     BoundMethod, CompileValue, EnumValue, HardwareValue, MaybeCompile, MethodInfo, MixedCompoundValue, NotCompile,
-    SimpleCompileValue, StructValue, Value, ValueCommon,
+    ReferenceWrapper, SimpleCompileValue, StructValue, Value, ValueCommon,
 };
 use crate::mid::bits::{FromBitsInvalidValue, FromBitsWrongLength, ToBitsWrongType};
 use crate::mid::ir::{IrExpressionLarge, IrLargeArena};
 use crate::syntax::ast::{
-    Arg, Block, BlockStatement, Expression, ExtraList, FunctionDeclaration, MaybeIdentifier, Parameter, Parameters,
+    Arg, Block, BlockStatement, Expression, ExtraList, FunctionDeclaration, MaybeIdentifier, Parameter,
+    ParameterSelfKind, Parameters,
 };
 use crate::syntax::pos::{HasSpan, Span, Spanned};
 use crate::util::ResultDoubleExt;
@@ -29,6 +30,12 @@ use indexmap::map::Entry;
 use itertools::{Either, Itertools, enumerate};
 use std::hash::Hash;
 use std::sync::Arc;
+
+/// How the selected method binds self inside its body.
+enum MethodSelf {
+    Value(Value),
+    Reference(ReferenceWrapper),
+}
 
 #[derive(Debug, Clone)]
 pub enum FunctionValue {
@@ -437,7 +444,7 @@ impl CompileItemContext<'_, '_> {
     ) -> DiagResult<Value> {
         // TODO propagate self type too
         let BoundMethod {
-            self_type: _,
+            self_type,
             self_value,
             method,
         } = method;
@@ -459,7 +466,20 @@ impl CompileItemContext<'_, '_> {
             items: param_items,
         } = params;
 
-        let self_value = Spanned::new(self_param.span, self_value.as_ref().clone());
+        let self_value = match self_param.inner {
+            ParameterSelfKind::Slf => MethodSelf::Value(self_value.as_ref().clone()),
+            ParameterSelfKind::RefSlf => {
+                let Value::Simple(SimpleCompileValue::Reference(rf)) = self_value.as_ref() else {
+                    return Err(self
+                        .refs
+                        .diags
+                        .report_error_internal(span_call, "reference receiver binding is not a reference"));
+                };
+                self.check_reference_receiver(flow, span_call, rf, self_type)?;
+                MethodSelf::Reference(rf.clone())
+            }
+        };
+        let self_value = Spanned::new(self_param.span, self_value);
         let func_body = FunctionBody::FunctionBodyBlockRef { body, ret_ty };
 
         self.call_user_function(
@@ -557,7 +577,7 @@ impl CompileItemContext<'_, '_> {
         body: &Spanned<FunctionBody>,
         // args
         span_call: Span,
-        arg_self: Option<Spanned<Value>>,
+        arg_self: Option<Spanned<MethodSelf>>,
         args: EvaluatedArgs,
     ) -> DiagResult<Value> {
         let entry = StackEntry::FunctionCall(span_call);
@@ -576,7 +596,7 @@ impl CompileItemContext<'_, '_> {
         params: &ExtraList<Parameter>,
         body: &Spanned<FunctionBody>,
         // args
-        arg_self: Option<Spanned<Value>>,
+        arg_self: Option<Spanned<MethodSelf>>,
         args: EvaluatedArgs,
     ) -> DiagResult<Value> {
         self.refs.check_should_stop(span_decl)?;
@@ -593,7 +613,10 @@ impl CompileItemContext<'_, '_> {
             scope.declare(
                 self.refs,
                 ScopeKey::Slf(arg_self.span),
-                Ok(ScopedEntry::Value(arg_self.inner)),
+                Ok(match arg_self.inner {
+                    MethodSelf::Value(value) => ScopedEntry::Value(value),
+                    MethodSelf::Reference(rf) => ScopedEntry::Alias(rf),
+                }),
             );
         }
 

@@ -361,3 +361,11 @@ fn struct_reference_fields() {
         "struct S(T: type) {\n    ref value: T,\n    ref channel: Link(T),\n    ordinary: Ref(T),\n}\n",
     );
 }
+
+#[test]
+fn reference_self() {
+    assert_formats_to(
+        "struct S { fn change(ref self, value: bool) { self.value = value; } }",
+        "struct S {\n    fn change(ref self, value: bool) {\n        self.value = value;\n    }\n}\n",
+    );
+}

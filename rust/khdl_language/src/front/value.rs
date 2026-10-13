@@ -271,6 +271,8 @@ pub struct EnumValue<V> {
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct BoundMethod<V> {
     pub self_type: Type,
+    /// A value for Slf, or a ReferenceWrapper value for RefSlf.
+    /// The declared receiver mode is retained in method.func_decl.params.slf.
     pub self_value: Box<V>,
     pub method: Arc<MethodInfo>,
 }
