@@ -241,11 +241,20 @@ pub struct ElaboratedStructInfo {
     pub debug_info_name: String,
     pub span_body: Span,
 
-    pub fields: IndexMap<Id, (Spanned<Id>, Spanned<Type>)>,
+    pub fields: IndexMap<Id, ElaboratedStructField>,
     pub hw: Result<HardwareStructInfo, NonHardwareStruct>,
 
     pub members_static: IndexMap<Id, DiagResult<CompileValue>>,
     pub methods_self: IndexMap<Id, Arc<MethodInfo>>,
+}
+
+#[derive(Debug)]
+pub struct ElaboratedStructField {
+    pub id: Spanned<Id>,
+    /// The constructor/storage type, including the reference wrapper.
+    pub ty: Spanned<Type>,
+    /// Reference fields project to their target; ordinary reference-valued fields do not.
+    pub ref_: Option<Span>,
 }
 
 #[derive(Debug)]
@@ -948,7 +957,7 @@ impl CompileItemContext<'_, '_> {
         let scope_params_captured = Arc::new(scope_params.capture(flow, span_body));
 
         // elaborate extra list containing fields and members
-        let mut fields_eval: IndexMap<Id, (Spanned<Id>, Spanned<Type>)> = IndexMap::new();
+        let mut fields_eval: IndexMap<Id, ElaboratedStructField> = IndexMap::new();
         let mut methods_self: IndexMap<Id, Arc<MethodInfo>> = IndexMap::new();
         let mut any_item_err = Ok(());
 
@@ -961,12 +970,38 @@ impl CompileItemContext<'_, '_> {
             |s: &mut Self, scope: &mut ExtraScope, flow: &mut FlowCompile, item: &'a StructBodyItem| {
                 match item {
                     StructBodyItem::Field(field) => {
-                        let &StructField { span: _, id, ty } = field;
+                        let &StructField { span: _, ref_, id, ty } = field;
 
                         let id_eval = s.eval_id(scope.as_scope(), flow, id)?;
-                        let ty = s.eval_expression_as_ty(scope.as_scope(), flow, ty)?;
+                        let ty = if let Some(span_ref) = ref_ {
+                            let value = s.eval_expression_as_compile(
+                                scope.as_scope(),
+                                flow,
+                                &Type::Any,
+                                ty,
+                                Spanned::new(span_ref, "reference field annotation"),
+                            )?;
+                            let stored_ty = match value.inner {
+                                CompileValue::Simple(SimpleCompileValue::Type(ty)) => Type::Ref(Arc::new(ty)),
+                                CompileValue::Simple(SimpleCompileValue::Interface(intf)) => {
+                                    Type::RefInterface(vec![], intf)
+                                }
+                                _ => {
+                                    return Err(DiagnosticError::new(
+                                        "reference field annotation must be a type or interface",
+                                        value.span,
+                                        "interface views and other values are not supported here",
+                                    )
+                                    .report(diags));
+                                }
+                            };
+                            Spanned::new(value.span, stored_ty)
+                        } else {
+                            s.eval_expression_as_ty(scope.as_scope(), flow, ty)?
+                        };
 
-                        if let Some(&(prev_id, _)) = fields_eval.get(&id_eval.inner) {
+                        if let Some(prev) = fields_eval.get(&id_eval.inner) {
+                            let prev_id = prev.id;
                             err_member_duplicate(prev_id.span(), "field", id_eval.span(), "field");
                             return Ok(());
                         }
@@ -975,7 +1010,7 @@ impl CompileItemContext<'_, '_> {
                             return Ok(());
                         }
 
-                        fields_eval.insert(id_eval.inner, (id_eval, ty));
+                        fields_eval.insert(id_eval.inner, ElaboratedStructField { id: id_eval, ty, ref_ });
                     }
                     StructBodyItem::Method(method) => match method.params.slf.inner {
                         ParameterSelfKind::Slf => {
@@ -985,7 +1020,8 @@ impl CompileItemContext<'_, '_> {
                             };
                             let id_eval = s.eval_id(scope.as_scope(), flow, id)?.inner;
 
-                            if let Some(&(prev_id, _)) = fields_eval.get(&id_eval) {
+                            if let Some(prev) = fields_eval.get(&id_eval) {
+                                let prev_id = prev.id;
                                 err_member_duplicate(prev_id.span(), "field", id.span(), "method");
                                 return Ok(());
                             }
@@ -1011,8 +1047,8 @@ impl CompileItemContext<'_, '_> {
         any_item_err?;
 
         let members_static = collect_static_members_from_body(self.refs, &scope, flow, "struct", |name| {
-            if let Some(&(prev_id, _)) = fields_eval.get(&name) {
-                Some((prev_id.span(), "field"))
+            if let Some(prev) = fields_eval.get(&name) {
+                Some((prev.id.span(), "field"))
             } else if let Some(prev_info) = methods_self.get(&name) {
                 Some((prev_info.func_decl.id.span(), "method"))
             } else {
@@ -1027,8 +1063,8 @@ impl CompileItemContext<'_, '_> {
         let fields_hw = fields_eval
             .iter()
             .enumerate()
-            .map(|(i, (_, (_, ty)))| {
-                ty.inner.as_hardware_type(elab).map_err(|_| NonHardwareStruct {
+            .map(|(i, (_, field))| {
+                field.ty.inner.as_hardware_type(elab).map_err(|_| NonHardwareStruct {
                     first_non_hardware_field: i,
                 })
             })

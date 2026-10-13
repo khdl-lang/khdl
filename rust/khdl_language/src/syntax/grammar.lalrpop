@@ -196,8 +196,8 @@ EnumMemberFunction: EnumBodyItem = {
 }
 
 StructField: StructBodyItem = {
-    <start:@L> <id:Id> ":" <ty:Expr> <end:@R>
-        => StructBodyItem::Field(StructField { id, ty, span: ctx.span(start, end) }),
+    <start:@L> <ref_:Span<"ref">?> <id:Id> ":" <ty:Expr> <end:@R>
+        => StructBodyItem::Field(StructField { id, ty, ref_, span: ctx.span(start, end) }),
 }
 StructMemberFunction: StructBodyItem = {
     FunctionDeclarationSelf => StructBodyItem::Method(<>),

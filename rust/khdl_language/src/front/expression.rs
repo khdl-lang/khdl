@@ -841,41 +841,102 @@ impl<'a> CompileItemContext<'a, '_> {
                     }
                 };
 
-                match base {
-                    LrValue::LeftTarget(base) => {
-                        let mut result = base;
-                        result.steps.push(index_to_step(index));
-                        LrValue::LeftTarget(result)
+                let base_ty = match &base {
+                    LrValue::LeftTarget(target) => {
+                        let ty = match target.base.inner {
+                            SignalOrVariable::Signal(signal) => {
+                                Some(signal.expect_ty(self, target.base.span)?.inner.as_type())
+                            }
+                            SignalOrVariable::Variable(var) => {
+                                match &flow.var_info(Spanned::new(target.base.span, var))?.ty {
+                                    Some(ty) => Some(ty.inner.clone()),
+                                    None => Some(
+                                        flow.var_eval_without_copy(
+                                            &mut self.large,
+                                            Spanned::new(target.base.span, var),
+                                        )?
+                                        .ty(),
+                                    ),
+                                }
+                            }
+                        };
+                        // Type-valued variables use static member lookup, not
+                        // hardware/struct projection. Do not interpret their
+                        // pending steps as fields of the metatype `type`.
+                        ty.filter(|ty| !matches!(ty, Type::Type))
+                            .map(|ty| target.steps.apply_to_expected_type(refs, Spanned::new(base_span, ty)))
+                            .transpose()?
                     }
-                    LrValue::LeftInterface(info) => {
-                        let &base = info.intf.as_single().ok_or_else(|| {
-                            DiagnosticError::new(
-                                "cannot access signal of interface array",
-                                index_span,
-                                "attempt to access signal here",
-                            )
-                            .add_info(base_span, "base evaluates to an interface array")
-                            .add_info(info.span_id, "interface array declared here")
-                            .add_footer_hint("to access individual interfaces, use array indexing: `<array>[<index>]`")
-                            .report(diags)
-                        })?;
-                        let index = index.left().ok_or_else(|| {
-                            DiagnosticError::new(
-                                "cannot tuple index into interface",
-                                expr.span,
-                                "trying to tuple index here",
-                            )
-                            .add_info(base_span, "base evaluates to an interface")
-                            .add_info(info.span_id, "interface declared here")
-                            .report(diags)
-                        })?;
+                    LrValue::Right(value) => Some(value.ty()),
+                    LrValue::LeftInterface(_) => None,
+                };
+                let is_ref_field = match (&base_ty, &index) {
+                    (Some(Type::Struct(elab)), Either::Left(index)) => refs
+                        .shared
+                        .elaboration_arenas
+                        .struct_info(*elab)
+                        .fields
+                        .get(index)
+                        .is_some_and(|field| field.ref_.is_some()),
+                    _ => false,
+                };
+                if is_ref_field {
+                    let mut steps = TargetSteps::single(index_to_step(index));
+                    let binding = match base {
+                        LrValue::LeftTarget(mut target) => {
+                            target.steps.steps.append(&mut steps.steps);
+                            flow.signal_or_var_eval(self, target.base, &target.steps)?
+                        }
+                        LrValue::Right(value) => {
+                            steps.apply_to_value(self, &Type::Any, Spanned::new(base_span, value))?
+                        }
+                        LrValue::LeftInterface(_) => unreachable!(),
+                    };
+                    self.deref_value(
+                        flow,
+                        expr.span,
+                        index_span,
+                        Spanned::new(expr.span, binding.into_value()),
+                    )?
+                } else {
+                    match base {
+                        LrValue::LeftTarget(base) => {
+                            let mut result = base;
+                            result.steps.push(index_to_step(index));
+                            LrValue::LeftTarget(result)
+                        }
+                        LrValue::LeftInterface(info) => {
+                            let &base = info.intf.as_single().ok_or_else(|| {
+                                DiagnosticError::new(
+                                    "cannot access signal of interface array",
+                                    index_span,
+                                    "attempt to access signal here",
+                                )
+                                .add_info(base_span, "base evaluates to an interface array")
+                                .add_info(info.span_id, "interface array declared here")
+                                .add_footer_hint(
+                                    "to access individual interfaces, use array indexing: `<array>[<index>]`",
+                                )
+                                .report(diags)
+                            })?;
+                            let index = index.left().ok_or_else(|| {
+                                DiagnosticError::new(
+                                    "cannot tuple index into interface",
+                                    expr.span,
+                                    "trying to tuple index here",
+                                )
+                                .add_info(base_span, "base evaluates to an interface")
+                                .add_info(info.span_id, "interface declared here")
+                                .report(diags)
+                            })?;
 
-                        let signal = base.get_signal(self, base_span, Spanned::new(index_span, index))?;
-                        LrValue::LeftTarget(AssignmentTarget::simple(Spanned::new(expr.span, signal.into())))
-                    }
-                    LrValue::Right(base) => {
-                        let steps = TargetSteps::new(vec![index_to_step(index)]);
-                        LrValue::Right(steps.apply_to_value(self, expected_ty, Spanned::new(base_span, base))?)
+                            let signal = base.get_signal(self, base_span, Spanned::new(index_span, index))?;
+                            LrValue::LeftTarget(AssignmentTarget::simple(Spanned::new(expr.span, signal.into())))
+                        }
+                        LrValue::Right(base) => {
+                            let steps = TargetSteps::new(vec![index_to_step(index)]);
+                            LrValue::Right(steps.apply_to_value(self, expected_ty, Spanned::new(base_span, base))?)
+                        }
                     }
                 }
             }
@@ -1014,45 +1075,60 @@ impl<'a> CompileItemContext<'a, '_> {
                 let reason = Spanned::new(span_keyword, "dereference operand");
                 let operand = self.eval_expression_as_compile(scope, flow, &Type::Any, operand, reason)?;
 
-                if let Value::Simple(SimpleCompileValue::Reference(rf)) = operand.inner {
-                    match rf.get(self, flow, operand.span)? {
-                        ReferenceInner::Variable { var, ty: _ } => {
-                            if !flow.var_still_exists(var) {
-                                let err = DiagnosticError::new(
-                                    "cannot access variable after its scope has ended",
-                                    span_keyword,
-                                    "trying to dereference here",
-                                )
-                                .add_info(rf.span_decl, "variable declared here")
-                                .add_info(rf.span_ref, "reference taken here")
-                                .report(diags);
-                                return Err(err);
-                            }
-                            LrValue::LeftTarget(AssignmentTarget::simple(Spanned::new(expr.span, var.into())))
-                        }
-                        ReferenceInner::Signal {
-                            signal,
-                            ty: _,
-                            ty_hw: _,
-                        } => LrValue::LeftTarget(AssignmentTarget::simple(Spanned::new(expr.span, signal.into()))),
-                        ReferenceInner::Interface(info) => LrValue::LeftInterface(info.clone()),
-                    }
-                } else {
-                    let diag = DiagnosticError::new(
-                        "cannot dereference non-reference value",
-                        span_keyword,
-                        "trying to dereference non-reference here",
-                    )
-                    .add_info(
-                        operand.span,
-                        format!("operand has type `{}`", operand.inner.ty().value_string(refs)),
-                    )
-                    .report(diags);
-                    return Err(diag);
-                }
+                self.deref_value(flow, expr.span, span_keyword, operand.map_inner(Value::from))?
             }
         };
         Ok(result)
+    }
+
+    /// Resolve a reference to its target without loading or copying the referent.
+    fn deref_value(
+        &mut self,
+        flow: &mut impl Flow,
+        span_result: Span,
+        span_deref: Span,
+        operand: Spanned<Value>,
+    ) -> DiagResult<LrValue> {
+        let refs = self.refs;
+        let diags = refs.diags;
+        Ok({
+            if let Value::Simple(SimpleCompileValue::Reference(rf)) = operand.inner {
+                match rf.get(self, flow, operand.span)? {
+                    ReferenceInner::Variable { var, ty: _ } => {
+                        if !flow.var_still_exists(var) {
+                            let err = DiagnosticError::new(
+                                "cannot access variable after its scope has ended",
+                                span_deref,
+                                "trying to dereference here",
+                            )
+                            .add_info(rf.span_decl, "variable declared here")
+                            .add_info(rf.span_ref, "reference taken here")
+                            .report(diags);
+                            return Err(err);
+                        }
+                        LrValue::LeftTarget(AssignmentTarget::simple(Spanned::new(span_result, var.into())))
+                    }
+                    ReferenceInner::Signal {
+                        signal,
+                        ty: _,
+                        ty_hw: _,
+                    } => LrValue::LeftTarget(AssignmentTarget::simple(Spanned::new(span_result, signal.into()))),
+                    ReferenceInner::Interface(info) => LrValue::LeftInterface(info.clone()),
+                }
+            } else {
+                let diag = DiagnosticError::new(
+                    "cannot dereference non-reference value",
+                    span_deref,
+                    "trying to dereference non-reference here",
+                )
+                .add_info(
+                    operand.span,
+                    format!("operand has type `{}`", operand.inner.ty().value_string(refs)),
+                )
+                .report(diags);
+                return Err(diag);
+            }
+        })
     }
 
     pub fn eval_call(
@@ -2769,7 +2845,7 @@ fn valid_type_for_eq(refs: CompileRefs, ty: &Type) -> bool {
             .struct_info(ty_struct)
             .fields
             .values()
-            .all(|(_, field_ty)| valid_type_for_eq(refs, &field_ty.inner)),
+            .all(|field| valid_type_for_eq(refs, &field.ty.inner)),
         &Type::Enum(ty_enum) => elab.enum_info(ty_enum).variants.values().all(|variant| {
             variant
                 .payload_ty

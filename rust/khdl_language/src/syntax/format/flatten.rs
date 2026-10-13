@@ -275,8 +275,13 @@ impl Context<'_> {
                         seq.push(
                             self.fmt_extra_list(SurroundKind::Curly, true, items, &|item| match item {
                                 StructBodyItem::Field(field) => {
-                                    let &StructField { span: _, id, ty } = field;
-                                    let node = HNode::Sequence(vec![self.fmt_id(id), wrapping_type(self.fmt_expr(ty))]);
+                                    let &StructField { span: _, ref_, id, ty } = field;
+                                    let mut seq = vec![];
+                                    if ref_.is_some() {
+                                        seq.extend([token(TT::Ref), HNode::Space]);
+                                    }
+                                    seq.extend([self.fmt_id(id), wrapping_type(self.fmt_expr(ty))]);
+                                    let node = HNode::Sequence(seq);
                                     HNodeAndComma { node, comma: true }
                                 }
                                 StructBodyItem::Method(method) => {

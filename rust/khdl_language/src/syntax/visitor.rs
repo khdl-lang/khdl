@@ -570,7 +570,12 @@ impl<V: SyntaxVisitor> VisitContext<'_, '_, V> {
                         self.visit_extra_list(&mut scope_params, items, &mut |slf, scope, item| {
                             match item {
                                 StructBodyItem::Field(field) => {
-                                    let &StructField { span, id: _, ty } = field;
+                                    let &StructField {
+                                        span,
+                                        ref_: _,
+                                        id: _,
+                                        ty,
+                                    } = field;
                                     slf.visitor.report_range(span, None);
                                     slf.visit_expression(scope, ty)?;
                                 }
