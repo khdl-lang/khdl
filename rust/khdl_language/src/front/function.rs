@@ -491,8 +491,8 @@ impl CompileItemContext<'_, '_> {
         let mut matcher = ParamArgMacher::new(self.refs, span_body, &args, false, NamedRule::OnlyNamed)?;
 
         let mut field_values = vec![];
-        for (_, &(field_id_spanned, ref field_ty)) in fields {
-            if let Ok(v) = matcher.resolve_param(field_id_spanned, field_ty.as_ref(), None) {
+        for field in fields.values() {
+            if let Ok(v) = matcher.resolve_param(field.id, field.ty.as_ref(), None) {
                 field_values.push(v.inner.into_value());
             }
         }

@@ -105,6 +105,7 @@ pub enum StructBodyItem {
 #[derive(Debug, Clone)]
 pub struct StructField {
     pub span: Span,
+    pub ref_: Option<Span>,
     pub id: Identifier,
     pub ty: Expression,
 }
