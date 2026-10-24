@@ -52,13 +52,14 @@ impl CompileItemContext<'_, '_> {
         f: &mut impl FnMut(&mut Self, &mut ExtraScope, &mut F, &'a T) -> DiagResult,
     ) -> DiagResult {
         let ExtraList { span: _, items } = list;
-        let mut cursor = ExtraCursor::new(items, common_decl_in_root_scope);
 
-        let mut scope_extra = ExtraScope {
+        let scope_cursor = ExtraScope {
             root_scope: None,
             scope: scope_parent,
         };
-        while let Some(()) = cursor.next(self, &mut scope_extra, flow, &mut *f)? {}
+        let mut cursor = ExtraCursor::new(scope_cursor, items, common_decl_in_root_scope);
+
+        while let Some(()) = cursor.next(self, flow, &mut *f)? {}
 
         Ok(())
     }
@@ -72,17 +73,19 @@ impl CompileItemContext<'_, '_> {
         f: &mut impl FnMut(&mut Self, &mut ExtraScope, &mut F, &'a T) -> DiagResult,
     ) -> DiagResult {
         let &ExtraListBlock { span, ref items } = block;
-        let mut cursor = ExtraCursor::new(items, common_decl_in_root_scope);
 
-        let mut scope_child = scope_parent.scope.new_child(span);
-        let mut scope_child = scope_parent.new_child(&mut scope_child);
-        while let Some(()) = cursor.next(self, &mut scope_child, flow, &mut *f)? {}
+        let mut scope_cursor = scope_parent.scope.new_child(span);
+        let scope_cursor = scope_parent.new_child(&mut scope_cursor);
+        let mut cursor = ExtraCursor::new(scope_cursor, items, common_decl_in_root_scope);
+
+        while let Some(()) = cursor.next(self, flow, &mut *f)? {}
 
         Ok(())
     }
 }
 
-pub struct ExtraCursor<'a, T> {
+pub struct ExtraCursor<'a, 's, 'p, T> {
+    root_scope: ExtraScope<'s, 'p>,
     common_decl_in_root_scope: bool,
     stack_frames: Vec<Frame<'a, T>>,
     stack_scopes: Vec<Option<ScopeContent>>,
@@ -104,25 +107,25 @@ enum FramePush<'a, T> {
     For(&'a ForStatement<ExtraListBlock<T>>, ElaboratedForHeader),
 }
 
-impl<'a, T> ExtraCursor<'a, T> {
-    pub fn new(list: &'a [ExtraListItem<T>], common_decl_in_root_scope: bool) -> Self {
+impl<'a, 's, 'p, T> ExtraCursor<'a, 's, 'p, T> {
+    pub fn new(root_scope: ExtraScope<'s, 'p>, list: &'a [ExtraListItem<T>], common_decl_in_root_scope: bool) -> Self {
         let frame = Frame::List {
             items: list.iter(),
             scopes_before: 0,
         };
         ExtraCursor {
+            root_scope,
             common_decl_in_root_scope,
             stack_frames: vec![frame],
             stack_scopes: vec![],
         }
     }
 
-    pub fn next<'c, 's, R, F: Flow>(
+    pub fn next<'c, 'h, R, F: Flow>(
         &mut self,
-        ctx: &mut CompileItemContext<'c, 's>,
-        scope_parent: &mut ExtraScope,
+        ctx: &mut CompileItemContext<'c, 'h>,
         flow: &mut F,
-        mut f: impl FnMut(&mut CompileItemContext<'c, 's>, &mut ExtraScope, &mut F, &'a T) -> DiagResult<R>,
+        mut f: impl FnMut(&mut CompileItemContext<'c, 'h>, &mut ExtraScope, &mut F, &'a T) -> DiagResult<R>,
     ) -> DiagResult<Option<R>> {
         let refs = ctx.refs;
 
@@ -147,7 +150,7 @@ impl<'a, T> ExtraCursor<'a, T> {
                     };
 
                     // handle item
-                    let (push, eval) = with_scope(scope_parent, &mut self.stack_scopes, |scope| match item {
+                    let (push, eval) = with_scope(&mut self.root_scope, &mut self.stack_scopes, |scope| match item {
                         ExtraListItem::Leaf(item) => {
                             let eval = f(ctx, scope, flow, item)?;
                             Ok((None, Some(eval)))
@@ -218,7 +221,7 @@ impl<'a, T> ExtraCursor<'a, T> {
                     refs.check_should_stop(stmt.span_keyword)?;
 
                     // run iteration
-                    let scope_iter = with_scope(scope_parent, &mut self.stack_scopes, |scope| {
+                    let scope_iter = with_scope(&mut self.root_scope, &mut self.stack_scopes, |scope| {
                         let mut scope_iter = scope.scope.new_child(stmt.span());
 
                         ctx.elaborate_for_statement_iteration(
