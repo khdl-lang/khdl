@@ -2,8 +2,8 @@ use crate::front::block::ElaboratedForHeader;
 use crate::front::compile::{CompileItemContext, CompileRefs};
 use crate::front::diagnostic::DiagResult;
 use crate::front::flow::Flow;
-use crate::front::scope::{Scope, ScopedEntry};
-use crate::syntax::ast::{ExtraList, ExtraListBlock, ExtraListItem, MaybeIdentifier};
+use crate::front::scope::{Scope, ScopeContent, ScopeParent, ScopedEntry};
+use crate::syntax::ast::{ExtraList, ExtraListBlock, ExtraListItem, ForStatement, MaybeIdentifier};
 use crate::syntax::pos::{HasSpan, Spanned};
 use crate::util::intern::Id;
 
@@ -52,11 +52,15 @@ impl CompileItemContext<'_, '_> {
         f: &mut impl FnMut(&mut Self, &mut ExtraScope, &mut F, &'a T) -> DiagResult,
     ) -> DiagResult {
         let ExtraList { span: _, items } = list;
+        let mut cursor = ExtraCursor::new(items, common_decl_in_root_scope);
+
         let mut scope_extra = ExtraScope {
             root_scope: None,
             scope: scope_parent,
         };
-        self.elaborate_extra_list_items(&mut scope_extra, flow, items, common_decl_in_root_scope, f)
+        while let Some(()) = cursor.next(self, &mut scope_extra, flow, &mut *f)? {}
+
+        Ok(())
     }
 
     pub fn elaborate_extra_list_block<'a, F: Flow, T>(
@@ -68,90 +72,236 @@ impl CompileItemContext<'_, '_> {
         f: &mut impl FnMut(&mut Self, &mut ExtraScope, &mut F, &'a T) -> DiagResult,
     ) -> DiagResult {
         let &ExtraListBlock { span, ref items } = block;
+        let mut cursor = ExtraCursor::new(items, common_decl_in_root_scope);
 
         let mut scope_child = scope_parent.scope.new_child(span);
         let mut scope_child = scope_parent.new_child(&mut scope_child);
-        self.elaborate_extra_list_items(&mut scope_child, flow, items, common_decl_in_root_scope, f)
+        while let Some(()) = cursor.next(self, &mut scope_child, flow, &mut *f)? {}
+
+        Ok(())
+    }
+}
+
+pub struct ExtraCursor<'a, T> {
+    common_decl_in_root_scope: bool,
+    stack_frames: Vec<Frame<'a, T>>,
+    stack_scopes: Vec<Option<ScopeContent>>,
+}
+
+enum Frame<'a, T> {
+    List {
+        scopes_before: usize,
+        items: std::slice::Iter<'a, ExtraListItem<T>>,
+    },
+    For {
+        stmt: &'a ForStatement<ExtraListBlock<T>>,
+        header: ElaboratedForHeader,
+    },
+}
+
+enum FramePush<'a, T> {
+    Block(Option<ScopeContent>, &'a ExtraListBlock<T>),
+    For(&'a ForStatement<ExtraListBlock<T>>, ElaboratedForHeader),
+}
+
+impl<'a, T> ExtraCursor<'a, T> {
+    pub fn new(list: &'a [ExtraListItem<T>], common_decl_in_root_scope: bool) -> Self {
+        let frame = Frame::List {
+            items: list.iter(),
+            scopes_before: 0,
+        };
+        ExtraCursor {
+            common_decl_in_root_scope,
+            stack_frames: vec![frame],
+            stack_scopes: vec![],
+        }
     }
 
-    fn elaborate_extra_list_items<'a, F: Flow, T: 'a>(
+    pub fn next<'c, 's, R, F: Flow>(
         &mut self,
-        scope: &mut ExtraScope,
+        ctx: &mut CompileItemContext<'c, 's>,
+        scope_parent: &mut ExtraScope,
         flow: &mut F,
-        items: &'a [ExtraListItem<T>],
-        common_decl_in_root_scope: bool,
-        f: &mut impl FnMut(&mut Self, &mut ExtraScope, &mut F, &'a T) -> DiagResult,
-    ) -> DiagResult {
-        let refs = self.refs;
+        mut f: impl FnMut(&mut CompileItemContext<'c, 's>, &mut ExtraScope, &mut F, &'a T) -> DiagResult<R>,
+    ) -> DiagResult<Option<R>> {
+        let refs = ctx.refs;
 
-        for item in items {
-            match item {
-                ExtraListItem::Leaf(leaf) => f(self, scope, flow, leaf)?,
-                ExtraListItem::Declaration(decl) => {
-                    let eval = self.eval_declaration(scope.as_scope(), flow, decl)?;
+        loop {
+            // get the top frame if any
+            let Some(frame) = self.stack_frames.last_mut() else {
+                return Ok(None);
+            };
 
-                    if let Some(eval) = eval {
-                        let id = eval.id;
-                        let entry = eval.value_into_entry(self.refs, flow)?;
-
-                        if common_decl_in_root_scope {
-                            scope.declare_root(refs, id, Ok(entry));
-                        } else {
-                            scope.as_scope().declare(refs, id, Ok(entry));
+            match frame {
+                Frame::List {
+                    items,
+                    scopes_before: _,
+                } => {
+                    // get next item if any
+                    let item = match items.next() {
+                        None => {
+                            self.pop();
+                            continue;
                         }
+                        Some(item) => item,
+                    };
+
+                    // handle item
+                    let (push, eval) = with_scope(scope_parent, &mut self.stack_scopes, |scope| match item {
+                        ExtraListItem::Leaf(item) => {
+                            let eval = f(ctx, scope, flow, item)?;
+                            Ok((None, Some(eval)))
+                        }
+                        ExtraListItem::Declaration(decl) => {
+                            let eval = ctx.eval_declaration(scope.scope, flow, decl)?;
+
+                            if let Some(eval) = eval {
+                                let id = eval.id;
+                                let entry = eval.value_into_entry(refs, flow)?;
+
+                                if self.common_decl_in_root_scope {
+                                    scope.declare_root(refs, id, Ok(entry));
+                                } else {
+                                    scope.scope.declare(refs, id, Ok(entry));
+                                }
+                            }
+
+                            Ok((None, None))
+                        }
+                        ExtraListItem::If(stmt) => {
+                            let block = ctx.compile_if_statement_choose_block(scope.scope, flow, stmt)?;
+                            let push = block.map(|block| FramePush::Block(None, block));
+                            Ok((push, None))
+                        }
+                        ExtraListItem::Match(stmt) => {
+                            let (declare, block) =
+                                ctx.compile_match_statement_choose_branch(scope.scope, flow, stmt)?;
+
+                            let mut scope_child = scope.scope.new_child(block.span);
+                            if let Some(declare) = declare {
+                                declare.declare(ctx, &mut scope_child, flow)?;
+                            }
+
+                            let push = Some(FramePush::Block(Some(scope_child.into_content()), block));
+                            Ok((push, None))
+                        }
+                        ExtraListItem::For(stmt) => {
+                            let header = ctx.elaborate_for_statement_header(scope.scope, flow, stmt)?;
+                            let push = Some(FramePush::For(stmt, header));
+                            Ok((push, None))
+                        }
+                    })?;
+
+                    // handle results
+                    match push {
+                        None => {}
+                        Some(FramePush::Block(scope_extra, block)) => self.push_block(scope_extra, block),
+                        Some(FramePush::For(stmt, header)) => self.stack_frames.push(Frame::For { stmt, header }),
+                    }
+                    if let Some(eval) = eval {
+                        return Ok(Some(eval));
                     }
                 }
-                ExtraListItem::If(stmt) => {
-                    let block = self.compile_if_statement_choose_block(scope.as_scope(), flow, stmt)?;
-                    if let Some(block) = block {
-                        self.elaborate_extra_list_block(scope, flow, block, common_decl_in_root_scope, f)?;
-                    }
-                }
-                ExtraListItem::Match(stmt) => {
-                    let (declare, block) = self.compile_match_statement_choose_branch(scope.as_scope(), flow, stmt)?;
-
-                    let mut scope_child = scope.scope.new_child(block.span);
-                    let mut scope_child = scope.new_child(&mut scope_child);
-
-                    if let Some(declare) = declare {
-                        declare.declare(self, scope_child.as_scope(), flow)?;
-                    }
-
-                    self.elaborate_extra_list_block(&mut scope_child, flow, block, common_decl_in_root_scope, f)?;
-                }
-                ExtraListItem::For(stmt) => {
+                Frame::For { stmt, header } => {
+                    let stmt = &**stmt;
                     let ElaboratedForHeader {
                         index_id,
-                        index_ty,
-                        iter,
-                    } = self.elaborate_for_statement_header(scope.as_scope(), flow, stmt)?;
+                        ref index_ty,
+                        ref mut iter,
+                    } = *header;
 
-                    for index_value in iter {
-                        refs.check_should_stop(stmt.span_keyword)?;
+                    // get next value if any
+                    let Some(index_value) = iter.next() else {
+                        self.pop();
+                        continue;
+                    };
+                    refs.check_should_stop(stmt.span_keyword)?;
 
+                    // run iteration
+                    let scope_iter = with_scope(scope_parent, &mut self.stack_scopes, |scope| {
                         let mut scope_iter = scope.scope.new_child(stmt.span());
-                        let mut scope_iter = scope.new_child(&mut scope_iter);
 
-                        self.elaborate_for_statement_iteration(
-                            scope_iter.as_scope(),
+                        ctx.elaborate_for_statement_iteration(
+                            &mut scope_iter,
                             flow,
                             stmt,
                             index_id,
-                            &index_ty,
+                            index_ty,
                             index_value,
                         )?;
 
-                        self.elaborate_extra_list_block(
-                            &mut scope_iter,
-                            flow,
-                            &stmt.body,
-                            common_decl_in_root_scope,
-                            f,
-                        )?;
-                    }
+                        Ok(scope_iter.into_content())
+                    })?;
+
+                    self.push_block(Some(scope_iter), &stmt.body);
                 }
             }
         }
-        Ok(())
     }
+
+    fn push_block(&mut self, scope_extra: Option<ScopeContent>, block: &'a ExtraListBlock<T>) {
+        let &ExtraListBlock { span, ref items } = block;
+
+        // remember how many scopes there were
+        let scopes_before = self.stack_scopes.len();
+
+        // optionally push the extra scope
+        if let Some(scope_extra) = scope_extra {
+            self.stack_scopes.push(Some(scope_extra));
+        }
+        // always push a new scope
+        self.stack_scopes.push(Some(ScopeContent::new(span)));
+
+        // actually push the frame
+        self.stack_frames.push(Frame::List {
+            items: items.iter(),
+            scopes_before,
+        });
+    }
+
+    fn pop(&mut self) {
+        match self.stack_frames.pop().unwrap() {
+            Frame::List {
+                items: _,
+                scopes_before,
+            } => {
+                self.stack_scopes.truncate(scopes_before);
+            }
+            Frame::For { stmt: _, header: _ } => {}
+        }
+    }
+}
+
+fn with_scope<R>(
+    parent: &mut ExtraScope,
+    stack: &mut Vec<Option<ScopeContent>>,
+    f: impl FnOnce(&mut ExtraScope) -> R,
+) -> R {
+    fn with_scope_impl<'s, R>(
+        parent: &mut ExtraScope,
+        mut stack: impl Iterator<Item = &'s mut Option<ScopeContent>>,
+        f: impl FnOnce(&mut ExtraScope) -> R,
+    ) -> R {
+        // get next item from stack if any
+        let Some(next_slot) = stack.next() else {
+            return f(parent);
+        };
+
+        // restore scope from content
+        let next_content = Option::take(next_slot).unwrap();
+        let mut next_scope = Scope::restore_from_content(ScopeParent::Normal(parent.scope), next_content);
+
+        // wrap in extra and recurse
+        let mut next_extra = parent.new_child(&mut next_scope);
+        let res = with_scope_impl(&mut next_extra, stack, f);
+
+        // restore scope content
+        assert!(next_slot.is_none());
+        *next_slot = Some(next_scope.into_content());
+
+        // return value
+        res
+    }
+
+    with_scope_impl(parent, stack.iter_mut(), f)
 }

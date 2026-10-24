@@ -236,3 +236,71 @@ def test_extra_item_kind_match():
     """
     f = compile_custom(src).resolve("top.f")
     assert f(x=4) == 4
+
+
+def test_extra_list_nested_scopes():
+    src = """
+    fn f(
+        for (i in 0..3) {
+            for (i in 0..2) {
+                const { print(i); }
+            }
+            match (i) {
+                2 => {
+                    for (j in 0..2) {
+                        if (j == 1) {
+                            const C = i * 10 + j;
+                            x: int(C..C+1),
+                        }
+                    }
+                }
+                val v => {
+                    const { print(v); }
+                }
+            }
+        }
+    ) -> int {
+        return x;
+    }
+    """
+    f = compile_custom(src).resolve("top.f")
+    assert f(x=21) == 21
+    with diag_error("type mismatch"):
+        f(x=20)
+
+
+def test_extra_list_side_effects():
+    src = """
+    fn f() -> any {
+        var array = [];
+        var index = 0;
+        var array_ref = ref(array);
+        var index_ref = ref(index);
+        fn effect(i: uint, v: any) -> any {
+            deref(array_ref) = [*deref(array_ref), (i, deref(index_ref))];
+            deref(index_ref) += 1;
+            return v;
+        }
+
+        fn g(
+            a: effect(2, int) = effect(3, 0),
+            const { effect(4, 0); }
+            for (i: effect(5, int) in effect(6, 0..2)) {
+                if (effect(7, i == 0)) {
+                    b: effect(8, int) = effect(9, 0),
+                } else if (effect(10, false)) {
+                } else {
+                    match (effect(11, i)) {
+                        1 => { c: effect(12, int) = effect(13, 0), }
+                    }
+                }
+            }
+        ) {}
+
+        g(effect(0, 1), c=effect(1, 2));
+        return array;
+    }
+    """
+    f = compile_custom(src).resolve("top.f")
+    expected = [0, 1, 2, 4, 5, 6, 7, 8, 9, 7, 10, 11, 12]
+    assert f() == [(e, i) for i, e in enumerate(expected)]
