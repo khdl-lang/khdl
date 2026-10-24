@@ -233,7 +233,7 @@ impl<'a> ParamArgMacher<'a> {
         &mut self,
         id: Spanned<Id>,
         ty: Spanned<&Type>,
-        default: Option<Spanned<ValueWithImplications>>,
+        default: Option<impl FnOnce() -> DiagResult<Spanned<ValueWithImplications>>>,
     ) -> DiagResult<Spanned<ValueWithImplications>> {
         let refs = self.refs;
         let diags = self.refs.diags;
@@ -285,7 +285,7 @@ impl<'a> ParamArgMacher<'a> {
                 None => {
                     if let Some(default) = default {
                         // default value
-                        Ok(default)
+                        default()
                     } else {
                         // nothing matched, report error
                         let id_str = id.inner.str(&self.refs.shared.interner);
@@ -492,7 +492,7 @@ impl CompileItemContext<'_, '_> {
 
         let mut field_values = vec![];
         for (_, &(field_id_spanned, ref field_ty)) in fields {
-            if let Ok(v) = matcher.resolve_param(field_id_spanned, field_ty.as_ref(), None) {
+            if let Ok(v) = matcher.resolve_param(field_id_spanned, field_ty.as_ref(), None::<fn() -> _>) {
                 field_values.push(v.inner.into_value());
             }
         }
@@ -533,7 +533,7 @@ impl CompileItemContext<'_, '_> {
             .resolve_param(
                 Spanned::new(variant_id.span(), variant_id.inner),
                 payload_ty.as_ref(),
-                None,
+                None::<fn() -> _>,
             )?
             .inner
             .into_value();
@@ -620,19 +620,18 @@ impl CompileItemContext<'_, '_> {
             let id_eval = slf.eval_id(scope.as_scope(), flow, id)?;
 
             let ty = slf.eval_expression_as_ty(scope.as_scope(), flow, ty)?;
-            let default = default
-                .as_ref()
-                .map(|&default| {
-                    let value = slf.eval_expression_as_compile(
-                        scope.as_scope(),
-                        flow,
-                        &ty.inner,
-                        default,
-                        Spanned::new(param.span, "parameter default value"),
-                    )?;
-                    Ok(value.map_inner(Value::from))
-                })
-                .transpose()?;
+
+            let mut eval_default = |default| {
+                let value = slf.eval_expression_as_compile(
+                    scope.as_scope(),
+                    flow,
+                    &ty.inner,
+                    default,
+                    Spanned::new(param.span, "parameter default value"),
+                )?;
+                Ok(value.map_inner(Value::from))
+            };
+            let default = default.map(|default| move || eval_default(default));
 
             let value = matcher.resolve_param(id_eval, ty.as_ref(), default);
 
