@@ -7,17 +7,17 @@ use crate::syntax::ast::{ExtraList, ExtraListBlock, ExtraListItem, ForStatement,
 use crate::syntax::pos::{HasSpan, Spanned};
 use crate::util::intern::Id;
 
-pub struct ExtraScope<'a, 'b, 'c, 'd> {
-    root_scope: Option<&'a Scope<'b>>,
-    scope: &'c mut Scope<'d>,
+pub struct ExtraScope<'s, 'p> {
+    root_scope: Option<&'p Scope<'p>>,
+    scope: &'s mut Scope<'p>,
 }
 
-impl<'a, 'b, 'c, 'd> ExtraScope<'a, 'b, 'c, 'd> {
-    pub fn as_scope(&mut self) -> &mut Scope<'d> {
+impl<'s, 'p> ExtraScope<'s, 'p> {
+    pub fn as_scope(&mut self) -> &mut Scope<'p> {
         self.scope
     }
 
-    pub fn new_child<'e, 'f>(&self, child_scope: &'e mut Scope<'f>) -> ExtraScope<'_, '_, 'e, 'f> {
+    pub fn new_child<'c, 'f>(&'f self, child_scope: &'c mut Scope<'f>) -> ExtraScope<'c, 'f> {
         ExtraScope {
             root_scope: Some(self.root_scope.unwrap_or(self.scope)),
             scope: child_scope,
