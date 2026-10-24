@@ -280,11 +280,14 @@ fn with_scope<R>(
     fn with_scope_impl<'s, R>(
         parent: &mut ExtraScope,
         mut stack: impl Iterator<Item = &'s mut Option<ScopeContent>>,
+        result: &mut Option<R>,
         f: impl FnOnce(&mut ExtraScope) -> R,
-    ) -> R {
+    ) {
         // get next item from stack if any
         let Some(next_slot) = stack.next() else {
-            return f(parent);
+            assert!(result.is_none());
+            *result = Some(f(parent));
+            return;
         };
 
         // restore scope from content
@@ -293,15 +296,14 @@ fn with_scope<R>(
 
         // wrap in extra and recurse
         let mut next_extra = parent.new_child(&mut next_scope);
-        let res = with_scope_impl(&mut next_extra, stack, f);
+        with_scope_impl(&mut next_extra, stack, result, f);
 
         // restore scope content
         assert!(next_slot.is_none());
         *next_slot = Some(next_scope.into_content());
-
-        // return value
-        res
     }
 
-    with_scope_impl(parent, stack.iter_mut(), f)
+    let mut result = None;
+    with_scope_impl(parent, stack.iter_mut(), &mut result, f);
+    result.unwrap()
 }
