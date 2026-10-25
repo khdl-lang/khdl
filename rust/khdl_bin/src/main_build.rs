@@ -229,7 +229,15 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
     let mut any_error = false;
     let start_output = Instant::now();
     for (path, output) in outputs {
-        match std::fs::write(&path, output).map_err(|e| e.with_path(path)) {
+        let result = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                std::fs::create_dir_all(parent).map_err(|e| e.with_path(parent))
+            }
+            _ => Ok(()),
+        }
+        .and_then(|()| std::fs::write(&path, output).map_err(|e| e.with_path(&path)));
+
+        match result {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("output error: {:?}", e);

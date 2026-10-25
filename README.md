@@ -216,7 +216,6 @@ From the project directory, check all items, or elaborate a top module and write
 
 ```bash
 khdl_bin build
-mkdir -p build
 khdl_bin build --top blink.Blink --output-verilog build/blink.v
 ```
 
