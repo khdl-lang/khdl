@@ -8,11 +8,16 @@ macro_rules! khdl_manifest_file_name_macro {
 }
 
 pub const KHDL_LANGUAGE_NAME: &str = "KHDL";
+pub const KHDL_BINARY_NAME: &str = "khdl";
 pub const KHDL_FILE_EXTENSION: &str = "kh";
 pub const KHDL_MANIFEST_FILE_NAME: &str = khdl_manifest_file_name_macro!();
 pub const KHDL_LSP_NAME: &str = "KHDL-LSP";
 pub const KHDL_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const KHDL_FMT_DIRECTIVE: &str = "khdl-fmt";
+
+pub const DUMMY_FILE_CMDLINE: &str = "<command line>";
+pub const DUMMY_FILE_PYTHON: &str = "<python caller>";
+pub const DUMMY_FILE_PYTHON_CONTENT: &str = "/* python caller */";
 
 // TODO make all of these configurable
 // TODO maybe we can reduce this by now, module elaboration does not count towards the stack any more

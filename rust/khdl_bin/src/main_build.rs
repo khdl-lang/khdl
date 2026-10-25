@@ -1,4 +1,5 @@
 use crate::args::ArgsBuild;
+use crate::command_file::CommandLineFile;
 use crate::util::{ErrorExit, manifest_find_read_parse, print_diagnostics};
 use itertools::Itertools;
 use khdl_language::back::lower_cpp::lower_to_cpp;
@@ -59,11 +60,14 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
     let settings = CompileSettings { do_ir_cleanup: true };
     let queue_items = if top_only { QueueItems::None } else { QueueItems::All };
 
+    let mut source = SourceDatabase::new();
+    let cmd_file = CommandLineFile::new(&mut source, std::env::args().skip(1));
+
+    // start timers
     let start_all = Instant::now();
     let start_source = start_all;
 
     // find and parse manifest
-    let mut source = SourceDatabase::new();
     let manifest = match manifest_find_read_parse(&mut source, manifest) {
         Ok(m) => m,
         Err(ErrorExit) => return ExitCode::FAILURE,
@@ -71,7 +75,6 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
     let Manifest {
         source: manifest_source,
     } = manifest.parsed;
-    let manifest_span = source.full_span(manifest.file);
 
     // collect source
     let diags = Diagnostics::new();
@@ -139,16 +142,17 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
     let start_compile = Instant::now();
     let top_values = top
         .iter()
-        .map(
-            |top| match refs.resolve_path(Spanned::new(manifest_span, top), false)? {
+        .map(|top| {
+            let top_span = cmd_file.value_span(top).unwrap_or(cmd_file.full_span());
+            match refs.resolve_path(Spanned::new(top_span, top), false)? {
                 ImportValue::Item(item) => refs.eval_item(item),
                 ImportValue::HierarchyNode(_) => Err(refs.diags.report_error_simple(
                     format!("top `{top}` must be an item, got a package"),
-                    manifest_span,
+                    top_span,
                     "top set here",
                 )),
-            },
-        )
+            }
+        })
         .collect_vec();
 
     // run compilation loop
@@ -169,7 +173,7 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
         .collect_vec();
 
     // finish compilation
-    let ir_db = shared.finish_ir_database(&diags, manifest_span);
+    let ir_db = shared.finish_ir_database(&diags, cmd_file.full_span());
     let time_compile = start_compile.elapsed();
 
     // lower and write outputs

@@ -145,31 +145,43 @@ impl<'a, 's> CompileRefs<'a, 's> {
     pub fn resolve_path(self, path: Spanned<&str>, allow_private: bool) -> DiagResult<ImportValue> {
         let diags = self.diags;
 
-        // split path
         if path.inner.is_empty() {
             return Err(diags.report_error_simple("path cannot be empty", path.span, "empty path here"));
         }
-        let path_split = path.inner.split(".").collect_vec();
-        if path_split.iter().any(|step| step.is_empty()) {
+
+        // split path, try to preserve span info
+        let path_split = {
+            let exact = self.fixed.source.span_str(path.span) == path.inner;
+            let mut offset = path.span.start_byte;
+            path.inner
+                .split(".")
+                .map(|step| {
+                    let span = match exact {
+                        true => Span::new(path.span.file, offset, offset + step.len()),
+                        false => path.span,
+                    };
+                    offset += step.len() + 1;
+                    Spanned::new(span, step)
+                })
+                .collect_vec()
+        };
+
+        if path_split.iter().any(|step| step.inner.is_empty()) {
             let title = format!("path `{}` contains an empty step", path.inner);
             return Err(diags.report_error_simple(title, path.span, "path here"));
         }
         let (&final_, steps) = path_split.split_last().unwrap();
 
         // call into existing import machinery
-        let base = resolve_import_steps(
-            diags,
-            self.fixed.hierarchy,
-            steps.iter().map(|&step| Spanned::new(path.span, step)),
-        )?;
+        let base = resolve_import_steps(diags, self.fixed.hierarchy, steps.iter().copied())?;
         resolve_import_final(
             diags,
             &self.shared.interner,
             self.fixed.hierarchy,
             &self.shared.file_scopes,
             base,
-            (!steps.is_empty()).then_some(path.span),
-            Spanned::new(path.span, final_),
+            steps.last().map(|pre_final| steps[0].span.join(pre_final.span)),
+            final_,
             allow_private,
         )
     }

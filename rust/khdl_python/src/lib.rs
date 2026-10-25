@@ -38,6 +38,7 @@ use khdl_language::util::nd_array::{NdArray, NdArrayShape};
 use khdl_language::util::pool::ThreadPool;
 use khdl_language::util::range::Range as RustRange;
 use khdl_language::util::{NON_ZERO_USIZE_ONE, get_num_cpus};
+use khdl_util::constants::{DUMMY_FILE_PYTHON, DUMMY_FILE_PYTHON_CONTENT};
 use khdl_util::io::{IoAction, IoErrorExt, IoErrorWithPath};
 use pyo3::exceptions::{PyAttributeError, PyException, PyIOError, PyIndexError, PyTypeError, PyValueError};
 use pyo3::types::{
@@ -332,8 +333,6 @@ fn format_file(py: Python, src: String) -> PyResult<String> {
     Ok(result.new_content)
 }
 
-const DUMMY_SOURCE: &str = "// dummy file, representing the python caller";
-
 #[pymethods]
 impl Source {
     #[new]
@@ -342,7 +341,7 @@ impl Source {
         let mut hierarchy = SourceHierarchy::new();
 
         // add dummy file so we have a span to point to for errors caused by the python caller
-        let dummy_file = source.add_file("dummy_caller.py".to_owned(), DUMMY_SOURCE.to_owned());
+        let dummy_file = source.add_file(DUMMY_FILE_PYTHON.to_owned(), DUMMY_FILE_PYTHON_CONTENT.to_owned());
         let dummy_span = source.full_span(dummy_file);
 
         // add std
