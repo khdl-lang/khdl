@@ -2,7 +2,7 @@ use crate::handlers::dispatch::NotificationHandler;
 use crate::server::state::{RequestError, RequestResult, ServerState};
 use crate::server::vfs::VfsError;
 use crate::util::uri::uri_to_path;
-use khdl_util::io::IoErrorExt;
+use khdl_util::io::{IoAction, IoErrorExt};
 use lsp_types::notification::{
     DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
 };
@@ -107,7 +107,7 @@ impl NotificationHandler<DidChangeWatchedFiles> for ServerState {
                                 }
                                 _ => {
                                     // other error, could be important
-                                    return Err(RequestError::Vfs(VfsError::Io(e.with_path(path))));
+                                    return Err(RequestError::Vfs(VfsError::Io(e.with_context(IoAction::Read, path))));
                                 }
                             }
                         }

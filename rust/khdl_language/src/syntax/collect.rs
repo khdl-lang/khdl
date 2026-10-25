@@ -7,7 +7,7 @@ use indexmap::IndexMap;
 use itertools::{Itertools, chain, zip_eq};
 use khdl_std::{STD_SOURCE_FILES, StdSourceFile};
 use khdl_util::constants::KHDL_FILE_EXTENSION;
-use khdl_util::io::{IoErrorExt, IoErrorWithPath, recurse_for_each_file};
+use khdl_util::io::{IoAction, IoErrorExt, IoErrorWithPath, recurse_for_each_file};
 use path_clean::PathClean;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -41,7 +41,7 @@ pub fn collect_source_from_manifest(
             manifest_span,
             steps.clone(),
             &file_steps_and_paths,
-            |path| std::fs::read_to_string(path).map_err(|e| io_error_message(e.with_path(path))),
+            |path| std::fs::read_to_string(path).map_err(|e| e.with_context(IoAction::Read, path).to_string()),
         )?;
 
         for (file, (_, path)) in zip_eq(files, file_steps_and_paths) {
@@ -87,7 +87,8 @@ pub fn collect_source_files_from_tree(
 ) -> DiagResult<Vec<(Vec<String>, PathBuf)>> {
     let report_error = |m: String| diags.report_error_simple(m, span, "while collecting source here");
 
-    let meta = std::fs::metadata(&entry_path).map_err(|e| report_error(io_error_message(e.with_path(&entry_path))))?;
+    let meta = std::fs::metadata(&entry_path)
+        .map_err(|e| report_error(e.with_context(IoAction::Metadata, &entry_path).to_string()))?;
     if meta.is_file() {
         return Ok(vec![(vec![], entry_path)]);
     }
@@ -126,7 +127,7 @@ pub fn collect_source_files_from_tree(
         files.push((relative_steps_str, path_file.to_owned()));
         Ok(())
     })
-    .map_err(|e| report_error(io_error_message(e)))?;
+    .map_err(|e: IoErrorWithPath| report_error(e.to_string()))?;
 
     step_err?;
 
@@ -149,9 +150,4 @@ pub fn add_std_sources(
     }
 
     Ok(())
-}
-
-pub fn io_error_message(e: IoErrorWithPath) -> String {
-    let IoErrorWithPath { error, path } = e;
-    format!("IO error: {error:?} at {path:?}")
 }

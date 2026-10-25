@@ -8,7 +8,7 @@ use khdl_language::syntax::format::{FormatError, FormatSettings, format_file};
 use khdl_language::syntax::source::SourceDatabase;
 use khdl_language::util::data::IndexMapExt;
 use khdl_util::constants::KHDL_FILE_EXTENSION;
-use khdl_util::io::{IoErrorExt, IoErrorWithPath, recurse_for_each_file};
+use khdl_util::io::{IoAction, IoErrorExt, IoErrorWithPath, recurse_for_each_file};
 use khdl_util::{swrite, swriteln};
 use std::ffi::OsStr;
 use std::io;
@@ -67,18 +67,19 @@ pub fn main_fmt(args: ArgsFormat) -> ExitCode {
                     // switch to recursive directory reading
                     recurse_for_each_file::<IoErrorWithPath>(&path, |_, entry_path| {
                         if entry_path.extension() == Some(OsStr::new(KHDL_FILE_EXTENSION)) {
-                            let content = std::fs::read_to_string(entry_path).map_err(|e| e.with_path(entry_path))?;
+                            let content = std::fs::read_to_string(entry_path)
+                                .map_err(|e| e.with_context(IoAction::Read, entry_path))?;
                             let file = source.add_file(entry_path.to_string_lossy().into_owned(), content);
                             files.insert_first(file, entry_path.to_owned());
                         }
                         Ok(())
                     })
                 }
-                Err(e) => Err(e.with_path(&path)),
+                Err(e) => Err(e.with_context(IoAction::Read, &path)),
             };
 
             if let Err(e) = io_result {
-                eprintln!("Failed to read input file(s): {e:?}");
+                eprintln!("error: {e}");
                 return ExitCode::FAILURE;
             }
 
@@ -149,9 +150,9 @@ pub fn main_fmt(args: ArgsFormat) -> ExitCode {
     if let Some(debug) = &debug {
         // write to debug file,
         //   don't actually change any files
-        let io_result = std::fs::write(debug, debug_output).map_err(|e| e.with_path(debug));
+        let io_result = std::fs::write(debug, debug_output).map_err(|e| e.with_context(IoAction::Write, debug));
         if let Err(e) = io_result {
-            eprintln!("Failed to write debug file: {e:?}");
+            eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     } else if check {
@@ -169,9 +170,10 @@ pub fn main_fmt(args: ArgsFormat) -> ExitCode {
             if let Ok(result) = result
                 && result.new_content != source[file].content
             {
-                let io_result = std::fs::write(path, &result.new_content).map_err(|e| e.with_path(path));
+                let io_result =
+                    std::fs::write(path, &result.new_content).map_err(|e| e.with_context(IoAction::Write, path));
                 if let Err(e) = io_result {
-                    eprintln!("Failed to write formatted file: {e:?}");
+                    eprintln!("error: {e}");
                     return ExitCode::FAILURE;
                 }
             }

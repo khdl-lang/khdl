@@ -26,7 +26,6 @@ use khdl_language::front::value::{
 use khdl_language::mid::ir::{IrDatabase, IrModule, IrPort, IrPortDeclared, IrPortInfo};
 use khdl_language::syntax::collect::{
     add_source_files_to_tree, add_std_sources, collect_source_files_from_tree, collect_source_from_manifest,
-    io_error_message,
 };
 use khdl_language::syntax::format::{FormatError, FormatSettings, format_file as rust_format_file};
 use khdl_language::syntax::hierarchy::SourceHierarchy;
@@ -39,7 +38,7 @@ use khdl_language::util::nd_array::{NdArray, NdArrayShape};
 use khdl_language::util::pool::ThreadPool;
 use khdl_language::util::range::Range as RustRange;
 use khdl_language::util::{NON_ZERO_USIZE_ONE, get_num_cpus};
-use khdl_util::io::IoErrorExt;
+use khdl_util::io::{IoAction, IoErrorExt, IoErrorWithPath};
 use pyo3::exceptions::{PyAttributeError, PyException, PyIOError, PyIndexError, PyTypeError, PyValueError};
 use pyo3::types::{
     PyAnyMethods, PyDict, PyIterator, PyList, PyModule, PyModuleMethods, PySlice, PySliceIndices, PySliceMethods,
@@ -369,7 +368,7 @@ impl Source {
             .parent()
             .ok_or_else(|| SourceSetException::new_err("manifest path does not have a parent directory"))?;
         let manifest_content = std::fs::read_to_string(manifest_path)
-            .map_err(|e| SourceSetException::new_err(io_error_message(e.with_path(manifest_path))))?;
+            .map_err(|e| SourceSetException::new_err(e.with_context(IoAction::Read, manifest_path).to_string()))?;
         let manifest_file = source.add_file(manifest_path.to_string_lossy().into_owned(), manifest_content);
 
         // parse manifest
@@ -421,7 +420,7 @@ impl Source {
             self.dummy_span,
             steps,
             &files,
-            |path| std::fs::read_to_string(path).map_err(|e| io_error_message(e.with_path(path))),
+            |path| std::fs::read_to_string(path).map_err(|e| e.with_context(IoAction::Read, path).to_string()),
         );
         map_diag_error(py, &diags, &self.source, result)?;
 
@@ -971,8 +970,7 @@ impl Module {
 
         // create build_dir
         let build_dir = build_dir.as_path();
-        std::fs::create_dir_all(build_dir)
-            .map_err(|e| PyIOError::new_err(format!("failed to create build_dir `{}`: {e}", build_dir.display())))?;
+        std::fs::create_dir_all(build_dir).map_err(|e| io_error(e.with_context(IoAction::CreateDir, build_dir)))?;
 
         // lower
         let (ir_database, ir_module, lowered_verilog) = Self::lower_verilog_impl(&slf, py)?;
@@ -993,9 +991,9 @@ impl Module {
         // write to files
         // TODO only write if changed to avoid unnecessary rebuilds? or does verilator already do that for us?
         let name_verilog = "lowered.v";
-        std::fs::write(build_dir.join(name_verilog), &source_verilog)?;
+        write_file(&build_dir.join(name_verilog), &source_verilog)?;
         let name_cpp = "lowered.cpp";
-        std::fs::write(build_dir.join(name_cpp), &source_cpp)?;
+        write_file(&build_dir.join(name_cpp), &source_cpp)?;
 
         // verilate
         // pick a random so file to avoid later `dlopen` calls hitting a stale cache
@@ -1043,7 +1041,7 @@ impl Module {
                  {name_so}: $(VK_OBJS) $(VK_USER_OBJS) $(VK_GLOBAL_OBJS)\n\
                  \t$(LINK) $(LDFLAGS) $^ -o $@ -shared $(LDLIBS)\n"
             );
-            std::fs::write(obj_dir.join(name_mk), source_mk)?;
+            write_file(&obj_dir.join(name_mk), &source_mk)?;
 
             // TODO use faster linker
             run_command(
@@ -1082,6 +1080,14 @@ impl Module {
 
 // TODO include stderr in the error message
 //   https://users.rust-lang.org/t/best-error-handing-practices-when-using-std-command/42259
+fn io_error(e: IoErrorWithPath) -> PyErr {
+    PyIOError::new_err(e.to_string())
+}
+
+fn write_file(path: &Path, content: &str) -> PyResult<()> {
+    std::fs::write(path, content).map_err(|e| io_error(e.with_context(IoAction::Write, path)))
+}
+
 fn run_command(command: &mut Command, dir: &Path, name: &str) -> PyResult<()> {
     let status = command
         .current_dir(dir)

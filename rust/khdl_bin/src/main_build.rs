@@ -20,7 +20,7 @@ use khdl_language::syntax::token::Tokenizer;
 use khdl_language::util::arena::IndexType;
 use khdl_language::util::pool::ThreadPool;
 use khdl_language::util::{NON_ZERO_USIZE_ONE, get_num_cpus};
-use khdl_util::io::IoErrorExt;
+use khdl_util::io::{IoAction, IoErrorExt};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -231,16 +231,16 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
     for (path, output) in outputs {
         let result = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => {
-                std::fs::create_dir_all(parent).map_err(|e| e.with_path(parent))
+                std::fs::create_dir_all(parent).map_err(|e| e.with_context(IoAction::CreateDir, parent))
             }
             _ => Ok(()),
         }
-        .and_then(|()| std::fs::write(&path, output).map_err(|e| e.with_path(&path)));
+        .and_then(|()| std::fs::write(&path, output).map_err(|e| e.with_context(IoAction::Write, &path)));
 
         match result {
             Ok(()) => {}
             Err(e) => {
-                eprintln!("output error: {:?}", e);
+                eprintln!("error: {e}");
                 any_error = true;
             }
         }

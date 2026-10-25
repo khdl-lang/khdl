@@ -259,7 +259,7 @@ fn escape_textmate_regex(literal: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::syntax::external::textmate::generate_textmate_language_json;
-    use khdl_util::io::IoErrorExt;
+    use khdl_util::io::{IoAction, IoErrorExt};
 
     #[test]
     fn matches_textmate_grammar() {
@@ -272,7 +272,7 @@ mod tests {
         // std::fs::write(&path_abs, &expected).unwrap();
 
         let actual = std::fs::read_to_string(&path_abs)
-            .map_err(|e| e.with_path(path_abs))
+            .map_err(|e| e.with_context(IoAction::Read, path_abs))
             .unwrap();
 
         assert_eq!(expected, actual);

@@ -2,7 +2,7 @@ use khdl_language::front::diagnostic::{DiagError, Diagnostics, diags_to_string};
 use khdl_language::syntax::manifest::Manifest;
 use khdl_language::syntax::source::{FileId, SourceDatabase};
 use khdl_util::constants::KHDL_MANIFEST_FILE_NAME;
-use khdl_util::io::IoErrorExt;
+use khdl_util::io::{IoAction, IoErrorExt};
 use path_clean::PathClean;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -28,7 +28,7 @@ pub fn manifest_find_read_parse(
         Ok(m) => m,
         Err(FindManifestError(msg)) => {
             eprintln!(
-                "{msg}. Change the working directory or use `--manifest` to point to the right manifest location."
+                "error: {msg}. Change the working directory or use `--manifest` to point to the right manifest location."
             );
             return Err(ErrorExit);
         }
@@ -62,14 +62,10 @@ struct FoundManifest {
 }
 
 fn manifest_find_read(manifest_path: Option<PathBuf>) -> Result<FoundManifest, FindManifestError> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| FindManifestError(format!("Failed to get current working directory: {e:?}")))?;
-    let cwd = std::path::absolute(&cwd).map_err(|e| {
-        FindManifestError(format!(
-            "Failed to convert working dir to absolute path: {:?}",
-            e.with_path(cwd)
-        ))
-    })?;
+    let cwd =
+        std::env::current_dir().map_err(|e| FindManifestError(format!("cannot get current working directory: {e}")))?;
+    let cwd = std::path::absolute(&cwd)
+        .map_err(|e| FindManifestError(e.with_context(IoAction::Absolute, cwd).to_string()))?;
 
     match manifest_path {
         Some(manifest_path) => {
@@ -81,7 +77,8 @@ fn manifest_find_read(manifest_path: Option<PathBuf>) -> Result<FoundManifest, F
                         .parent()
                         .ok_or_else(|| {
                             FindManifestError(format!(
-                                "Manifest path {manifest_path:?} does not have a parent directory"
+                                "manifest path `{}` does not have a parent directory",
+                                manifest_path.display()
                             ))
                         })?
                         .to_owned();
@@ -91,10 +88,9 @@ fn manifest_find_read(manifest_path: Option<PathBuf>) -> Result<FoundManifest, F
                         source,
                     })
                 }
-                Err(e) => Err(FindManifestError(format!(
-                    "Failed to read manifest file: {:?}",
-                    e.with_path(manifest_path)
-                ))),
+                Err(e) => Err(FindManifestError(
+                    e.with_context(IoAction::Read, manifest_path).to_string(),
+                )),
             }
         }
         None => {
@@ -112,17 +108,17 @@ fn manifest_find_read(manifest_path: Option<PathBuf>) -> Result<FoundManifest, F
                     Err(e) => match e.kind() {
                         ErrorKind::NotFound => continue,
                         _ => {
-                            return Err(FindManifestError(format!(
-                                "Failed to read manifest file: {:?}",
-                                e.with_path(cand_manifest_path)
-                            )));
+                            return Err(FindManifestError(
+                                e.with_context(IoAction::Read, cand_manifest_path).to_string(),
+                            ));
                         }
                     },
                 }
             }
 
             Err(FindManifestError(format!(
-                "No manifest file `{KHDL_MANIFEST_FILE_NAME}` found in any parent directory of the current working directory {cwd:?}"
+                "no manifest file `{KHDL_MANIFEST_FILE_NAME}` found in any parent directory of the current working directory `{}`",
+                cwd.display()
             )))
         }
     }

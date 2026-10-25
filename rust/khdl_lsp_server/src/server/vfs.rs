@@ -1,7 +1,7 @@
 use crate::util::uri::NormalizeError;
 use indexmap::IndexMap;
 use khdl_util::constants::KHDL_MANIFEST_FILE_NAME;
-use khdl_util::io::{IoErrorExt, IoErrorWithPath};
+use khdl_util::io::{IoAction, IoErrorExt, IoErrorWithPath};
 use lsp_types::Uri;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -82,7 +82,7 @@ impl Vfs {
             return Ok(self.files.get(path).unwrap());
         }
 
-        let content = std::fs::read(path).map_err(|e| e.with_path(path))?;
+        let content = std::fs::read(path).map_err(|e| e.with_context(IoAction::Read, path))?;
 
         let slot = self.files.entry(path.to_owned()).or_default();
         *slot = content;

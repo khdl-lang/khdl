@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
@@ -16,15 +17,9 @@ fn recurse_for_each_file_impl<E: From<IoErrorWithPath>>(
     stack: &mut Vec<OsString>,
     f: &mut impl FnMut(&[OsString], &Path) -> Result<(), E>,
 ) -> Result<(), E> {
-    let read_dir = fs::read_dir(root).map_err(|e| IoErrorWithPath {
-        path: root.to_owned(),
-        error: e,
-    })?;
+    let read_dir = fs::read_dir(root).map_err(|e| e.with_context(IoAction::ReadDir, root))?;
     for entry in read_dir {
-        let entry = entry.map_err(|e| IoErrorWithPath {
-            path: root.to_owned(),
-            error: e,
-        })?;
+        let entry = entry.map_err(|e| e.with_context(IoAction::ReadDir, root))?;
         let next = entry.path();
         if next.is_dir() {
             stack.push(entry.file_name());
@@ -37,21 +32,54 @@ fn recurse_for_each_file_impl<E: From<IoErrorWithPath>>(
     Ok(())
 }
 
+/// The operation that caused an [IoErrorWithPath], used to construct readable error messages.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum IoAction {
+    Read,
+    Write,
+    ReadDir,
+    CreateDir,
+    Metadata,
+    Absolute,
+}
+
 #[derive(Debug)]
 pub struct IoErrorWithPath {
-    pub error: io::Error,
+    pub action: IoAction,
     pub path: PathBuf,
+    pub error: io::Error,
+}
+
+impl IoAction {
+    pub fn description(self) -> &'static str {
+        match self {
+            IoAction::Read => "read",
+            IoAction::Write => "write",
+            IoAction::ReadDir => "read directory",
+            IoAction::CreateDir => "create directory",
+            IoAction::Metadata => "read metadata of",
+            IoAction::Absolute => "get absolute path of",
+        }
+    }
+}
+
+impl Display for IoErrorWithPath {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let IoErrorWithPath { action, path, error } = self;
+        write!(f, "cannot {} `{}`: {}", action.description(), path.display(), error)
+    }
 }
 
 pub trait IoErrorExt {
-    fn with_path(self, path: impl Into<PathBuf>) -> IoErrorWithPath;
+    fn with_context(self, action: IoAction, path: impl Into<PathBuf>) -> IoErrorWithPath;
 }
 
 impl IoErrorExt for io::Error {
-    fn with_path(self, path: impl Into<PathBuf>) -> IoErrorWithPath {
+    fn with_context(self, action: IoAction, path: impl Into<PathBuf>) -> IoErrorWithPath {
         IoErrorWithPath {
-            error: self,
+            action,
             path: path.into(),
+            error: self,
         }
     }
 }
