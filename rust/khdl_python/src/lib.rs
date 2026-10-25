@@ -956,7 +956,7 @@ impl Module {
         if optimization.is_some_and(|level| level > 3) {
             return Err(PyValueError::new_err("Verilator optimization must be between 0 and 3"));
         }
-        let jobs = jobs.unwrap_or_else(|| get_num_cpus());
+        let jobs = jobs.unwrap_or_else(get_num_cpus);
 
         // Select code-generation workarounds, C++ driver, and matching PCH
         // settings together; Verilator's configured defaults may use another compiler.
