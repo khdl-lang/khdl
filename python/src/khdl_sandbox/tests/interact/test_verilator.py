@@ -48,3 +48,12 @@ def test_verilator_rebuild_with_stale_objects(tmp_dir: Path):
     inst.ports.x = True
     inst.step(1)
     assert inst.ports.y is True
+
+
+def test_verilator_constant_comparison(tmp_dir: Path):
+    src = "module top ports(x: in async uint(2), y: out async bool) { comb { val low = x & 3; y = low <= 3; } }"
+    inst = compile_custom(src).resolve("top.top").as_verilated(tmp_dir).instance()
+    for x in range(4):
+        inst.ports.x = x
+        inst.step(1)
+        assert inst.ports.y is True

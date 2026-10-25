@@ -1006,26 +1006,26 @@ impl Module {
             // TODO move this compilation process to somewhere else, not in the python crate
             run_command(
                 Command::new("verilator")
+                    // C++ compiler settings
                     .args(compiler.into_iter().flat_map(|(name, ..)| ["--compiler", name]))
                     .args(optimization.map(|level| format!("-O{level}")))
                     .arg("-cc")
-                    .arg("-CFLAGS")
-                    .arg("-fPIC")
+                    .args(["-CFLAGS", "-fPIC"])
                     // enforce Verilog 2005 to check that we don't accidentally use newer language features
-                    .arg("--language")
-                    .arg("1364-2005")
+                    .args(["--language", "1364-2005"])
                     // the backend sometimes intentionally uses these
                     .arg("-Wno-WIDTHTRUNC")
                     .arg("-Wno-WIDTHEXPAND")
                     .arg("-Wno-UNSIGNED")
+                    .arg("-Wno-CMPCONST")
                     // error on some sketchy constructions
                     .arg("-Werror-IMPLICIT")
                     .arg("-Werror-PINMISSING")
+                    // misc settings
                     .arg("--trace")
-                    .arg("--top-module")
-                    .arg(verilog_name)
-                    .arg("--prefix")
-                    .arg(&top_class_name)
+                    .args(["--top-module", verilog_name])
+                    .args(["--prefix", &top_class_name])
+                    // source files
                     .args(extra_verilog_files)
                     .arg(name_verilog)
                     .arg(name_cpp),
