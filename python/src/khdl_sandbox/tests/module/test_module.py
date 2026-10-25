@@ -208,6 +208,22 @@ def test_reference_escape_simple():
         compile_custom(src).resolve("top.top")
 
 
+def test_item_param_hardware_ref():
+    src = """
+    struct S(b: any) {}
+    module top_basic ports(x: in async bool) {
+        comb { val s = S(x); }
+    }
+    module top_ref ports(x: in async bool) {
+        comb { val s = S(ref(x)); }
+    }
+    """
+    with diag_error("item parameters must be compile-time"):
+        compile_custom(src).resolve("top.top_basic")
+    with diag_error("item parameters cannot contain references"):
+        compile_custom(src).resolve("top.top_ref")
+
+
 def test_reference_escape_function():
     src = """
     module top ports() {

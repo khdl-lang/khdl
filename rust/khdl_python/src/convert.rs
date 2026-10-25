@@ -171,7 +171,7 @@ pub fn convert_python_args_and_kwargs_to_args(
         let value = compile_value_from_py(&value, Some(compile))?;
         args_inner.push(Arg {
             span: dummy_span,
-            name: None,
+            id: None,
             value: Spanned::new(dummy_span, ValueWithImplications::from(value)),
         });
     }
@@ -184,7 +184,7 @@ pub fn convert_python_args_and_kwargs_to_args(
 
             args_inner.push(Arg {
                 span: dummy_span,
-                name: Some(Spanned::new(dummy_span, id)),
+                id: Some(Spanned::new(dummy_span, id)),
                 value: Spanned::new(dummy_span, ValueWithImplications::from(value)),
             });
         }
@@ -192,6 +192,6 @@ pub fn convert_python_args_and_kwargs_to_args(
 
     Ok(EvaluatedArgs {
         span: dummy_span,
-        inner: args_inner,
+        inner: args_inner.into_iter(),
     })
 }

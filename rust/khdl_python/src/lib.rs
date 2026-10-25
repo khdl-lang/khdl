@@ -13,6 +13,7 @@ use khdl_language::front::compile::{
 };
 use khdl_language::front::diagnostic::Diagnostics;
 use khdl_language::front::flow::{FlowCompile, FlowRoot};
+use khdl_language::front::function::CallArgs;
 use khdl_language::front::item::ElaboratedModule;
 use khdl_language::front::print::{CollectPrintHandler, PrintHandler, StdoutPrintHandler};
 use khdl_language::front::steps::{SpannedStep, TargetStepCompile, TargetSteps};
@@ -745,7 +746,7 @@ impl Value {
             &RustType::Any,
             dummy_span,
             Spanned::new(dummy_span, &target),
-            Ok(args),
+            CallArgs::Evaluated(args),
         );
         refs.run_compile_loop(compile_ref.pool.as_ref());
 

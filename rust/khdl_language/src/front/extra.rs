@@ -7,12 +7,18 @@ use crate::syntax::ast::{ExtraList, ExtraListBlock, ExtraListItem, ForStatement,
 use crate::syntax::pos::{HasSpan, Spanned};
 use crate::util::intern::Id;
 
+/// Scope used during [ExtraList] elaboration.
+/// This optionally keeps a reference to the root scope, to allow collecting root declarations.
 pub struct ExtraScope<'s, 'p> {
     root_scope: Option<&'p Scope<'p>>,
     scope: &'s mut Scope<'p>,
 }
 
 impl<'s, 'p> ExtraScope<'s, 'p> {
+    pub fn new(root_scope: Option<&'p Scope<'p>>, scope: &'s mut Scope<'p>) -> Self {
+        Self { root_scope, scope }
+    }
+
     pub fn as_scope(&mut self) -> &mut Scope<'p> {
         self.scope
     }
@@ -59,8 +65,9 @@ impl CompileItemContext<'_, '_> {
         };
         let mut cursor = ExtraCursor::new(scope_cursor, items, common_decl_in_root_scope);
 
-        while let Some(()) = cursor.next(self, flow, &mut *f)? {}
-
+        while let Some(mut leaf) = cursor.next(self, flow)? {
+            leaf.with_scope(|scope, item| f(self, scope, flow, item))?;
+        }
         Ok(())
     }
 
@@ -78,17 +85,42 @@ impl CompileItemContext<'_, '_> {
         let scope_cursor = scope_parent.new_child(&mut scope_cursor);
         let mut cursor = ExtraCursor::new(scope_cursor, items, common_decl_in_root_scope);
 
-        while let Some(()) = cursor.next(self, flow, &mut *f)? {}
-
+        while let Some(mut leaf) = cursor.next(self, flow)? {
+            leaf.with_scope(|scope, item| f(self, scope, flow, item))?;
+        }
         Ok(())
     }
 }
 
+/// The [ExtraList] elaboration state, which allows iterating over the leaf items in their proper scope, step by step.
+/// This type works similar to an [Iterator].
 pub struct ExtraCursor<'a, 's, 'p, T> {
     root_scope: ExtraScope<'s, 'p>,
     common_decl_in_root_scope: bool,
     stack_frames: Vec<Frame<'a, T>>,
     stack_scopes: Vec<Option<ScopeContent>>,
+}
+
+/// An item returned by [ExtraCursor].
+/// This contains the item itself, and conceptually also contains the corresponding scope.
+///
+/// We actually keep a mutable reference to the cursor,
+/// which ensures its scope stack remains in the right state for this item.
+pub struct ExtraLeaf<'c, 'a, 's, 'p, T> {
+    cursor: &'c mut ExtraCursor<'a, 's, 'p, T>,
+    item: &'a T,
+}
+
+impl<'a, T> ExtraLeaf<'_, 'a, '_, '_, T> {
+    pub fn item(&self) -> &'a T {
+        self.item
+    }
+
+    pub fn with_scope<R>(&mut self, f: impl FnOnce(&mut ExtraScope, &'a T) -> R) -> R {
+        with_scope(&mut self.cursor.root_scope, &mut self.cursor.stack_scopes, |s| {
+            f(s, self.item)
+        })
+    }
 }
 
 enum Frame<'a, T> {
@@ -121,12 +153,15 @@ impl<'a, 's, 'p, T> ExtraCursor<'a, 's, 'p, T> {
         }
     }
 
-    pub fn next<'c, 'h, R, F: Flow>(
+    pub fn root_scope(&mut self) -> &mut ExtraScope<'s, 'p> {
+        &mut self.root_scope
+    }
+
+    pub fn next(
         &mut self,
-        ctx: &mut CompileItemContext<'c, 'h>,
-        flow: &mut F,
-        mut f: impl FnMut(&mut CompileItemContext<'c, 'h>, &mut ExtraScope, &mut F, &'a T) -> DiagResult<R>,
-    ) -> DiagResult<Option<R>> {
+        ctx: &mut CompileItemContext,
+        flow: &mut impl Flow,
+    ) -> DiagResult<Option<ExtraLeaf<'_, 'a, 's, 'p, T>>> {
         let refs = ctx.refs;
 
         loop {
@@ -149,12 +184,14 @@ impl<'a, 's, 'p, T> ExtraCursor<'a, 's, 'p, T> {
                         Some(item) => item,
                     };
 
+                    // leafs are immediately returned, skipping scope construction
+                    if let ExtraListItem::Leaf(item) = item {
+                        return Ok(Some(ExtraLeaf { cursor: self, item }));
+                    }
+
                     // handle item
-                    let (push, eval) = with_scope(&mut self.root_scope, &mut self.stack_scopes, |scope| match item {
-                        ExtraListItem::Leaf(item) => {
-                            let eval = f(ctx, scope, flow, item)?;
-                            Ok((None, Some(eval)))
-                        }
+                    let push = with_scope(&mut self.root_scope, &mut self.stack_scopes, |scope| match item {
+                        ExtraListItem::Leaf(_) => unreachable!("already handled"),
                         ExtraListItem::Declaration(decl) => {
                             let eval = ctx.eval_declaration(scope.scope, flow, decl)?;
 
@@ -169,12 +206,11 @@ impl<'a, 's, 'p, T> ExtraCursor<'a, 's, 'p, T> {
                                 }
                             }
 
-                            Ok((None, None))
+                            Ok(None)
                         }
                         ExtraListItem::If(stmt) => {
                             let block = ctx.compile_if_statement_choose_block(scope.scope, flow, stmt)?;
-                            let push = block.map(|block| FramePush::Block(None, block));
-                            Ok((push, None))
+                            Ok(block.map(|block| FramePush::Block(None, block)))
                         }
                         ExtraListItem::Match(stmt) => {
                             let (declare, block) =
@@ -185,13 +221,11 @@ impl<'a, 's, 'p, T> ExtraCursor<'a, 's, 'p, T> {
                                 declare.declare(ctx, &mut scope_child, flow)?;
                             }
 
-                            let push = Some(FramePush::Block(Some(scope_child.into_content()), block));
-                            Ok((push, None))
+                            Ok(Some(FramePush::Block(Some(scope_child.into_content()), block)))
                         }
                         ExtraListItem::For(stmt) => {
                             let header = ctx.elaborate_for_statement_header(scope.scope, flow, stmt)?;
-                            let push = Some(FramePush::For(stmt, header));
-                            Ok((push, None))
+                            Ok(Some(FramePush::For(stmt, header)))
                         }
                     })?;
 
@@ -200,9 +234,6 @@ impl<'a, 's, 'p, T> ExtraCursor<'a, 's, 'p, T> {
                         None => {}
                         Some(FramePush::Block(scope_extra, block)) => self.push_block(scope_extra, block),
                         Some(FramePush::For(stmt, header)) => self.stack_frames.push(Frame::For { stmt, header }),
-                    }
-                    if let Some(eval) = eval {
-                        return Ok(Some(eval));
                     }
                 }
                 Frame::For { stmt, header } => {

@@ -856,7 +856,7 @@ pub type Args<N = Option<Identifier>, T = Expression> = ExtraList<Arg<N, T>>;
 #[derive(Debug, Copy, Clone)]
 pub struct Arg<N = Option<Identifier>, T = Expression> {
     pub span: Span,
-    pub name: N,
+    pub id: N,
     pub value: T,
 }
 

@@ -4,6 +4,7 @@ use crate::front::diagnostic::{DiagResult, DiagnosticError};
 use crate::front::domain::ValueDomain;
 use crate::front::expression::NamedOrValue;
 use crate::front::flow::{Flow, FlowKind, ImplicationContradiction};
+use crate::front::function::{CallArgs, Param, error_missing_argument};
 use crate::front::implication::ValueWithImplications;
 use crate::front::module_header::interface_array_shape;
 use crate::front::scope::{NamedValue, Scope};
@@ -12,70 +13,73 @@ use crate::front::string::hardware_print_string;
 use crate::front::types::{HardwareType, Type, Typed};
 use crate::front::value::{CompileValue, HardwareValue, MaybeCompile, NotCompile, SimpleCompileValue, Value};
 use crate::mid::ir::{IrExpression, IrStatement};
-use crate::syntax::ast::{Arg, Args, Expression, ExpressionKind, StringPiece};
-use crate::syntax::pos::{HasSpan, Span, Spanned};
+use crate::syntax::ast::{Expression, ExpressionKind, StringPiece};
+use crate::syntax::pos::{Span, Spanned};
 use crate::syntax::token::TOKEN_STR_BUILTIN;
 use crate::util::range_multi::MultiRange;
 use std::sync::Arc;
 
 impl CompileItemContext<'_, '_> {
-    pub fn eval_type_of(&mut self, scope: &Scope, flow: &mut impl Flow, args: &Args) -> DiagResult<Type> {
-        let diags = self.refs.diags;
+    pub fn eval_type_of(
+        &mut self,
+        flow: &mut impl Flow,
+        span_target: Span,
+        args: CallArgs<'_, '_, '_>,
+    ) -> DiagResult<Type> {
+        let refs = self.refs;
+        let diags = refs.diags;
 
-        // check single unnamed arg
-        // TODO extract common code, there are probably other users of this pattern
-        const ARG_DIAG_TITLE: &str = "`type(...)` only takes a single unnamed argument";
-
-        let mut arg_expr = None;
-        let mut scope_args = scope.new_child(args.span());
-        self.elaborate_extra_list(&mut scope_args, flow, args, false, &mut |_, _, _, arg| {
-            let &Arg { span: _, name, value } = arg;
-
-            if let Some(name) = name {
-                return Err(diags.report_error_simple(
-                    ARG_DIAG_TITLE,
-                    name.span(),
-                    "tried to pass named argument here",
-                ));
+        // unwrap args
+        let err_identifier = |span: Span, kind: &str| {
+            diags.report_error_simple(
+                format!("`type(...)` only works on identifiers, not {kind}s"),
+                span,
+                format!("tried to pass {kind} here"),
+            )
+        };
+        let mut args = match args {
+            CallArgs::Ast(args) => args,
+            CallArgs::Evaluated(args) => {
+                return Err(err_identifier(args.span, "value"));
             }
-            if arg_expr.is_some() {
-                return Err(diags.report_error_simple(ARG_DIAG_TITLE, args.span(), "too many arguments passed here"));
-            }
+        };
 
-            arg_expr = Some(value);
-            Ok(())
+        // get first argument
+        let param = Param::Positional { span: span_target };
+        let id_name = args.next_arg(self, flow, param, |ctx, scope, flow, arg_value| {
+            // get id
+            let id = match *refs.get_expr_inner(arg_value) {
+                ExpressionKind::Id(id) => id,
+                _ => return Err(err_identifier(arg_value.span, "expression")),
+            };
+
+            // eval id and named
+            let id = ctx.eval_id(scope, flow, id)?;
+            let named = ctx.eval_scoped_as_named(scope, id)?;
+            Ok((id, named))
         })?;
-
-        let Some(arg_expr) = arg_expr else {
-            return Err(diags.report_error_simple(ARG_DIAG_TITLE, args.span(), "no arguments passed here"));
+        let Some((id, named)) = id_name else {
+            return Err(error_missing_argument(refs, args.span, param));
         };
 
-        // eval id
-        let &ExpressionKind::Id(id) = self.refs.get_expr(arg_expr) else {
-            return Err(diags.report_error_simple(
-                "`type(...)` only works on identifiers, not general expressions",
-                arg_expr.span,
-                "tried to pass non-identifier here",
-            ));
-        };
-        let id = self.eval_id(scope, flow, id)?;
-
-        // eval named
-        let named = self.eval_scoped_as_named(scope, id)?;
+        // finish args
+        CallArgs::Ast(args).finish(self, flow, span_target)?;
 
         // get type
-        let ty = match named {
-            NamedOrValue::Value(value) => value.ty(),
+        match named {
+            NamedOrValue::Value(value) => Ok(value.ty()),
             NamedOrValue::Named(value) => match value {
                 NamedValue::Variable(var) => {
-                    flow.type_of(self, Spanned::new(id.span, SignalOrVariable::Variable(var)))?
+                    let var = Spanned::new(id.span, SignalOrVariable::Variable(var));
+                    flow.type_of(self, var)
                 }
                 NamedValue::Signal(signal) => {
-                    flow.type_of(self, Spanned::new(id.span, SignalOrVariable::Signal(signal)))?
+                    let signal = Spanned::new(id.span, SignalOrVariable::Signal(signal));
+                    flow.type_of(self, signal)
                 }
                 NamedValue::Interface(info) => {
                     let ref_ty = Type::RefInterface(info.intf.shape().to_vec(), info.elab.inner);
-                    let e = DiagnosticError::new(
+                    let diag = DiagnosticError::new(
                         "interface instances do not have a type",
                         id.span,
                         "interface instance used here",
@@ -83,14 +87,13 @@ impl CompileItemContext<'_, '_> {
                     .add_info(info.span_id, "interface declared here")
                     .add_footer_hint(format!(
                         "a reference to this interface, `ref(<intf>)`, has type `{}`",
-                        ref_ty.value_string(self.refs)
+                        ref_ty.value_string(refs)
                     ))
                     .report(diags);
-                    return Err(e);
+                    Err(diag)
                 }
             },
-        };
-        Ok(ty)
+        }
     }
 
     pub fn eval_builtin(

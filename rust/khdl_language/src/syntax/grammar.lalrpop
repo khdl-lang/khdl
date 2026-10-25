@@ -840,8 +840,8 @@ DotIndexKind: DotIndexKind = {
 }
 
 Arg: Arg = {
-    <start:@L> <name:(<Id> "=")?> <value:Expr> <end:@L> =>
-        Arg { name, value, span: ctx.span(start, end) },
+    <start:@L> <id:(<Id> "=")?> <value:Expr> <end:@L> =>
+        Arg { id, value, span: ctx.span(start, end) },
 }
 
 ArrayLiteralElement: ArrayLiteralElement<Expression> = {

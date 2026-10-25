@@ -1299,10 +1299,10 @@ impl<V: SyntaxVisitor> VisitContext<'_, '_, V> {
 
                 let mut scope_dummy = DeclScope::new_child(scope);
                 self.visit_extra_list(&mut scope_dummy, args, &mut |slf, scope, arg| {
-                    let &Arg { span, ref name, value } = arg;
+                    let &Arg { span, ref id, value } = arg;
                     slf.visitor.report_range(span, None);
-                    // TODO try resolving name, needs type info
-                    let _ = name;
+                    // TODO try resolving id, needs type info
+                    let _ = id;
                     slf.visit_expression(scope, value)?;
                     ControlFlow::Continue(())
                 })?;

@@ -1249,11 +1249,11 @@ impl Context<'_> {
                 let node_target = self.fmt_expr(target);
 
                 let node_args = self.fmt_extra_list(SurroundKind::Round, false, args, &|arg| {
-                    let &Arg { span: _, name, value } = arg;
+                    let &Arg { span: _, id, value } = arg;
                     let node_value = self.fmt_expr(value);
-                    let node_arg = if let Some(name) = name {
+                    let node_arg = if let Some(id) = id {
                         // TODO allow wrapping before/after "="?
-                        HNode::Sequence(vec![self.fmt_id(name), token(TT::Eq), node_value])
+                        HNode::Sequence(vec![self.fmt_id(id), token(TT::Eq), node_value])
                     } else {
                         node_value
                     };

@@ -3,6 +3,7 @@ use crate::front::check::{TypeContainsReason, check_type_contains_value, check_t
 use crate::front::compile::{CompileItemContext, CompileRefs, StackEntry};
 use crate::front::diagnostic::{DiagError, DiagResult, DiagnosticError};
 use crate::front::exit::{ExitFlag, ExitStack, ReturnEntry, ReturnEntryHardware, ReturnEntryKind};
+use crate::front::extra::{ExtraCursor, ExtraScope};
 use crate::front::flow::{Flow, FlowKind, VariableInfo};
 use crate::front::implication::ValueWithImplications;
 use crate::front::item::{
@@ -22,11 +23,8 @@ use crate::syntax::ast::{
 };
 use crate::syntax::pos::{HasSpan, Span, Spanned};
 use crate::util::ResultDoubleExt;
-use crate::util::data::VecExt;
 use crate::util::intern::Id;
-use indexmap::IndexMap;
-use indexmap::map::Entry;
-use itertools::{Either, Itertools, enumerate};
+use itertools::{Either, Itertools};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -80,264 +78,229 @@ pub enum FunctionBody<'a> {
     },
 }
 
-#[must_use]
-pub struct ParamArgMacher<'a> {
-    // constant initial values
-    refs: CompileRefs<'a, 'a>,
-    args: &'a EvaluatedArgs,
-    arg_name_to_index: IndexMap<Id, usize>,
-    positional_count: usize,
-    params_span: Span,
+/// Parameter specification.
+#[derive(Debug, Copy, Clone)]
+pub enum Param {
+    /// Only accept positional.
+    Positional { span: Span },
+    /// Only accept named with the given name.
+    Named(Spanned<Id>),
+    /// Accept either positional or named with the given name.
+    PositionalOrNamed(Spanned<Id>),
+}
 
-    // mutable state
-    next_param_index: usize,
-    arg_used: Vec<bool>,
-    param_names: IndexMap<Id, Span>,
+/// The different kinds of call arguments possible.
+pub enum CallArgs<'a, 's, 'p> {
+    /// Not yet evaluated AST arguments.
+    Ast(AstArgs<'a, 's, 'p>),
+    /// Already fully evaluated args.
+    Evaluated(EvaluatedArgs),
+}
 
-    any_err: DiagResult,
+pub struct AstArgs<'a, 's, 'p> {
+    pub span: Span,
+    pub cursor: ExtraCursor<'a, 's, 'p, Arg>,
 }
 
 pub struct EvaluatedArgs {
     pub span: Span,
-    pub inner: Vec<Arg<Option<Spanned<Id>>, Spanned<ValueWithImplications>>>,
+    pub inner: std::vec::IntoIter<EvaluatedArg>,
 }
 
-#[derive(Debug, Copy, Clone)]
-enum NamedRule {
-    OnlyNamed,
-    OnlyPositional,
-    PositionalAndNamed,
-}
+pub type EvaluatedArg = Arg<Option<Spanned<Id>>, Spanned<ValueWithImplications>>;
 
-// TODO make generic over the "value", this should be reused for instance connections in the future
-impl<'a> ParamArgMacher<'a> {
-    fn new(
-        refs: CompileRefs<'a, 'a>,
-        params_span: Span,
-        args: &'a EvaluatedArgs,
-        args_must_be_compile_without_ref: bool,
-        args_must_be_named: NamedRule,
-    ) -> DiagResult<Self> {
-        let diags = refs.diags;
-
-        // check for duplicate arg names and check that positional args are before named args
-        let mut arg_name_to_index: IndexMap<Id, usize> = IndexMap::new();
-        let mut first_named_span = None;
-        let mut positional_count: usize = 0;
-        let mut any_err_args = Ok(());
-        for (arg_index, arg) in enumerate(&args.inner) {
-            if args_must_be_compile_without_ref {
-                match CompileValue::try_from(&arg.value.inner) {
-                    Ok(arg_compile) => {
-                        if arg_compile.definitely_contains_reference() {
-                            let diag = DiagnosticError::new(
-                                "item parameters cannot contain references",
-                                arg.value.span,
-                                "argument containing reference passed here",
-                            ).add_footer_info("references must stay inside the module they belong to, they cannot escape into other items")
-                                .report(diags);
-                            any_err_args = Err(diag);
-                        }
-                    }
-                    Err(NotCompile) => {
-                        let diag = DiagnosticError::new(
-                            "call target only supports compile-time parameters",
-                            arg.value.span,
-                            "argument containing hardware value passed here",
-                        )
-                        .add_info(params_span, "parameters defined here")
-                        .report(diags);
-                        any_err_args = Err(diag);
-                    }
-                }
-            }
-
-            match (&arg.name, args_must_be_named) {
-                (None, NamedRule::OnlyNamed) => {
-                    let diag = DiagnosticError::new(
-                        "positional arguments are not allowed for this call target",
-                        arg.span,
-                        "positional argument passed here",
-                    )
-                    .add_info(params_span, "parameters defined here")
-                    .report(diags);
-                    any_err_args = Err(diag);
-                }
-                (Some(_), NamedRule::OnlyPositional) => {
-                    let diag = DiagnosticError::new(
-                        "named arguments are not allowed for this call target",
-                        arg.span,
-                        "named argument passed here",
-                    )
-                    .add_info(params_span, "parameters defined here")
-                    .report(diags);
-                    any_err_args = Err(diag);
-                }
-
-                (None, NamedRule::OnlyPositional) => {}
-                (Some(_), NamedRule::OnlyNamed) => {}
-                (_, NamedRule::PositionalAndNamed) => {}
-            }
-
-            match &arg.name {
-                Some(id) => {
-                    match arg_name_to_index.entry(id.inner) {
-                        Entry::Occupied(entry) => {
-                            let prev_index = *entry.get();
-                            let diag = DiagnosticError::new("duplicate named parameter", id.span, "passed again here")
-                                .add_info(args.inner[prev_index].span, "previously passed here")
-                                .report(diags);
-                            any_err_args = Err(diag);
-                        }
-                        Entry::Vacant(entry) => {
-                            entry.insert(arg_index);
-                        }
-                    }
-
-                    if first_named_span.is_none() {
-                        first_named_span = Some(id.span);
-                    }
-                }
-                None => {
-                    if let Some(first_named_span) = first_named_span {
-                        let diag = DiagnosticError::new(
-                            "positional arguments after named arguments are not allowed",
-                            arg.span,
-                            "later positional argument here".to_string(),
-                        )
-                        .add_info(first_named_span, "first named argument here")
-                        .report(diags);
-                        any_err_args = Err(diag);
-                    }
-
-                    positional_count += 1;
-                }
-            }
+impl Param {
+    fn span(self) -> Span {
+        match self {
+            Param::Positional { span } => span,
+            Param::Named(id) | Param::PositionalOrNamed(id) => id.span,
         }
-        any_err_args?;
+    }
+}
 
-        Ok(Self {
-            refs,
-            args,
-            positional_count,
-            arg_name_to_index,
-            params_span,
-            next_param_index: 0,
-            arg_used: vec![false; args.inner.len()],
-            param_names: IndexMap::new(),
-            any_err: Ok(()),
+impl<'a, 's, 'p> AstArgs<'a, 's, 'p> {
+    /// Pop the next argument if any, and check that it matches `param`.
+    pub fn next_arg<F: Flow, R>(
+        &mut self,
+        ctx: &mut CompileItemContext,
+        flow: &mut F,
+        param: Param,
+        f: impl FnOnce(&mut CompileItemContext, &Scope, &mut F, Expression) -> DiagResult<R>,
+    ) -> DiagResult<Option<R>> {
+        let Some(mut arg) = self.cursor.next(ctx, flow)? else {
+            return Ok(None);
+        };
+
+        arg.with_scope(|scope, arg| {
+            let &Arg { span, id, value } = arg;
+
+            let scope = scope.as_scope();
+            let id = id.map(|id| ctx.eval_id(scope, flow, id)).transpose()?;
+            check_arg_name(ctx.refs, param, span, id)?;
+
+            f(ctx, scope, flow, value)
         })
+        .map(Some)
+    }
+}
+
+impl CallArgs<'_, '_, '_> {
+    pub fn span(&self) -> Span {
+        match self {
+            CallArgs::Ast(args) => args.span,
+            CallArgs::Evaluated(args) => args.span,
+        }
     }
 
-    pub fn resolve_param(
+    /// Pop and evaluate the next argument, and heck that it matches `param` and `ty`.
+    pub fn next_value(
         &mut self,
-        id: Spanned<Id>,
+        ctx: &mut CompileItemContext,
+        flow: &mut impl Flow,
+        param: Param,
         ty: Spanned<&Type>,
-        default: Option<impl FnOnce() -> DiagResult<Spanned<ValueWithImplications>>>,
-    ) -> DiagResult<Spanned<ValueWithImplications>> {
-        let refs = self.refs;
-        let diags = self.refs.diags;
+    ) -> DiagResult<Option<Spanned<ValueWithImplications>>> {
+        // eval value
+        let value = match self {
+            CallArgs::Ast(args) => args.next_arg(ctx, flow, param, |ctx, scope, flow, expr| {
+                ctx.eval_expression_with_implications(scope, flow, ty.inner, expr)
+            })?,
+            CallArgs::Evaluated(args) => args
+                .inner
+                .next()
+                .map(|arg| {
+                    check_arg_name(ctx.refs, param, arg.span, arg.id)?;
+                    Ok(arg.value)
+                })
+                .transpose()?,
+        };
 
-        let param_index = self.next_param_index;
-        self.next_param_index += 1;
-
-        if let Some(prev_span) = self.param_names.insert(id.inner, id.span) {
-            let e = DiagnosticError::new("duplicate parameter name", id.span, "defined again here")
-                .add_info(prev_span, "previously defined here")
-                .report(diags);
-            self.any_err = Err(e);
-            return Err(e);
-        }
-
-        let value = if param_index < self.positional_count {
-            // positional match
-            let arg_index = param_index;
-            let arg = &self.args.inner[arg_index];
-            assert!(arg.name.is_none());
-            assert!(!self.arg_used[arg_index]);
-
-            // check if there's also a named match to get better error messages
-            if let Some(&other_arg_index) = self.arg_name_to_index.get(&id.inner) {
-                let e = DiagnosticError::new(
-                    "argument matches positionally but is also passed as named",
-                    self.args.inner[other_arg_index].span,
-                    "named match here",
-                )
-                .add_info(id.span, "parameter defined here")
-                .add_info(arg.span, "positional match here")
-                .report(diags);
-                self.any_err = Err(e);
-                self.arg_used[other_arg_index] = true;
-            }
-
-            self.arg_used[arg_index] = true;
-            Ok(arg.value.clone())
-        } else {
-            match self.arg_name_to_index.get(&id.inner) {
-                Some(&arg_index) => {
-                    // named match
-                    let arg = &self.args.inner[arg_index];
-                    assert!(arg.name.is_some());
-                    assert!(!self.arg_used[arg_index]);
-                    self.arg_used[arg_index] = true;
-                    Ok(arg.value.clone())
-                }
-                None => {
-                    if let Some(default) = default {
-                        // default value
-                        default()
-                    } else {
-                        // nothing matched, report error
-                        let id_str = id.inner.str(&self.refs.shared.interner);
-                        let e = DiagnosticError::new(
-                            format!("missing argument for parameter `{id_str}`"),
-                            self.args.span,
-                            "missing argument here",
-                        )
-                        .add_info(id.span, "parameter defined without default value here")
-                        .report(diags);
-                        self.any_err = Err(e);
-                        Err(e)
-                    }
-                }
+        // check type
+        let value = match value {
+            None => None,
+            Some(value) => {
+                let reason = TypeContainsReason::Parameter { param_ty: ty.span };
+                check_type_contains_value(ctx.refs, reason, ty.inner, value.as_ref())?;
+                Some(value)
             }
         };
 
-        // check type match
-        let value = value.and_then(|value| {
-            let reason = TypeContainsReason::Parameter { param_ty: ty.span };
-            check_type_contains_value(refs, reason, ty.inner, value.as_ref())?;
-            Ok(value)
-        });
-
-        if let Err(e) = value {
-            self.any_err = Err(e);
-        }
-
-        value
+        Ok(value)
     }
 
-    pub fn finish(self) -> DiagResult {
-        let diags = self.refs.diags;
-        self.any_err?;
+    /// The same as [Self::next_value] but reports an error if there are no remaining arguments.
+    pub fn require_value(
+        &mut self,
+        ctx: &mut CompileItemContext,
+        flow: &mut impl Flow,
+        param: Param,
+        ty: Spanned<&Type>,
+    ) -> DiagResult<Spanned<ValueWithImplications>> {
+        match self.next_value(ctx, flow, param, ty)? {
+            Some(value) => Ok(value),
+            None => Err(error_missing_argument(ctx.refs, self.span(), param)),
+        }
+    }
 
-        let mut any_err_used = Ok(());
-        for (i, arg_used) in enumerate(self.arg_used) {
-            if !arg_used {
-                let e = DiagnosticError::new(
-                    "argument does not match any parameter",
-                    self.args.inner[i].span,
-                    "argument passed here",
+    /// Check that all args have been used.
+    pub fn finish(self, ctx: &mut CompileItemContext, flow: &mut impl Flow, span_params: Span) -> DiagResult {
+        let span_leftover = match self {
+            CallArgs::Ast(mut args) => args.cursor.next(ctx, flow)?.map(|arg| arg.item().span),
+            CallArgs::Evaluated(mut args) => args.inner.next().map(|arg| arg.span),
+        };
+
+        match span_leftover {
+            None => Ok(()),
+            Some(span_leftover) => Err(DiagnosticError::new(
+                "argument does not match any parameter",
+                span_leftover,
+                "argument passed here",
+            )
+            .add_info(span_params, "parameters declared here")
+            .report(ctx.refs.diags)),
+        }
+    }
+}
+
+/// Check the `arg_id` matches `param`.
+fn check_arg_name(refs: CompileRefs, param: Param, span_arg: Span, arg_id: Option<Spanned<Id>>) -> DiagResult {
+    let diags = refs.diags;
+    let interner = &refs.shared.interner;
+
+    match (param, arg_id) {
+        (Param::Positional { .. } | Param::PositionalOrNamed(_), None) => {
+            // positional accepts no id
+            Ok(())
+        }
+        (Param::Positional { span }, Some(arg_id)) => {
+            // positional-only rejects id
+            Err(DiagnosticError::new(
+                "named arguments are not allowed for this call target",
+                arg_id.span,
+                "named argument passed here",
+            )
+            .add_info(span, "parameter declared here")
+            .report(diags))
+        }
+        (Param::Named(param_id) | Param::PositionalOrNamed(param_id), Some(arg_id)) => {
+            // named accepts matching id
+            if param_id.inner == arg_id.inner {
+                Ok(())
+            } else {
+                let param_str = param_id.inner.str(interner);
+                let arg_str = arg_id.inner.str(interner);
+                Err(DiagnosticError::new(
+                    "argument name does not match the parameter at this position",
+                    arg_id.span,
+                    format!("argument `{arg_str}` passed here, expected `{param_str}`"),
                 )
-                .add_info(self.params_span, "parameters defined here")
-                .report(diags);
-                any_err_used = Err(e);
+                .add_info(param_id.span, "parameter declared here")
+                .add_footer_hint("arguments must be passed in parameter order")
+                .report(diags))
             }
         }
-
-        any_err_used?;
-        Ok(())
+        (Param::Named(param_id), None) => {
+            // named-only rejects no id
+            let param_str = param_id.inner.str(interner);
+            Err(DiagnosticError::new(
+                "positional arguments are not allowed for this call target",
+                span_arg,
+                "positional argument passed here",
+            )
+            .add_info(param_id.span, "parameter declared here")
+            .add_footer_hint(format!("pass the argument by name using `{param_str}=`"))
+            .report(diags))
+        }
     }
+}
+
+pub fn error_missing_argument(refs: CompileRefs, span_args: Span, param: Param) -> DiagError {
+    let title = match param {
+        Param::Positional { .. } => "missing argument".to_owned(),
+        Param::Named(id) | Param::PositionalOrNamed(id) => {
+            format!(
+                "missing argument for parameter `{}`",
+                id.inner.str(&refs.shared.interner)
+            )
+        }
+    };
+    DiagnosticError::new(title, span_args, "missing argument here")
+        .add_info(param.span(), "parameter declared here")
+        .report(refs.diags)
+}
+
+pub fn require_compile_arg(
+    refs: CompileRefs,
+    what: &str,
+    value: Spanned<&ValueWithImplications>,
+) -> DiagResult<CompileValue> {
+    CompileValue::try_from(value.inner).map_err(|_: NotCompile| {
+        refs.diags.report_error_simple(
+            format!("{what} must be compile-time"),
+            value.span,
+            "hardware value passed here",
+        )
+    })
 }
 
 impl CompileItemContext<'_, '_> {
@@ -348,7 +311,7 @@ impl CompileItemContext<'_, '_> {
         span_target: Span,
         span_call: Span,
         function: &FunctionValue,
-        args: EvaluatedArgs,
+        args: CallArgs<'_, '_, '_>,
     ) -> DiagResult<Value> {
         let refs = self.refs;
         let diags = self.refs.diags;
@@ -382,13 +345,13 @@ impl CompileItemContext<'_, '_> {
                 } = &**function;
                 self.call_user_function(flow, *span_decl, scope_captured, params, body, span_call, None, args)
             }
-            FunctionValue::Bits(function) => self.call_bits_function(span_call, span_target, function, args),
-            &FunctionValue::StructNew(struct_elab) => self.call_struct_new(span_call, struct_elab, args),
+            FunctionValue::Bits(function) => self.call_bits_function(flow, span_call, span_target, function, args),
+            &FunctionValue::StructNew(struct_elab) => self.call_struct_new(flow, struct_elab, args),
             &FunctionValue::StructNewInfer(func_unique) => match *expected_ty {
                 Type::Struct(expected_elab) => {
                     let expected_info = self.refs.shared.elaboration_arenas.struct_info(expected_elab);
                     if expected_info.unique == func_unique {
-                        self.call_struct_new(span_call, expected_elab, args)
+                        self.call_struct_new(flow, expected_elab, args)
                     } else {
                         Err(error_unique_mismatch(
                             "struct",
@@ -403,7 +366,7 @@ impl CompileItemContext<'_, '_> {
                 _ => Err(err_infer_mismatch("struct", func_unique.id().span())),
             },
             &FunctionValue::EnumNew(enum_elab, variant_index) => {
-                self.call_enum_new(span_call, enum_elab, variant_index, &args)
+                self.call_enum_new(flow, span_call, enum_elab, variant_index, args)
             }
             &FunctionValue::EnumNewInfer(func_unique, variant_id) => match expected_ty {
                 &Type::Enum(expected_elab) => {
@@ -411,7 +374,7 @@ impl CompileItemContext<'_, '_> {
 
                     if expected_info.unique == func_unique {
                         let variant_index = expected_info.variant_index(refs, Spanned::new(span_target, variant_id))?;
-                        self.call_enum_new(span_call, expected_elab, variant_index, &args)
+                        self.call_enum_new(flow, span_call, expected_elab, variant_index, args)
                     } else {
                         Err(error_unique_mismatch(
                             "enum",
@@ -433,7 +396,7 @@ impl CompileItemContext<'_, '_> {
         flow: &mut impl Flow,
         span_call: Span,
         method: &BoundMethod<Value>,
-        args: EvaluatedArgs,
+        args: CallArgs<'_, '_, '_>,
     ) -> DiagResult<Value> {
         // TODO propagate self type too
         let BoundMethod {
@@ -474,10 +437,13 @@ impl CompileItemContext<'_, '_> {
         )
     }
 
-    // TODO ensure the expected type for fields is correctly propagated to the args
-    //   (this might need a major re-think, currently args are always evaluated in advance)
-    fn call_struct_new(&mut self, span_call: Span, elab: ElaboratedStruct, args: EvaluatedArgs) -> DiagResult<Value> {
-        let _ = span_call;
+    fn call_struct_new(
+        &mut self,
+        flow: &mut impl Flow,
+        elab: ElaboratedStruct,
+        mut args: CallArgs<'_, '_, '_>,
+    ) -> DiagResult<Value> {
+        let refs = self.refs;
         let &ElaboratedStructInfo {
             unique: _,
             debug_info_name: _,
@@ -486,17 +452,14 @@ impl CompileItemContext<'_, '_> {
             hw: _,
             members_static: _,
             methods_self: _,
-        } = self.refs.shared.elaboration_arenas.struct_info(elab);
-
-        let mut matcher = ParamArgMacher::new(self.refs, span_body, &args, false, NamedRule::OnlyNamed)?;
+        } = refs.shared.elaboration_arenas.struct_info(elab);
 
         let mut field_values = vec![];
-        for (_, &(field_id_spanned, ref field_ty)) in fields {
-            if let Ok(v) = matcher.resolve_param(field_id_spanned, field_ty.as_ref(), None::<fn() -> _>) {
-                field_values.push(v.inner.into_value());
-            }
+        for &(field_id, ref field_ty) in fields.values() {
+            let value = args.require_value(self, flow, Param::Named(field_id), field_ty.as_ref())?;
+            field_values.push(value.inner.into_value());
         }
-        matcher.finish()?;
+        args.finish(self, flow, span_body)?;
 
         let result = StructValue {
             ty: elab,
@@ -507,12 +470,14 @@ impl CompileItemContext<'_, '_> {
 
     fn call_enum_new(
         &mut self,
+        flow: &mut impl Flow,
         span_call: Span,
         elab: ElaboratedEnum,
         variant_index: usize,
-        args: &EvaluatedArgs,
+        mut args: CallArgs<'_, '_, '_>,
     ) -> DiagResult<Value> {
-        let enum_info = self.refs.shared.elaboration_arenas.enum_info(elab);
+        let refs = self.refs;
+        let enum_info = refs.shared.elaboration_arenas.enum_info(elab);
         let &ElaboratedEnumVariantInfo {
             id: variant_id,
             ref payload_ty,
@@ -525,24 +490,17 @@ impl CompileItemContext<'_, '_> {
                 "calling enum variant here",
             )
             .add_info(variant_id.span(), "enum variant declared without payload here")
-            .report(self.refs.diags)
+            .report(refs.diags)
         })?;
 
-        let mut matcher = ParamArgMacher::new(self.refs, span_call, args, false, NamedRule::OnlyPositional)?;
-        let payload = matcher
-            .resolve_param(
-                Spanned::new(variant_id.span(), variant_id.inner),
-                payload_ty.as_ref(),
-                None::<fn() -> _>,
-            )?
-            .inner
-            .into_value();
-        matcher.finish()?;
+        let param = Param::Positional { span: payload_ty.span };
+        let payload = args.require_value(self, flow, param, payload_ty.as_ref())?;
+        args.finish(self, flow, payload_ty.span)?;
 
         let result = EnumValue {
             ty: elab,
             variant: variant_index,
-            payload: Some(Box::new(payload)),
+            payload: Some(Box::new(payload.inner.into_value())),
         };
         Ok(Value::Compound(MixedCompoundValue::Enum(result)))
     }
@@ -558,7 +516,7 @@ impl CompileItemContext<'_, '_> {
         // args
         span_call: Span,
         arg_self: Option<Spanned<Value>>,
-        args: EvaluatedArgs,
+        args: CallArgs<'_, '_, '_>,
     ) -> DiagResult<Value> {
         let entry = StackEntry::FunctionCall(span_call);
         self.recurse(entry, |s| {
@@ -577,98 +535,125 @@ impl CompileItemContext<'_, '_> {
         body: &Spanned<FunctionBody>,
         // args
         arg_self: Option<Spanned<Value>>,
-        args: EvaluatedArgs,
+        args: CallArgs<'_, '_, '_>,
     ) -> DiagResult<Value> {
         self.refs.check_should_stop(span_decl)?;
 
-        // recreate captured scope
-        let span_scope = params.span.join(body.span);
-        let scope_captured = Arc::clone(scope_captured).as_scope();
-
-        // map params into scope
-        let mut scope = scope_captured.new_child(span_scope);
-        let mut param_values = vec![];
-
-        if let Some(arg_self) = arg_self {
-            scope.declare(
-                self.refs,
-                ScopeKey::Slf(arg_self.span),
-                Ok(ScopedEntry::Value(arg_self.inner)),
-            );
-        }
-
+        // decide whether to allow hardware/reference values
         let args_must_be_compile_without_ref = match body.inner {
             FunctionBody::ItemBody(_) => true,
             FunctionBody::FunctionBodyBlockOwned { .. } | FunctionBody::FunctionBodyBlockRef { .. } => false,
         };
-        let mut matcher = ParamArgMacher::new(
-            self.refs,
-            params.span,
-            &args,
-            args_must_be_compile_without_ref,
-            NamedRule::PositionalAndNamed,
-        )?;
 
-        self.elaborate_extra_list(&mut scope, flow, params, true, &mut |slf, scope, flow, param| {
+        // create parameter scope
+        let scope_captured = Arc::clone(scope_captured).as_scope();
+        let params_scope_span = params.span.join(body.span);
+        let mut params_scope = scope_captured.new_child(params_scope_span);
+
+        // declare self
+        if let Some(arg_self) = arg_self {
+            params_scope.declare(
+                self.refs,
+                ScopeKey::Slf(arg_self.span),
+                Ok(ScopedEntry::Value(arg_self.inner)),
+            );
+        };
+
+        // create parameter cursor
+        let params_scope = ExtraScope::new(None, &mut params_scope);
+        let mut params_cursor = ExtraCursor::new(params_scope, &params.items, true);
+
+        // walk over parameters and arguments in lockstep
+        let mut args = args;
+        let mut param_values_flat = vec![];
+        while let Some(mut param_leaf) = params_cursor.next(self, flow)? {
             let &Parameter {
                 span: _,
-                id,
-                ty,
-                default,
-            } = param;
+                id: param_id,
+                ty: param_ty,
+                default: param_default,
+            } = param_leaf.item();
 
-            let id_eval = slf.eval_id(scope.as_scope(), flow, id)?;
+            // eval param
+            let (param_id, param_ty) = param_leaf.with_scope(|scope, _| -> DiagResult<_> {
+                let scope = scope.as_scope();
+                let param_id = self.eval_id(scope, flow, param_id)?;
+                let param_ty = self.eval_expression_as_ty(scope, flow, param_ty)?;
+                Ok((param_id, param_ty))
+            })?;
 
-            let ty = slf.eval_expression_as_ty(scope.as_scope(), flow, ty)?;
+            // eval arg
+            let param_match = Param::PositionalOrNamed(param_id);
+            let arg_value = args.next_value(self, flow, param_match, param_ty.as_ref())?;
 
-            let mut eval_default = |default| {
-                let value = slf.eval_expression_as_compile(
-                    scope.as_scope(),
-                    flow,
-                    &ty.inner,
-                    default,
-                    Spanned::new(param.span, "parameter default value"),
-                )?;
-                Ok(value.map_inner(Value::from))
+            // use arg or fallback to param default
+            let value = match (arg_value, param_default) {
+                (Some(arg_value), _) => arg_value,
+                (None, Some(param_default)) => {
+                    let value = param_leaf.with_scope(|scope, _| {
+                        self.eval_expression_with_implications(scope.as_scope(), flow, &param_ty.inner, param_default)
+                    })?;
+
+                    let reason = TypeContainsReason::Parameter {
+                        param_ty: param_ty.span,
+                    };
+                    check_type_contains_value(self.refs, reason, &param_ty.inner, value.as_ref())?;
+
+                    value
+                }
+                (None, None) => return Err(error_missing_argument(self.refs, args.span(), param_match)),
             };
-            let default = default.map(|default| move || eval_default(default));
 
-            let value = matcher.resolve_param(id_eval, ty.as_ref(), default);
+            // check compile
+            if args_must_be_compile_without_ref {
+                let value_compile = require_compile_arg(self.refs, "item parameters", value.as_ref())?;
+                if value_compile.definitely_contains_reference() {
+                    let diag = DiagnosticError::new(
+                        "item parameters cannot contain references",
+                        value.span,
+                        "argument containing reference passed here",
+                    )
+                    .add_footer_info(
+                        "references must stay inside the module they belong to, they cannot escape into other items",
+                    )
+                    .report(self.refs.diags);
+                    return Err(diag);
+                }
+            }
 
             // record value into vec
-            if let Ok(value) = &value {
-                param_values.push((id_eval, value.inner.clone()));
-            }
+            param_values_flat.push((param_id, value.inner.clone()));
 
             // declare param in scope
             let param_var = flow.var_new_immutable_init(
-                slf.refs,
-                MaybeIdentifier::Identifier(id_eval),
-                param.id.span(),
-                value.map(|v| v.inner),
+                self.refs,
+                MaybeIdentifier::Identifier(param_id),
+                param_id.span(),
+                Ok(value.inner),
             )?;
             let entry = ScopedEntry::Named(NamedValue::Variable(param_var));
+            param_leaf
+                .with_scope(|scope, _| scope.declare_root(self.refs, MaybeIdentifier::Identifier(param_id), Ok(entry)));
+        }
+        args.finish(self, flow, params.span)?;
 
-            scope.declare_root(slf.refs, MaybeIdentifier::Identifier(id_eval), Ok(entry));
+        // we're done with the cursor, convert back to scope
+        let scope_params = &*params_cursor.root_scope().as_scope();
 
-            Ok(())
-        })?;
-        matcher.finish()?;
-
-        // run the body
+        // run the function
         let entry = StackEntry::FunctionRun(span_decl);
         self.recurse(entry, |slf| {
             match &body.inner {
                 FunctionBody::ItemBody(item_body) => {
                     // unwrap compile, we checked that these values are compile-time during argument matching
-                    let param_values = param_values
+                    let param_values = param_values_flat
                         .into_iter()
                         .map(|(id, v)| (id, CompileValue::try_from(&v).unwrap()))
                         .collect_vec();
 
                     let mut flow_inner = flow.new_child_compile(body.span, "item body");
                     let value = slf.eval_item_function_body(
-                        &scope,
+                        scope_params,
                         &mut flow_inner,
                         Some(param_values),
                         Spanned::new(body.span, item_body),
@@ -676,10 +661,10 @@ impl CompileItemContext<'_, '_> {
                     Ok(Value::from(value))
                 }
                 &FunctionBody::FunctionBodyBlockOwned { ref body, ret_ty } => {
-                    slf.run_function_body_block(flow, &scope, span_decl, ret_ty, body)
+                    slf.run_function_body_block(flow, scope_params, span_decl, ret_ty, body)
                 }
                 &FunctionBody::FunctionBodyBlockRef { body, ret_ty } => {
-                    slf.run_function_body_block(flow, &scope, span_decl, ret_ty, body)
+                    slf.run_function_body_block(flow, scope_params, span_decl, ret_ty, body)
                 }
             }
         })
@@ -747,67 +732,46 @@ impl CompileItemContext<'_, '_> {
 
     fn call_bits_function(
         &mut self,
+        flow: &mut impl Flow,
         span_call: Span,
         span_target: Span,
         function: &FunctionBits,
-        args: EvaluatedArgs,
+        mut args: CallArgs<'_, '_, '_>,
     ) -> DiagResult<Value> {
         let refs = self.refs;
         let diags = self.refs.diags;
 
-        // check arg is single non-named value
-        // TODO use new common arg-matching machinery
-        let value = match args.inner.single() {
-            Ok(Arg { span: _, name, value }) => {
-                if let Some(name) = name {
-                    return Err(diags.report_error_simple(
-                        "this function expects a single unnamed parameter",
-                        name.span,
-                        "got named argument here",
-                    ));
-                }
-                value
-            }
-            Err(_) => {
-                return Err(diags.report_error_simple(
-                    "this function expects a single parameter",
-                    args.span,
-                    "incorrect arguments here",
-                ));
-            }
+        let FunctionBits { ty_hw, kind } = function;
+        let ty_ir = ty_hw.as_ir(refs);
+        let ty_bits = HardwareType::Array(Arc::new(HardwareType::Bool), ty_ir.size_bits());
+
+        // get the single argument
+        let expected_ty = match kind {
+            FunctionBitsKind::ToBits => ty_hw.as_type(),
+            FunctionBitsKind::FromBits { .. } => ty_bits.as_type(),
         };
+        let param = Param::Positional { span: span_target };
+        let value = args.require_value(self, flow, param, Spanned::new(span_target, &expected_ty))?;
+        args.finish(self, flow, span_target)?;
         let span_value = value.span;
 
         // actual implementation
-        let FunctionBits { ty_hw, kind } = function;
-        match kind {
+        match *kind {
             FunctionBitsKind::ToBits => {
-                check_type_contains_value(
-                    refs,
-                    TypeContainsReason::Operator(span_call),
-                    &ty_hw.as_type(),
-                    value.as_ref(),
-                )?;
-
                 // try as compile-time first so we get compile-time bits back
                 match CompileValue::try_from(&value.inner) {
                     Ok(value) => {
-                        let bits = ty_hw.value_to_bits(self.refs, &value).map_err(|_: ToBitsWrongType| {
+                        let bits = ty_hw.value_to_bits(refs, &value).map_err(|_: ToBitsWrongType| {
                             diags.report_error_internal(span_call, "value_to_bits wrong type")
                         })?;
                         let bits_wrapped = bits.into_iter().map(CompileValue::new_bool).collect_vec();
                         Ok(Value::Simple(SimpleCompileValue::Array(Arc::new(bits_wrapped))))
                     }
                     Err(NotCompile) => {
-                        let value = value.inner.as_hardware_value_unchecked(
-                            self.refs,
-                            &mut self.large,
-                            span_call,
-                            ty_hw.clone(),
-                        )?;
-
-                        let ty_ir = ty_hw.as_ir(self.refs);
-                        let ty_bits = HardwareType::Array(Arc::new(HardwareType::Bool), ty_ir.size_bits());
+                        let value =
+                            value
+                                .inner
+                                .as_hardware_value_unchecked(refs, &mut self.large, span_call, ty_hw.clone())?;
                         let value_bits = HardwareValue {
                             ty: ty_bits,
                             domain: value.domain,
@@ -817,26 +781,23 @@ impl CompileItemContext<'_, '_> {
                     }
                 }
             }
-            &FunctionBitsKind::FromBits { is_unsafe } => {
-                let ty_ir = ty_hw.as_ir(self.refs);
-                let width = ty_ir.size_bits();
-
+            FunctionBitsKind::FromBits { is_unsafe } => {
                 let value = check_type_is_bool_array(
                     refs,
                     TypeContainsReason::Operator(span_call),
                     value.map_inner(|v| v.into_value()),
-                    Some(width),
+                    Some(ty_ir.size_bits()),
                 )?;
 
                 let result = match value {
                     MaybeCompile::Compile(v) => {
-                        let result = ty_hw.value_from_bits(self.refs, &v).map_err(|e| match e {
+                        let result = ty_hw.value_from_bits(refs, &v).map_err(|e| match e {
                             Either::Left(FromBitsInvalidValue) => {
                                 if is_unsafe {
                                     DiagnosticError::new(
                                         "invalid bit pattern for type",
                                         span_value,
-                                        format!("got bits `{:?}`", v),
+                                        format!("got bits `{v:?}`"),
                                     )
                                     .add_info(span_target, format!("target type `{}`", ty_hw.value_string(refs)))
                                     .report(diags)
@@ -854,7 +815,7 @@ impl CompileItemContext<'_, '_> {
                         Value::from(result)
                     }
                     MaybeCompile::Hardware(v) => {
-                        let expr = self.large.push_expr(IrExpressionLarge::FromBits(ty_ir, v.expr.clone()));
+                        let expr = self.large.push_expr(IrExpressionLarge::FromBits(ty_ir, v.expr));
                         Value::Hardware(HardwareValue {
                             ty: ty_hw.clone(),
                             domain: v.domain,
