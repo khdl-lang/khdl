@@ -10,6 +10,6 @@
    [1m[94m|[0m             [1m[91minvalid domain crossing here[0m
    [1m[94m|[0m             [1m[94msource domain is sync(clk_a)[0m
    [1m[94m|[0m
-   [1m[94m= [0m[1m[91mnote[0m: crossing due to signal read in clocked block
-   [1m[94m= [0m[1m[91mhelp[0m: to intentionally cross domains, use `unsafe_value_with_domain` or `unsafe_bool_to_clock`
+   [1m[94m= [0m[1m[92mnote[0m: crossing due to signal read in clocked block
+   [1m[94m= [0m[1m[96mhelp[0m: to intentionally cross domains, use `unsafe_value_with_domain` or `unsafe_bool_to_clock`
 

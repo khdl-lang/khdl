@@ -4,7 +4,7 @@
 use crate::syntax::pos::Span;
 use crate::syntax::source::{FileId, SourceDatabase};
 use crate::util::data::NonEmptyVec;
-use annotate_snippets::renderer::{AnsiColor, Color, Style};
+use annotate_snippets::renderer::{AnsiColor, Color, DEFAULT_HELP_STYLE, DEFAULT_NOTE_STYLE, Style};
 use annotate_snippets::{AnnotationKind, Group, Level, Renderer, Snippet};
 use indexmap::IndexMap;
 use std::backtrace::Backtrace;
@@ -298,18 +298,30 @@ impl DiagnosticContent {
             group = group.element(snippet);
         }
 
-        for (footer_kind, footer_message) in footers {
-            let footer_level = match footer_kind {
-                FooterKind::Info => Level::NOTE,
-                FooterKind::Hint => Level::HELP,
+        // TODO revert to plain level messages when https://github.com/rust-lang/annotate-snippets-rs/issues/498 is fixed,
+        //   for now we render the level names ourselves because messages don't use the level style
+        let footer_element = |kind: FooterKind, message: &str| {
+            let (name, style) = match kind {
+                FooterKind::Info => ("note", DEFAULT_NOTE_STYLE),
+                FooterKind::Hint => ("help", DEFAULT_HELP_STYLE),
             };
-            group = group.element(footer_level.message(footer_message.as_str()));
+            let label = if settings.ansi_color {
+                format!("{style}{name}{style:#}")
+            } else {
+                name.to_owned()
+            };
+            let message = message.replace('\n', &format!("\n{}", " ".repeat(name.len() + 2)));
+            Level::NOTE.no_name().message(format!("{label}: {message}"))
+        };
+
+        for (footer_kind, footer_message) in footers {
+            group = group.element(footer_element(*footer_kind, footer_message));
         }
 
         if let Some(backtrace) = &backtrace
             && settings.backtrace
         {
-            group = group.element(Level::NOTE.message(backtrace.as_str()));
+            group = group.element(footer_element(FooterKind::Info, backtrace));
         }
 
         // format into string
