@@ -23,14 +23,7 @@ pub module top ports(
         t = select(bool, enable, false, true);
     }
 
-    instance child(
-        T=int(0..256)
-    ) ports(
-        clk,
-        rst,
-        x=d1,
-        y,
-    );
+    instance child(T=int(0..256)) ports(clk, rst, x=d1, y);
 }
 
 fn select(T: type, c: bool, a: T, b: T) -> bool {

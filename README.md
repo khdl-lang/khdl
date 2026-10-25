@@ -7,7 +7,7 @@ See https://khdl-lang.org/ for an overview, or try it without installing anythin
 A short sneak-peak at the language:
 
 ```
-pub module top ports( 
+pub module top ports(
     clk: in clock,
     rst: in async bool,
 
@@ -33,11 +33,13 @@ pub module top ports(
 }
 
 interface axi_stream(T: type) {
-    ready: bool, valid: bool, data: T,
+    ready: bool,
+    valid: bool,
+    data: T,
+
     view input { ready: out, valid: in, data: in }
     view output { ready: in, valid: out, data: out }
 }
-
 ```
 
 ## Background
@@ -88,7 +90,7 @@ existing RTL languages, prefixed by _SV_ or _VHDL_.
     * Leads to code generation or lots of duplicate code
     * Makes instantiating and connection modules (one of the most basic and common things to do in RTL) much more
       convenient.
-    * _SV_/_VHDL_: the latest versions have a limited form of interfaces, but vendor support is lacking. THis means that
+    * _SV_/_VHDL_: the latest versions have a limited form of interfaces, but vendor support is lacking. This means that
       developers have to resort to writing lots of duplicate code, using editor templates or ad-hoc code generation
       tools. This makes instantiating and connecting modules with large interfaces cumbersome.
 

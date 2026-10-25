@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 
+import khdl
+
 from khdl_sandbox.common.util import compile_custom
 
 
@@ -12,6 +14,9 @@ def test_webdemo():
     # check that it compiles and elaborates
     c = compile_custom(source)
     _ = c.resolve_module("top.top")
+
+    # check that is correctly formatted
+    assert khdl.format_file(source) == source
 
 
 def test_readme():
@@ -25,3 +30,6 @@ def test_readme():
     # check that it compiles and elaborates
     c = compile_custom(source)
     _ = c.resolve_module("top.top")
+
+    # check that is correctly formatted
+    assert khdl.format_file(source) == source
