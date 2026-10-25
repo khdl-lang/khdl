@@ -379,8 +379,7 @@ impl Source {
         } = manifest;
 
         // collect hierarchy
-        let hierarchy =
-            collect_source_from_manifest(&diags, &mut source, manifest_file, manifest_parent, &manifest_source);
+        let hierarchy = collect_source_from_manifest(&diags, &mut source, manifest_parent, &manifest_source);
         let (hierarchy, _) = map_diag_error(py, &diags, &source, hierarchy)?;
 
         let manifest_span = source.full_span(manifest_file);

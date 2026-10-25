@@ -37,19 +37,15 @@ pub fn main_fmt(args: ArgsFormat) -> ExitCode {
                 Ok(m) => m,
                 Err(ErrorExit) => return ExitCode::FAILURE,
             };
-            let (_, files) = match collect_source_from_manifest(
-                &diags,
-                &mut source,
-                manifest.file,
-                &manifest.path_parent,
-                &manifest.parsed.source,
-            ) {
-                Ok(s) => s,
-                Err(_) => {
-                    print_diagnostics(&source, diags);
-                    return ExitCode::FAILURE;
-                }
-            };
+            let (_, files) =
+                match collect_source_from_manifest(&diags, &mut source, &manifest.path_parent, &manifest.parsed.source)
+                {
+                    Ok(s) => s,
+                    Err(_) => {
+                        print_diagnostics(&source, diags);
+                        return ExitCode::FAILURE;
+                    }
+                };
 
             files
         }

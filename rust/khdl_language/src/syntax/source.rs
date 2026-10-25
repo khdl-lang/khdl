@@ -1,6 +1,7 @@
 use crate::new_index_type;
 use crate::syntax::pos::{LineOffsets, Pos, PosFull, Span, SpanFull};
 use crate::util::arena::{Arena, IndexType};
+use std::ops::Range;
 
 /// The full set of source files that are part of this compilation. This type is immutable.
 #[derive(Clone)]
@@ -75,5 +76,9 @@ impl FileId {
     pub fn dummy() -> FileId {
         let mut arena = Arena::new();
         arena.push(())
+    }
+
+    pub fn span(self, bytes: Range<usize>) -> Span {
+        Span::new(self, bytes.start, bytes.end)
     }
 }

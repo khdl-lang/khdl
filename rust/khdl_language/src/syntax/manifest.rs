@@ -1,30 +1,23 @@
 use crate::front::diagnostic::{DiagResult, Diagnostics};
 use crate::syntax::pos::Span;
 use crate::syntax::source::{FileId, SourceDatabase};
+use crate::syntax::token::str_is_valid_identifier;
 use crate::util::data::VecExt;
-use indexmap::IndexMap;
+use toml::Spanned;
+use toml::de::{DeTable, DeValue};
 
 // TODO maybe add default elaboration root(s)
 // TODO allow manifests to refer to other manifests
 // TODO add external verilog filelist, at some point we can parse it to avoid manual "external" declarations
 // TODO allow marking certain files as "external", meaning that eg. format should not format them
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct Manifest {
     pub source: ManifestSource,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields, transparent)]
+#[derive(Debug, Clone)]
 pub struct ManifestSource {
-    node: ManifestSourceNode,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(untagged)]
-enum ManifestSourceNode {
-    Leaf(String),
-    Branch(IndexMap<String, ManifestSourceNode>),
+    entries: Vec<SourceEntry>,
 }
 
 impl Manifest {
@@ -32,55 +25,102 @@ impl Manifest {
         // Note: it's important that the `toml` crate feature `preserve_order` is enabled,
         //   since the order of fields in the manifest can be significant, especially for the resulting error messages.
         let content = &source[file].content;
-        toml::from_str(content).map_err(|e| {
+
+        let root = DeTable::parse(content).map_err(|e| {
             let span = match e.span() {
                 None => source.full_span(file),
-                Some(span) => Span::new(file, span.start, span.end),
+                Some(range) => file.span(range),
             };
             diags.report_error_simple(
                 format!("failed to parse manifest: {}", e.message()),
                 span,
                 "while parsing manifest here",
             )
-        })
+        })?;
+
+        let mut manifest_source = None;
+        for (key, value) in root.get_ref() {
+            match key.get_ref().as_ref() {
+                "source" => {
+                    let mut entries = vec![];
+                    collect_source_entries(diags, file, &mut vec![], value, &mut entries)?;
+                    manifest_source = Some(ManifestSource { entries });
+                }
+                other => {
+                    return Err(diags.report_error_simple(
+                        format!("unknown manifest field `{other}`"),
+                        file.span(key.span()),
+                        "unknown field here",
+                    ));
+                }
+            }
+        }
+
+        let source = manifest_source.ok_or_else(|| {
+            diags.report_error_simple(
+                "manifest is missing the `source` field",
+                Span::empty_at(source.full_span(file).start()),
+                "expected `source` field in this manifest",
+            )
+        })?;
+        Ok(Manifest { source })
     }
 }
 
+fn collect_source_entries(
+    diags: &Diagnostics,
+    file: FileId,
+    steps: &mut Vec<String>,
+    node: &Spanned<DeValue>,
+    entries: &mut Vec<SourceEntry>,
+) -> DiagResult {
+    match node.get_ref() {
+        DeValue::String(path) => {
+            entries.push(SourceEntry {
+                span_path: file.span(node.span()),
+                steps: steps.clone(),
+                path_relative: path.to_string(),
+            });
+            Ok(())
+        }
+        DeValue::Table(table) => {
+            for (key, value) in table {
+                let key_str = key.get_ref().as_ref();
+                if key_str == "_" {
+                    collect_source_entries(diags, file, steps, value, entries)?;
+                } else {
+                    if !str_is_valid_identifier(key_str) {
+                        return Err(diags.report_error_simple(
+                            format!("invalid identifier `{key_str}` in package path"),
+                            file.span(key.span()),
+                            "invalid identifier here",
+                        ));
+                    }
+                    steps.with_pushed(key_str.to_owned(), |steps| {
+                        collect_source_entries(diags, file, steps, value, entries)
+                    })?;
+                }
+            }
+            Ok(())
+        }
+        _ => Err(diags.report_error_simple(
+            "invalid manifest source entry",
+            file.span(node.span()),
+            "expected a path string or a table of entries",
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SourceEntry {
+    pub span_path: Span,
+
     pub steps: Vec<String>,
     pub path_relative: String,
 }
 
-// TODO somehow add stdlib by default
 impl ManifestSource {
-    pub fn entries(&self) -> Vec<SourceEntry> {
-        let mut entries = vec![];
-        for_each_entry_impl(&mut vec![], &self.node, &mut |prefix, path| {
-            let entry = SourceEntry {
-                steps: prefix.iter().map(|s| s.to_string()).collect(),
-                path_relative: path.to_string(),
-            };
-            entries.push(entry);
-        });
-        entries
-    }
-}
-
-fn for_each_entry_impl<'n>(prefix: &mut Vec<&'n str>, node: &'n ManifestSourceNode, f: &mut impl FnMut(&[&str], &str)) {
-    match node {
-        ManifestSourceNode::Leaf(path) => f(prefix, path),
-        ManifestSourceNode::Branch(map) => {
-            for (k, v) in map {
-                let actual_key = k != "_";
-
-                if actual_key {
-                    prefix.with_pushed(k, |prefix| {
-                        for_each_entry_impl(prefix, v, f);
-                    })
-                } else {
-                    for_each_entry_impl(prefix, v, f);
-                }
-            }
-        }
+    pub fn entries(&self) -> &[SourceEntry] {
+        &self.entries
     }
 }

@@ -37,7 +37,6 @@ struct ManifestCommon {
 
     diags: Diagnostics,
     source: SourceDatabase,
-    manifest_file: FileId,
     file_to_path: IndexMap<FileId, PathBuf>,
 }
 
@@ -230,11 +229,12 @@ impl ServerState {
             if let Ok(manifest) = &parsed {
                 for entry in manifest.source.entries() {
                     let SourceEntry {
+                        span_path: _,
                         steps: _,
                         path_relative,
                     } = entry;
 
-                    let entry_path = path_join_normalized(&manifest_folder, Path::new(&path_relative))
+                    let entry_path = path_join_normalized(&manifest_folder, Path::new(path_relative))
                         .map_err(|e| SendErrorOr::Other(RequestError::Vfs(VfsError::FailedNormalization(e))))?;
 
                     watchers.push(build_watcher_any_file_with_name(
@@ -248,7 +248,6 @@ impl ServerState {
                 manifest_folder,
                 diags,
                 source,
-                manifest_file,
                 file_to_path,
             };
             let manifest_found = ManifestFound { common, parsed };
@@ -313,17 +312,18 @@ fn collect_manifest_sources(
 
     try_inner!(add_std_sources(diags, source, &mut hierarchy));
 
-    // TODO get more precise span
-    let manifest_span = source.full_span(common.manifest_file);
-
     for entry in parsed.source.entries() {
-        let SourceEntry { steps, path_relative } = entry;
+        let &SourceEntry {
+            span_path,
+            ref steps,
+            ref path_relative,
+        } = entry;
 
-        let entry_path = path_join_normalized(&common.manifest_folder, Path::new(&path_relative))?;
+        let entry_path = path_join_normalized(&common.manifest_folder, Path::new(path_relative))?;
 
         // TODO don't early exit, visit all entries before returning error
         // TODO insert extra files from Vfs that don't yet exist on disk
-        let files = try_inner!(collect_source_files_from_tree(diags, manifest_span, entry_path));
+        let files = try_inner!(collect_source_files_from_tree(diags, span_path, entry_path));
 
         let file_paths = files.iter().map(|(_, p)| p.to_owned()).collect_vec();
 
@@ -331,8 +331,8 @@ fn collect_manifest_sources(
             diags,
             source,
             &mut hierarchy,
-            manifest_span,
-            steps,
+            span_path,
+            steps.clone(),
             &files,
             |file_path| match vfs.read_str_maybe_from_disk(file_path) {
                 Ok(s) => Ok(s.to_owned()),

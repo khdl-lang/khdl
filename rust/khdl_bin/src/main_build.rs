@@ -75,19 +75,14 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
 
     // collect source
     let diags = Diagnostics::new();
-    let (hierarchy, _) = match collect_source_from_manifest(
-        &diags,
-        &mut source,
-        manifest.file,
-        &manifest.path_parent,
-        &manifest_source,
-    ) {
-        Ok(s) => s,
-        Err(_) => {
-            print_diagnostics(&source, diags);
-            return ExitCode::FAILURE;
-        }
-    };
+    let (hierarchy, _) =
+        match collect_source_from_manifest(&diags, &mut source, &manifest.path_parent, &manifest_source) {
+            Ok(s) => s,
+            Err(_) => {
+                print_diagnostics(&source, diags);
+                return ExitCode::FAILURE;
+            }
+        };
     let time_source = start_source.elapsed();
 
     // print source info

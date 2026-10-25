@@ -15,8 +15,6 @@ use std::path::{Path, PathBuf};
 pub fn collect_source_from_manifest(
     diags: &Diagnostics,
     source: &mut SourceDatabase,
-    // TODO get more detailed spans
-    manifest_file: FileId,
     manifest_path: &Path,
     manifest: &ManifestSource,
 ) -> DiagResult<(SourceHierarchy, IndexMap<FileId, PathBuf>)> {
@@ -27,18 +25,21 @@ pub fn collect_source_from_manifest(
     add_std_sources(diags, source, &mut hierarchy)?;
 
     // add manifest entries
-    let manifest_span = source.full_span(manifest_file);
     for entry in manifest.entries() {
-        let SourceEntry { steps, path_relative } = entry;
+        let &SourceEntry {
+            span_path,
+            ref steps,
+            ref path_relative,
+        } = entry;
         let entry_path = manifest_path.join(path_relative).clean();
 
-        let file_steps_and_paths = collect_source_files_from_tree(diags, manifest_span, entry_path)?;
+        let file_steps_and_paths = collect_source_files_from_tree(diags, span_path, entry_path)?;
 
         let files = add_source_files_to_tree(
             diags,
             source,
             &mut hierarchy,
-            manifest_span,
+            span_path,
             steps.clone(),
             &file_steps_and_paths,
             |path| std::fs::read_to_string(path).map_err(|e| e.with_context(IoAction::Read, path).to_string()),
@@ -56,7 +57,7 @@ pub fn add_source_files_to_tree(
     diags: &Diagnostics,
     source: &mut SourceDatabase,
     hierarchy: &mut SourceHierarchy,
-    manifest_span: Span,
+    span: Span,
     steps: Vec<String>,
     files: &Vec<(Vec<String>, PathBuf)>,
     mut read: impl FnMut(&Path) -> Result<String, String>,
@@ -68,11 +69,10 @@ pub fn add_source_files_to_tree(
         let mut all_steps = steps.clone();
         all_steps.extend(relative_steps.iter().cloned());
 
-        let content =
-            read(path).map_err(|e| diags.report_error_simple(e, manifest_span, "while reading files here"))?;
+        let content = read(path).map_err(|e| diags.report_error_simple(e, span, "while reading files here"))?;
 
         let file = source.add_file(path.to_string_lossy().into_owned(), content);
-        hierarchy.add_file(diags, source, manifest_span, &all_steps, file)?;
+        hierarchy.add_file(diags, source, span, &all_steps, file)?;
 
         file_ids.push(file);
     }

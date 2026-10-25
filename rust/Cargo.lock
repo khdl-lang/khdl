@@ -506,7 +506,6 @@ checksum = "93ead53efc7ea8ed3cfb0c79fc8023fbb782a5432b52830b6518941cebe6505c"
 dependencies = [
  "equivalent",
  "hashbrown",
- "serde",
 ]
 
 [[package]]
@@ -595,7 +594,6 @@ dependencies = [
  "rand",
  "regex",
  "regex-automata",
- "serde",
  "serde_json",
  "strum",
  "toml",

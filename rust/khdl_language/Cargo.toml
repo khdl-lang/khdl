@@ -23,7 +23,7 @@ dashmap.workspace = true
 derive_more.workspace = true
 dlopen2 = { workspace = true, optional = true }
 fnv.workspace = true
-indexmap = { workspace = true, features = ["serde"] }
+indexmap.workspace = true
 itertools.workspace = true
 lalrpop-util.workspace = true
 lazy_static.workspace = true
@@ -35,7 +35,6 @@ path-clean.workspace = true
 rand.workspace = true
 regex-automata.workspace = true
 regex.workspace = true
-serde = { workspace = true, features = ["serde_derive"] }
 serde_json.workspace = true
 strum.workspace = true
 toml = { workspace = true, features = ["preserve_order"] }
