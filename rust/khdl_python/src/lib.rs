@@ -49,6 +49,7 @@ use pyo3::{
     Bound, IntoPyObject, IntoPyObjectExt, Py, PyAny, PyClassInitializer, PyErr, PyRef, PyResult, Python,
     create_exception, intern, pyclass, pyfunction, pymethods, pymodule, wrap_pyfunction,
 };
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -941,7 +942,7 @@ impl Module {
     }
 
     #[allow(clippy::wrong_self_convention)]
-    #[pyo3(signature=(build_dir, *, extra_verilog_files=None, optimization=None, compiler=None))]
+    #[pyo3(signature=(build_dir, *, extra_verilog_files=None, optimization=None, compiler=None, jobs=None))]
     fn as_verilated(
         slf: Py<Self>,
         py: Python,
@@ -949,12 +950,14 @@ impl Module {
         extra_verilog_files: Option<Vec<PathBuf>>,
         optimization: Option<u8>,
         compiler: Option<String>,
+        jobs: Option<NonZeroUsize>,
     ) -> PyResult<ModuleVerilated> {
         // handle args
         let extra_verilog_files = extra_verilog_files.unwrap_or_default();
         if optimization.is_some_and(|level| level > 3) {
             return Err(PyValueError::new_err("Verilator optimization must be between 0 and 3"));
         }
+        let jobs = jobs.unwrap_or_else(|| get_num_cpus());
 
         // Select code-generation workarounds, C++ driver, and matching PCH
         // settings together; Verilator's configured defaults may use another compiler.
@@ -1048,7 +1051,7 @@ impl Module {
                     .arg("-f")
                     .arg(name_mk)
                     .arg("-j")
-                    .arg(get_num_cpus().get().to_string())
+                    .arg(jobs.to_string())
                     .args(compiler.into_iter().flat_map(|(_, driver, pch_include, pch_suffix)| {
                         [
                             format!("CXX={driver}"),
