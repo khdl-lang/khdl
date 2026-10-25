@@ -1,5 +1,7 @@
 # KHDL
 
+[![PyPI](https://img.shields.io/pypi/v/khdl)](https://pypi.org/project/khdl/)
+
 An experimental new language for hardware design.
 See https://khdl-lang.org/ for an overview, or try it without installing anything in the
 [web demo](https://khdl-lang.org/demo/).
@@ -224,7 +226,13 @@ The top module must be public and have no generic parameters. `khdl_bin fmt` for
 ### Python bindings
 
 The Python bindings can elaborate modules, call compile-time functions, export Verilog and simulate designs through
-[Verilator](https://www.veripool.org/verilator/). Install them from the repository root with:
+[Verilator](https://www.veripool.org/verilator/). They are published on [PyPI](https://pypi.org/project/khdl/):
+
+```bash
+pip install khdl
+```
+
+Alternatively, build and install them from the repository root with:
 
 ```bash
 pip install ./rust/khdl_python
