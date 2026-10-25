@@ -15,4 +15,4 @@ valgrind --tool=cachegrind --cachegrind-out-file=cachegrind.out \
 valgrind --tool=callgrind --callgrind-out-file=callgrind.out \
   $COMMAND
 
-samply record ./target/profiling/khdl_bin ../python/profile_test/ -j1
+samply record ./target/profiling/khdl ../python/profile_test/ -j1

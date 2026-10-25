@@ -204,7 +204,7 @@ cd khdl/rust
 cargo build --release -p khdl_bin
 ```
 
-This builds the compiler as `rust/target/release/khdl_bin`, the commands below assume it's on your `PATH`.
+This builds the compiler as `rust/target/release/khdl`, the commands below assume it's on your `PATH`.
 
 A project is a directory with a `khdl.toml` manifest, which maps source directories to namespaces. With this
 manifest, a file `src/blink.kh` defines the items `blink.<name>`:
@@ -217,11 +217,11 @@ _ = "src"
 From the project directory, check all items, or elaborate a top module and write it out as Verilog:
 
 ```bash
-khdl_bin build
-khdl_bin build --top blink.Blink --output-verilog build/blink.v
+khdl build
+khdl build --top blink.Blink --output-verilog build/blink.v
 ```
 
-The top module must be public and have no generic parameters. `khdl_bin fmt` formats all source files of the project.
+The top module must be public and have no generic parameters. `khdl fmt` formats all source files of the project.
 
 ### Python bindings
 

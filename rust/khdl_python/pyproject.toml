@@ -33,6 +33,7 @@ requires = ["maturin>=1.11,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
+module-name = "khdl"
 features = ["pyo3/extension-module"]
 
 [tool.uv]

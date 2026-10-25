@@ -8,7 +8,11 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
-default-run = "khdl_bin"
+default-run = "khdl"
+
+[[bin]]
+name = "khdl"
+path = "src/main.rs"
 
 [lints]
 workspace = true
