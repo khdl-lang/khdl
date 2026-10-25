@@ -1,4 +1,4 @@
-use crate::front::check::check_hardware_type_for_bit_operation;
+use crate::front::check::{TypeContainsReason, check_hardware_type_for_bit_operation, check_type_contains_value};
 use crate::front::compile::{CompileItemContext, CompileRefs, resolve_import_final};
 use crate::front::diagnostic::{DiagError, DiagResult, DiagnosticError, Diagnostics};
 use crate::front::domain::ValueDomain;
@@ -632,7 +632,7 @@ impl TargetSteps<&TargetStepCompile> {
     ) -> DiagResult {
         let target_span = target.span;
         let target = Spanned::new(target_span, SetCompileTarget::Scalar(target.inner));
-        set_compile_value_impl(refs, target, &self.steps, assign_op_span, source)
+        set_compile_value_impl(refs, target, &self.steps, assign_op_span, source, None)
     }
 
     /// Evaluate the expression `value[steps]`
@@ -1019,12 +1019,21 @@ fn set_compile_value_impl(
     steps: &[SpannedStep<&TargetStepCompile>],
     assign_op_span: Span,
     source: Spanned<CompileValue>,
+    expected_ty: Option<Spanned<Type>>,
 ) -> DiagResult {
     let diags = refs.diags;
     let elab = &refs.shared.elaboration_arenas;
 
     // if done just do the final assignment, otherwise get the next step
     let Some((step, steps)) = steps.split_first() else {
+        if let Some(expected_ty) = expected_ty {
+            let reason = TypeContainsReason::Assignment {
+                span_target: target.span,
+                span_target_ty: expected_ty.span,
+            };
+            check_type_contains_value(refs, reason, &expected_ty.inner, source.as_ref())?;
+        }
+
         match target.inner {
             SetCompileTarget::Scalar(target) => {
                 // scalar assignment target, just replace the entire value
@@ -1083,7 +1092,7 @@ fn set_compile_value_impl(
 
     let target_span = target.span;
     let step_span = step.span_step;
-    let new_target = match step.step {
+    let (new_target, field_ty) = match step.step {
         TargetStepCompile::ArrayIndex(index) => {
             let target_inner = check_target_is_array(refs, target, step_span, false)?;
 
@@ -1093,7 +1102,8 @@ fn set_compile_value_impl(
                 Spanned::new(target_span, target_inner.len()),
             )?;
 
-            SetCompileTarget::Scalar(&mut target_inner[index])
+            let new_target = SetCompileTarget::Scalar(&mut target_inner[index]);
+            (new_target, None)
         }
         TargetStepCompile::ArraySlice {
             start: slice_start,
@@ -1111,7 +1121,8 @@ fn set_compile_value_impl(
                 Spanned::new(target_span, target_inner.len()),
             )?;
 
-            SetCompileTarget::Slice(&mut target_inner[slice_start..][..slice_len])
+            let new_target = SetCompileTarget::Slice(&mut target_inner[slice_start..][..slice_len]);
+            (new_target, None)
         }
         TargetStepCompile::DotIndexInt(index) => {
             // check target is tuple
@@ -1134,7 +1145,8 @@ fn set_compile_value_impl(
             let index = check_tuple_index(diags, target_inner.len(), index, target_span, step_span)?;
 
             // build new target
-            SetCompileTarget::Scalar(&mut target_inner[index])
+            let new_target = SetCompileTarget::Scalar(&mut target_inner[index]);
+            (new_target, None)
         }
         TargetStepCompile::DotIndexId(field) => {
             // check target is struct
@@ -1156,14 +1168,35 @@ fn set_compile_value_impl(
             // get field index
             let ty_info = elab.struct_info(target_inner.ty);
             let field_index = ty_info.field_index(refs, target_span, Spanned::new(step_span, *field))?;
+            let field_ty = ty_info.fields[field_index].1.clone();
 
             // build new target
-            SetCompileTarget::Scalar(&mut target_inner.fields[field_index])
+            let new_target = SetCompileTarget::Scalar(&mut target_inner.fields[field_index]);
+            (new_target, Some(field_ty))
         }
     };
 
+    // Preserve extra type constraints we encounter along the way. These can only come from struct fields.
+    // * if this was a struct field, set the new expected type to the type of that field
+    // * otherwise, just apply the step to the current expected type if there is one
+    let next_expected_ty = match field_ty {
+        Some(field_ty) => Some(field_ty),
+        None => expected_ty
+            .map(|ty| {
+                let span = ty.span;
+                let step = SpannedStep {
+                    span_full: step.span_full,
+                    span_step: step.span_step,
+                    step: TargetStep::Compile(step.step.clone()),
+                };
+                let new_ty = TargetSteps::single(step).apply_to_expected_type(refs, ty)?;
+                Ok(Spanned::new(span, new_ty))
+            })
+            .transpose()?,
+    };
+
     let new_target = Spanned::new(step.span_full, new_target);
-    set_compile_value_impl(refs, new_target, steps, assign_op_span, source)
+    set_compile_value_impl(refs, new_target, steps, assign_op_span, source, next_expected_ty)
 }
 
 fn check_target_is_array<'a>(
