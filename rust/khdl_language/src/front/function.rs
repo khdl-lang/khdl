@@ -284,7 +284,7 @@ pub fn error_missing_argument(refs: CompileRefs, span_args: Span, param: Param) 
             )
         }
     };
-    DiagnosticError::new(title, span_args, "missing argument here")
+    DiagnosticError::new(title, Span::empty_at(span_args.end()), "missing argument here")
         .add_info(param.span(), "parameter declared here")
         .report(refs.diags)
 }

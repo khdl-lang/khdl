@@ -39,7 +39,7 @@ use crate::syntax::ast::{
 use crate::syntax::parsed::AstRefModuleInternal;
 use crate::syntax::pos::{HasSpan, Span, Spanned};
 use crate::util::arena::Arena;
-use crate::util::data::{IndexMapExt, VecExt};
+use crate::util::data::{IndexMapExt, NonEmptyVec, VecExt};
 use crate::util::intern::Id;
 use crate::util::nd_array::{NdArray, NdArrayShape, try_for_each_nd_index};
 use crate::util::{ResultExt, result_pair};
@@ -914,54 +914,44 @@ impl BodyContext {
         let interface_mismatches = rest
             .iter()
             .filter(|other| first.interface.inner != other.interface.inner)
-            .collect_vec();
-        if !interface_mismatches.is_empty() {
-            let mut diag = DiagnosticError::new(
-                "interface mismatch",
-                stmt.span,
-                "connect entries must have matching interfaces",
-            )
-            .add_info(
-                first.span,
-                format!(
-                    "first entry has interface `{}`",
-                    first.interface.inner.value_string(refs)
-                ),
-            );
-            for other in interface_mismatches {
-                diag = diag.add_info(
-                    other.span,
-                    format!(
-                        "this entry has interface `{}`",
-                        other.interface.inner.value_string(refs)
-                    ),
+            .map(|other| {
+                let message = format!(
+                    "this entry has interface `{}`",
+                    other.interface.inner.value_string(refs)
                 );
-            }
-            return Err(diag.report(diags));
+                (other.span, message)
+            })
+            .collect_vec();
+        if let Ok(interface_mismatches) = NonEmptyVec::try_from(interface_mismatches) {
+            let diag = DiagnosticError::new_multiple("interface mismatch", interface_mismatches)
+                .add_info(
+                    first.span,
+                    format!(
+                        "first entry has interface `{}`",
+                        first.interface.inner.value_string(refs)
+                    ),
+                )
+                .report(diags);
+            return Err(diag);
         }
 
         // check that all shapes match
         let shape_mismatches = rest
             .iter()
             .filter(|other| first.intf.shape() != other.intf.shape())
+            .map(|other| {
+                let message = format!("this entry is {}", describe_interface_shape(other.intf.shape()));
+                (other.span, message)
+            })
             .collect_vec();
-        if !shape_mismatches.is_empty() {
-            let mut diag = DiagnosticError::new(
-                "interface array shape mismatch",
-                stmt.span,
-                "connect entries must have matching interface shapes",
-            )
-            .add_info(
-                first.span,
-                format!("first entry is {}", describe_interface_shape(first.intf.shape())),
-            );
-            for other in shape_mismatches {
-                diag = diag.add_info(
-                    other.span,
-                    format!("this entry is {}", describe_interface_shape(other.intf.shape())),
-                );
-            }
-            return Err(diag.report(diags));
+        if let Ok(shape_mismatches) = NonEmptyVec::try_from(shape_mismatches) {
+            let diag = DiagnosticError::new_multiple("interface array shape mismatch", shape_mismatches)
+                .add_info(
+                    first.span,
+                    format!("first entry is {}", describe_interface_shape(first.intf.shape())),
+                )
+                .report(diags);
+            return Err(diag);
         }
 
         // for each signal, find the single driver entry, grouping errors by the set of driving entries
