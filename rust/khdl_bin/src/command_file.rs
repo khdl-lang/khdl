@@ -29,7 +29,7 @@ impl CommandLineFile {
                 start
             } else {
                 let arg_escaped = arg.replace('"', "\\\"");
-                swrite!(f, " \"");
+                swrite!(f, "\"");
                 let start = f.len();
                 swrite!(f, "{arg_escaped}\"");
                 start
