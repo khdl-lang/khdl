@@ -83,6 +83,19 @@ pub struct LeftInterfaceInfo {
     pub intf: NdArray<Interface>,
 }
 
+fn is_reference_field(refs: CompileRefs, ty: &Type, field: Id) -> bool {
+    match ty {
+        Type::Struct(elab) => refs
+            .shared
+            .elaboration_arenas
+            .struct_info(*elab)
+            .fields
+            .get(&field)
+            .is_some_and(|field| field.ref_.is_some()),
+        _ => false,
+    }
+}
+
 impl LrValue {
     pub fn from_named(span: Span, named: NamedValue) -> LrValue {
         match named {
@@ -90,6 +103,53 @@ impl LrValue {
             NamedValue::Signal(sig) => LrValue::LeftTarget(AssignmentTarget::simple(Spanned::new(span, sig.into()))),
             NamedValue::Interface(intf) => LrValue::LeftInterface(intf),
         }
+    }
+
+    /// Resolve logical fields only when the deferred place is consumed. Neither
+    /// declaration hints nor a union type identify the actual struct beneath `any`.
+    pub fn resolve_reference_fields(self, ctx: &mut CompileItemContext, flow: &mut impl Flow) -> DiagResult<Self> {
+        let LrValue::LeftTarget(AssignmentTarget { base, steps }) = self else {
+            return Ok(self);
+        };
+        let mut result = LrValue::LeftTarget(AssignmentTarget::simple(base));
+        // Reuse the receiver snapshot as we walk ordinary projections. Taking a
+        // fresh snapshot at every named field would repeatedly clone the root.
+        let mut receiver_cursor: Option<(ValueWithImplications, usize)> = None;
+        for step in steps.steps {
+            if let LrValue::LeftTarget(target) = &result
+                && let TargetStep::Compile(TargetStepCompile::DotIndexId(field)) = &step.step
+                && let SignalOrVariable::Variable(var) = target.base.inner
+            {
+                // Inspect the stored receiver, without copying/reading a hardware
+                // referent. Signals cannot contain reference fields in their layout.
+                let (receiver, prefix_len) = match receiver_cursor.take() {
+                    Some(cursor) => cursor,
+                    None => (
+                        flow.var_eval_without_copy(&mut ctx.large, target.base.map_inner(|_| var))?,
+                        0,
+                    ),
+                };
+                let remaining = TargetSteps::new(target.steps.steps[prefix_len..].to_vec());
+                let receiver = remaining.apply_to_value(ctx, &Type::Any, Spanned::new(target.base.span, receiver))?;
+                if is_reference_field(ctx.refs, &receiver.ty(), *field) {
+                    let binding = TargetSteps::single(step.clone()).apply_to_value(
+                        ctx,
+                        &Type::Any,
+                        Spanned::new(step.span_full, receiver),
+                    )?;
+                    result = ctx.deref_value(
+                        flow,
+                        step.span_full,
+                        step.span_step,
+                        Spanned::new(step.span_full, binding.into_value()),
+                    )?;
+                    continue;
+                }
+                receiver_cursor = Some((receiver, target.steps.steps.len()));
+            }
+            result = ctx.project_lr_value(flow, &Type::Any, base.span, result, step)?;
+        }
+        Ok(result)
     }
 
     /// Evaluate as a value.
@@ -102,7 +162,7 @@ impl LrValue {
         let refs = ctx.refs;
         let diags = refs.diags;
 
-        match self {
+        match self.resolve_reference_fields(ctx, flow)? {
             LrValue::LeftTarget(v) => {
                 // eval base
                 let AssignmentTarget { base, steps } = v;
@@ -130,10 +190,15 @@ impl LrValue {
     }
 
     /// Evaluate as an assignment target.
-    pub fn into_target(self, ctx: &mut CompileItemContext, span: Span) -> DiagResult<AssignmentTarget> {
+    pub fn into_target(
+        self,
+        ctx: &mut CompileItemContext,
+        flow: &mut impl Flow,
+        span: Span,
+    ) -> DiagResult<AssignmentTarget> {
         let diags = ctx.refs.diags;
 
-        match self {
+        match self.resolve_reference_fields(ctx, flow)? {
             LrValue::LeftTarget(t) => Ok(t),
             LrValue::LeftInterface(info) => {
                 let e = DiagnosticError::new("cannot use interface as target", span, "interface used as target here")
@@ -267,7 +332,7 @@ impl<'a> CompileItemContext<'a, '_> {
         expr: Expression,
     ) -> DiagResult<AssignmentTarget> {
         self.eval_expression_as_lr(scope, flow, &Type::Any, expr)?
-            .into_target(self, expr.span)
+            .into_target(self, flow, expr.span)
     }
 
     pub fn eval_expression_as_lr(
@@ -753,68 +818,7 @@ impl<'a> CompileItemContext<'a, '_> {
                     step,
                 };
 
-                match base {
-                    LrValue::LeftTarget(base) => {
-                        let mut result = base;
-                        result.steps.push(step);
-                        LrValue::LeftTarget(result)
-                    }
-                    LrValue::LeftInterface(info) => {
-                        let Some(array_len) = info.intf.first_len() else {
-                            let e = DiagnosticError::new(
-                                "cannot index into interface",
-                                expr.span,
-                                "trying to index into interface here",
-                            )
-                            .add_info(base_span, "base evaluates to an interface")
-                            .add_info(info.span_id, "interface declared here")
-                            .report(diags);
-                            return Err(e);
-                        };
-                        let array_len = Spanned::new(base_span, array_len);
-
-                        let intf = match step.step {
-                            // index
-                            TargetStep::Compile(TargetStepCompile::ArrayIndex(index)) => {
-                                let index =
-                                    check_range_index_compile(diags, Spanned::new(step.span_step, &index), array_len)?;
-                                info.intf.step_index(index).expect("already checked range")
-                            }
-                            // slice
-                            TargetStep::Compile(TargetStepCompile::ArraySlice { start, length }) => {
-                                let SliceInfo { start, length } = check_range_slice_compile(
-                                    diags,
-                                    Spanned::new(step.span_step, &start),
-                                    length.as_ref().map(|length| Spanned::new(step.span_step, length)),
-                                    array_len,
-                                )?;
-                                info.intf.step_slice(start, length).expect("already checked range")
-                            }
-                            // hardware index/slice not yet supported
-                            TargetStep::Hardware(TargetStepHardware::ArrayIndex(_)) => {
-                                let msg = "indexing interface arrays with a hardware value";
-                                return Err(diags.report_error_todo(step.span_step, msg));
-                            }
-                            TargetStep::Hardware(TargetStepHardware::ArraySlice { .. }) => {
-                                let msg = "slicing interface arrays with a hardware start";
-                                return Err(diags.report_error_todo(step.span_step, msg));
-                            }
-                            // impossible case
-                            TargetStep::Compile(
-                                TargetStepCompile::DotIndexInt(_) | TargetStepCompile::DotIndexId(_),
-                            ) => {
-                                let msg = "dot index step from array index expression";
-                                return Err(diags.report_error_internal(step.span_step, msg));
-                            }
-                        };
-                        LrValue::LeftInterface(LeftInterfaceInfo { intf, ..info })
-                    }
-                    LrValue::Right(base) => {
-                        let steps = TargetSteps::single(step);
-                        let result = steps.apply_to_value(self, expected_ty, Spanned::new(base_span, base))?;
-                        LrValue::Right(result)
-                    }
-                }
+                self.project_lr_value(flow, expected_ty, base_span, base, step)?
             }
             &ExpressionKind::DotIndex(base, index) => {
                 let base_span = base.span;
@@ -829,116 +833,16 @@ impl<'a> CompileItemContext<'a, '_> {
                     ),
                 };
 
-                let index_to_step = |index: Either<Id, BigUint>| {
-                    let step = match index {
-                        Either::Left(index) => TargetStepCompile::DotIndexId(index),
-                        Either::Right(index) => TargetStepCompile::DotIndexInt(index),
-                    };
-                    SpannedStep {
-                        span_full: expr.span,
-                        span_step: index_span,
-                        step: TargetStep::Compile(step),
-                    }
+                let step = match index {
+                    Either::Left(index) => TargetStepCompile::DotIndexId(index),
+                    Either::Right(index) => TargetStepCompile::DotIndexInt(index),
                 };
-
-                let base_ty = match &base {
-                    LrValue::LeftTarget(target) => {
-                        let ty = match target.base.inner {
-                            SignalOrVariable::Signal(signal) => {
-                                Some(signal.expect_ty(self, target.base.span)?.inner.as_type())
-                            }
-                            SignalOrVariable::Variable(var) => {
-                                match &flow.var_info(Spanned::new(target.base.span, var))?.ty {
-                                    Some(ty) => Some(ty.inner.clone()),
-                                    None => Some(
-                                        flow.var_eval_without_copy(
-                                            &mut self.large,
-                                            Spanned::new(target.base.span, var),
-                                        )?
-                                        .ty(),
-                                    ),
-                                }
-                            }
-                        };
-                        // Type-valued variables use static member lookup, not
-                        // hardware/struct projection. Do not interpret their
-                        // pending steps as fields of the metatype `type`.
-                        ty.filter(|ty| !matches!(ty, Type::Type))
-                            .map(|ty| target.steps.apply_to_expected_type(refs, Spanned::new(base_span, ty)))
-                            .transpose()?
-                    }
-                    LrValue::Right(value) => Some(value.ty()),
-                    LrValue::LeftInterface(_) => None,
+                let step = SpannedStep {
+                    span_full: expr.span,
+                    span_step: index_span,
+                    step: TargetStep::Compile(step),
                 };
-                let is_ref_field = match (&base_ty, &index) {
-                    (Some(Type::Struct(elab)), Either::Left(index)) => refs
-                        .shared
-                        .elaboration_arenas
-                        .struct_info(*elab)
-                        .fields
-                        .get(index)
-                        .is_some_and(|field| field.ref_.is_some()),
-                    _ => false,
-                };
-                if is_ref_field {
-                    let mut steps = TargetSteps::single(index_to_step(index));
-                    let binding = match base {
-                        LrValue::LeftTarget(mut target) => {
-                            target.steps.steps.append(&mut steps.steps);
-                            flow.signal_or_var_eval(self, target.base, &target.steps)?
-                        }
-                        LrValue::Right(value) => {
-                            steps.apply_to_value(self, &Type::Any, Spanned::new(base_span, value))?
-                        }
-                        LrValue::LeftInterface(_) => unreachable!(),
-                    };
-                    self.deref_value(
-                        flow,
-                        expr.span,
-                        index_span,
-                        Spanned::new(expr.span, binding.into_value()),
-                    )?
-                } else {
-                    match base {
-                        LrValue::LeftTarget(base) => {
-                            let mut result = base;
-                            result.steps.push(index_to_step(index));
-                            LrValue::LeftTarget(result)
-                        }
-                        LrValue::LeftInterface(info) => {
-                            let &base = info.intf.as_single().ok_or_else(|| {
-                                DiagnosticError::new(
-                                    "cannot access signal of interface array",
-                                    index_span,
-                                    "attempt to access signal here",
-                                )
-                                .add_info(base_span, "base evaluates to an interface array")
-                                .add_info(info.span_id, "interface array declared here")
-                                .add_footer_hint(
-                                    "to access individual interfaces, use array indexing: `<array>[<index>]`",
-                                )
-                                .report(diags)
-                            })?;
-                            let index = index.left().ok_or_else(|| {
-                                DiagnosticError::new(
-                                    "cannot tuple index into interface",
-                                    expr.span,
-                                    "trying to tuple index here",
-                                )
-                                .add_info(base_span, "base evaluates to an interface")
-                                .add_info(info.span_id, "interface declared here")
-                                .report(diags)
-                            })?;
-
-                            let signal = base.get_signal(self, base_span, Spanned::new(index_span, index))?;
-                            LrValue::LeftTarget(AssignmentTarget::simple(Spanned::new(expr.span, signal.into())))
-                        }
-                        LrValue::Right(base) => {
-                            let steps = TargetSteps::new(vec![index_to_step(index)]);
-                            LrValue::Right(steps.apply_to_value(self, expected_ty, Spanned::new(base_span, base))?)
-                        }
-                    }
-                }
+                self.project_lr_value(flow, expected_ty, base_span, base, step)?
             }
             &ExpressionKind::Call(target, ref args) => {
                 // eval target
@@ -1012,7 +916,9 @@ impl<'a> CompileItemContext<'a, '_> {
                 };
 
                 let operand_span = operand.span;
-                let operand = self.eval_expression_as_lr(scope, flow, expected_ty_inner, operand)?;
+                let operand = self
+                    .eval_expression_as_lr(scope, flow, expected_ty_inner, operand)?
+                    .resolve_reference_fields(self, flow)?;
 
                 let result = match operand {
                     LrValue::LeftTarget(operand) => {
@@ -1079,6 +985,116 @@ impl<'a> CompileItemContext<'a, '_> {
             }
         };
         Ok(result)
+    }
+
+    /// Append a deferred projection, or apply it to an already evaluated value or
+    /// interface. Raw payload projection remains in TargetSteps; transparency is
+    /// interpreted here for reads, writes, reference-taking and interface access.
+    fn project_lr_value(
+        &mut self,
+        flow: &mut impl Flow,
+        expected_ty: &Type,
+        base_span: Span,
+        base: LrValue,
+        step: SpannedStep<TargetStep>,
+    ) -> DiagResult<LrValue> {
+        let diags = self.refs.diags;
+        match base {
+            LrValue::LeftTarget(mut target) => {
+                target.steps.push(step);
+                Ok(LrValue::LeftTarget(target))
+            }
+            LrValue::Right(value) => {
+                let transparent = match &step.step {
+                    TargetStep::Compile(TargetStepCompile::DotIndexId(field)) => {
+                        is_reference_field(self.refs, &value.ty(), *field)
+                    }
+                    _ => false,
+                };
+                let span_full = step.span_full;
+                let span_step = step.span_step;
+                let value =
+                    TargetSteps::single(step).apply_to_value(self, expected_ty, Spanned::new(base_span, value))?;
+                if transparent {
+                    self.deref_value(flow, span_full, span_step, Spanned::new(span_full, value.into_value()))
+                } else {
+                    Ok(LrValue::Right(value))
+                }
+            }
+            LrValue::LeftInterface(info) => {
+                let index = match &step.step {
+                    TargetStep::Compile(TargetStepCompile::DotIndexId(index)) => {
+                        let &base = info.intf.as_single().ok_or_else(|| {
+                            DiagnosticError::new(
+                                "cannot access signal of interface array",
+                                step.span_step,
+                                "attempt to access signal here",
+                            )
+                            .add_info(base_span, "base evaluates to an interface array")
+                            .add_info(info.span_id, "interface array declared here")
+                            .add_footer_hint("to access individual interfaces, use array indexing: `<array>[<index>]`")
+                            .report(diags)
+                        })?;
+                        let signal = base.get_signal(self, base_span, Spanned::new(step.span_step, *index))?;
+                        return Ok(LrValue::LeftTarget(AssignmentTarget::simple(Spanned::new(
+                            step.span_full,
+                            signal.into(),
+                        ))));
+                    }
+                    TargetStep::Compile(TargetStepCompile::DotIndexInt(_)) => {
+                        return Err(DiagnosticError::new(
+                            "cannot tuple index into interface",
+                            step.span_full,
+                            "trying to tuple index here",
+                        )
+                        .add_info(base_span, "base evaluates to an interface")
+                        .add_info(info.span_id, "interface declared here")
+                        .report(diags));
+                    }
+                    _ => &step.step,
+                };
+                let array_len = info.intf.first_len().ok_or_else(|| {
+                    DiagnosticError::new(
+                        "cannot index into interface",
+                        step.span_full,
+                        "trying to index into interface here",
+                    )
+                    .add_info(base_span, "base evaluates to an interface")
+                    .add_info(info.span_id, "interface declared here")
+                    .report(diags)
+                })?;
+                let array_len = Spanned::new(base_span, array_len);
+                let intf = match index {
+                    TargetStep::Compile(TargetStepCompile::ArrayIndex(index)) => {
+                        let index = check_range_index_compile(diags, Spanned::new(step.span_step, index), array_len)?;
+                        info.intf.step_index(index).expect("already checked range")
+                    }
+                    TargetStep::Compile(TargetStepCompile::ArraySlice { start, length }) => {
+                        let SliceInfo { start, length } = check_range_slice_compile(
+                            diags,
+                            Spanned::new(step.span_step, start),
+                            length.as_ref().map(|length| Spanned::new(step.span_step, length)),
+                            array_len,
+                        )?;
+                        info.intf.step_slice(start, length).expect("already checked range")
+                    }
+                    TargetStep::Hardware(TargetStepHardware::ArrayIndex(_)) => {
+                        return Err(
+                            diags.report_error_todo(step.span_step, "indexing interface arrays with a hardware value")
+                        );
+                    }
+                    TargetStep::Hardware(TargetStepHardware::ArraySlice { .. }) => {
+                        return Err(
+                            diags.report_error_todo(step.span_step, "slicing interface arrays with a hardware start")
+                        );
+                    }
+                    TargetStep::Compile(TargetStepCompile::DotIndexId(_) | TargetStepCompile::DotIndexInt(_)) => {
+                        unreachable!()
+                    }
+                };
+                Ok(LrValue::LeftInterface(LeftInterfaceInfo { intf, ..info }))
+            }
+        }
     }
 
     /// Resolve a reference to its target without loading or copying the referent.

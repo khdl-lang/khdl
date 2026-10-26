@@ -807,8 +807,9 @@ impl BodyContext {
                 let &ConnectEntry { span: _, expr, view } = entry;
 
                 // eval value
-                let value =
-                    ctx.eval_expression_as_lr(scope.as_scope(), &mut flow.new_child_isolated(), &Type::Any, expr)?;
+                let mut flow_value = flow.new_child_isolated();
+                let value = ctx.eval_expression_as_lr(scope.as_scope(), &mut flow_value, &Type::Any, expr)?
+                    .resolve_reference_fields(ctx, &mut flow_value)?;
                 // eval view
                 let view_id = view
                     .map(|view| ctx.eval_id(scope.as_scope(), flow, view.id))
@@ -1501,7 +1502,9 @@ impl BodyContext {
             } => {
                 // eval expr
                 let mut flow_connection = flow_parent.new_child_isolated();
-                let value_eval = ctx.eval_expression_as_lr(scope, &mut flow_connection, &Type::Any, expr)?;
+                let value_eval = ctx
+                    .eval_expression_as_lr(scope, &mut flow_connection, &Type::Any, expr)?
+                    .resolve_reference_fields(ctx, &mut flow_connection)?;
 
                 // expect interface
                 let value_eval = match value_eval {

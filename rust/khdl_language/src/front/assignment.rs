@@ -2,7 +2,7 @@ use crate::front::check::{TypeContainsReason, check_port_is_output, check_type_c
 use crate::front::compile::CompileItemContext;
 use crate::front::diagnostic::{DiagResult, DiagnosticError};
 use crate::front::domain::{DomainSignal, ValueDomain};
-use crate::front::expression::eval_binary_expression;
+use crate::front::expression::{LrValue, eval_binary_expression};
 use crate::front::flow::{Flow, FlowHardware, HardwareProcessKind, VarSetValue};
 use crate::front::implication::{HardwareValueWithImplications, ValueWithImplications};
 use crate::front::scope::Scope;
@@ -49,37 +49,42 @@ impl CompileItemContext<'_, '_> {
         } = stmt;
 
         // evaluate target
-        let target = self.eval_expression_as_assign_target(scope, flow, target_expr)?;
-        let &AssignmentTarget {
-            base: target_base,
-            steps: ref target_steps,
-        } = &target;
+        let target = self.eval_expression_as_lr(scope, flow, &Type::Any, target_expr)?;
 
         // compute source, by evaluating right but also left if needed
-        let source_value = match op.inner {
+        let (target, source_value) = match op.inner {
             None => {
                 // figure out the expected type
                 // (the expected type still being unknown if fine for now, we can suggest one later)
-                let target_base_ty = match target_base.inner {
-                    SignalOrVariable::Signal(target_base) => match target_base {
-                        Signal::Port(port) => Some(self.ports[port].ty.as_ref().map_inner(HardwareType::as_type)),
-                        Signal::Wire(wire) => self.wires[wire]
-                            .typed_maybe(refs, &self.wire_interfaces)?
-                            .map(|info| info.ty.map_inner(HardwareType::as_type)),
+                let target_base_ty = match &target {
+                    LrValue::LeftTarget(target) => match target.base.inner {
+                        SignalOrVariable::Signal(target_base) => match target_base {
+                            Signal::Port(port) => Some(self.ports[port].ty.as_ref().map_inner(HardwareType::as_type)),
+                            Signal::Wire(wire) => self.wires[wire]
+                                .typed_maybe(refs, &self.wire_interfaces)?
+                                .map(|info| info.ty.map_inner(HardwareType::as_type)),
+                        },
+                        SignalOrVariable::Variable(var) => flow.var_info(target.base.map_inner(|_| var))?.ty.clone(),
                     },
-                    SignalOrVariable::Variable(var) => flow.var_info(Spanned::new(target_base.span, var))?.ty.clone(),
+                    _ => None,
                 };
 
-                let right_expected_ty = target_base_ty
-                    .as_ref()
-                    .map(|target_base_ty| target_steps.apply_to_expected_type(refs, target_base_ty.clone()))
-                    .transpose()?;
-                let right_expected_ty = right_expected_ty.as_ref().unwrap_or(&Type::Any);
+                let right_expected_ty = match (&target, target_base_ty) {
+                    (LrValue::LeftTarget(target), Some(ty)) => target.steps.assignment_expected_type(refs, ty.inner),
+                    _ => Type::Any,
+                };
 
-                // evaluate right
-                self.eval_expression_with_implications(scope, flow, right_expected_ty, right_expr)?
+                // Ordinary targets are deferred until the RHS has run. This also
+                // determines which transparent binding a plain assignment uses.
+                let source = self.eval_expression_with_implications(scope, flow, &right_expected_ty, right_expr)?;
+                (target.into_target(self, flow, target_expr.span)?, source)
             }
             Some(op_inner) => {
+                // Capture reference crossings before reading the compound LHS,
+                // and keep those target identities across RHS side effects.
+                let target = target.into_target(self, flow, target_expr.span)?;
+                let target_base = target.base;
+                let target_steps = &target.steps;
                 // evaluate left, including steps
                 let left_value = flow.signal_or_var_eval(self, target_base, target_steps)?;
                 let left_value = Spanned::new(target_expr.span, left_value);
@@ -96,9 +101,14 @@ impl CompileItemContext<'_, '_> {
                     left_value,
                     right_value,
                 )?;
-                Spanned::new(stmt.span, source_value)
+                (target, Spanned::new(stmt.span, source_value))
             }
         };
+
+        let &AssignmentTarget {
+            base: target_base,
+            steps: ref target_steps,
+        } = &target;
 
         // store result
         match target_base.inner {

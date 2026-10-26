@@ -109,6 +109,45 @@ impl IrStepsBuilder for IgnoreBuilder {
 }
 
 impl TargetSteps<TargetStep> {
+    /// A suggestion for RHS evaluation, not a write constraint. Inspect declarations only:
+    /// the receiver need not have a value yet, and its contents can change on the RHS.
+    pub fn assignment_expected_type(&self, refs: CompileRefs, mut ty: Type) -> Type {
+        for step in &self.steps {
+            ty = match (&step.step, ty) {
+                (
+                    TargetStep::Compile(TargetStepCompile::ArrayIndex(_))
+                    | TargetStep::Hardware(TargetStepHardware::ArrayIndex(_)),
+                    Type::Array(inner, _),
+                ) => (*inner).clone(),
+                (TargetStep::Compile(TargetStepCompile::ArraySlice { start, length }), Type::Array(inner, len)) => {
+                    let len = length
+                        .clone()
+                        .or_else(|| len.and_then(|len| BigUint::try_from(len - start).ok()));
+                    Type::Array(inner, len)
+                }
+                (TargetStep::Hardware(TargetStepHardware::ArraySlice { length, .. }), Type::Array(inner, _)) => {
+                    Type::Array(inner, Some(length.clone()))
+                }
+                (TargetStep::Compile(TargetStepCompile::DotIndexInt(index)), Type::Tuple(Some(fields))) => index
+                    .as_usize_if_lt(fields.len())
+                    .map_or(Type::Any, |index| fields[index].clone()),
+                (TargetStep::Compile(TargetStepCompile::DotIndexId(id)), Type::Struct(elab)) => {
+                    let info = refs.shared.elaboration_arenas.struct_info(elab);
+                    match info.fields.get(id) {
+                        Some(field) if field.ref_.is_some() => match &field.ty.inner {
+                            Type::Ref(inner) => (**inner).clone(),
+                            _ => Type::Any,
+                        },
+                        Some(field) => field.ty.inner.clone(),
+                        None => Type::Any,
+                    }
+                }
+                _ => Type::Any,
+            };
+        }
+        ty
+    }
+
     pub fn try_as_compile(&self) -> Result<TargetSteps<&TargetStepCompile>, NotCompile> {
         let steps = self
             .steps

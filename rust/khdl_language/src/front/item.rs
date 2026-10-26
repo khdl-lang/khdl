@@ -5,7 +5,7 @@ use crate::front::extra::ExtraScope;
 use crate::front::flow::{Flow, FlowCompile, FlowRoot};
 use crate::front::function::{FunctionBody, FunctionValue, UserFunctionValue};
 use crate::front::interface::ElaboratedInterfaceInfo;
-use crate::front::module_header::{ElaboratedModuleExternalInfo, ElaboratedModuleInternalInfo};
+use crate::front::module_header::{ElaboratedModuleExternalInfo, ElaboratedModuleInternalInfo, interface_array_shape};
 use crate::front::scope::{CaptureFailed, DeclaredValueSingle, NamedValue, Scope, ScopeKey, ScopedEntry};
 use crate::front::steps::POSSIBLE_BUILTIN_TYPE_MEMBERS;
 use crate::front::types::{HardwareType, Type};
@@ -985,6 +985,9 @@ impl CompileItemContext<'_, '_> {
                                 CompileValue::Simple(SimpleCompileValue::Type(ty)) => Type::Ref(Arc::new(ty)),
                                 CompileValue::Simple(SimpleCompileValue::Interface(intf)) => {
                                     Type::RefInterface(vec![], intf)
+                                }
+                                CompileValue::Simple(SimpleCompileValue::InterfaceArray(lengths, intf)) => {
+                                    Type::RefInterface(interface_array_shape(diags, value.span, &lengths)?, intf)
                                 }
                                 _ => {
                                     return Err(DiagnosticError::new(
