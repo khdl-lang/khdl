@@ -195,6 +195,7 @@ impl<'a, 's> CompileRefs<'a, 's> {
 /// globally shared, constant state
 #[derive(Copy, Clone)]
 pub struct CompileFixed<'a> {
+    pub data: &'a crate::syntax::data::DataInputs,
     pub settings: &'a CompileSettings,
     pub source: &'a SourceDatabase,
     pub hierarchy: &'a SourceHierarchy,
@@ -446,6 +447,7 @@ pub enum CompileStackEntry {
 
 fn populate_file_scopes(diags: &Diagnostics, fixed: CompileFixed, interner: &Interner) -> FileScopes<Arc<FrozenScope>> {
     let CompileFixed {
+        data: _,
         settings: _,
         source,
         hierarchy,

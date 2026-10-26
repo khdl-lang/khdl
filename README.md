@@ -264,6 +264,48 @@ code --install-extension khdl-lsp-client-0.0.1.vsix
 
 Then set the `khdl.server.path` setting to the absolute path of `rust/target/release/khdl_lsp_server`.
 
+## Compile-time JSON inputs
+
+Declare data files or recursive JSON directories in `khdl.toml`:
+
+```toml
+[source]
+_ = "src"
+
+[data]
+config = "data/config.json"
+tables = "data/tables"
+foo.coefficients_0 = "data/coefficients_0.json"
+```
+
+Directory entries collect `.json` files recursively: `data/tables/device/a.json` becomes `tables.device.a`.
+Use `_ = "data"` to collect without a prefix. Dotted keys and equivalent nested TOML tables both work.
+Derived alias components must be identifiers; duplicate aliases are errors. Source and data namespaces are separate.
+Paths are relative to the manifest, or may be absolute, including intentional symlinks and external library paths.
+
+```khdl
+import std.json;
+
+struct Config { width: int(1..=64), enabled: bool }
+const config = json.load("config", Config);
+```
+
+`json.load(name, T)` takes a compile-time logical alias and destination type. Computed aliases such as
+`"foo.coefficients_{i}"` work during generic elaboration. Source code cannot use this operation to open filesystem paths.
+All declared data text is read before elaboration, while JSON parsing and conversion happen only when a load is evaluated.
+Consequently, unused missing files fail collection, but unused malformed JSON is not parsed.
+
+Supported targets are booleans, strings, integer ranges, fixed/unspecified-length arrays, specified tuples, structs,
+and enums. Tuples use JSON arrays. Struct objects require all declared fields, reject extra/duplicate keys, and ignore key order.
+Ordinary enums use `"Idle"` for a payload-free variant or `{"Transfer": payload}` for a payload variant.
+Standard `Option(T)` maps null to `None` and non-null input to `Some(decoded T)`; directly nested options are rejected
+because their null encodings are ambiguous. Options separated by arrays or objects remain supported.
+Integers retain arbitrary precision; fractional and exponent notation are currently rejected. `any`, field defaults,
+and arbitrary-type conversion are not supported yet. Errors include JSON source ranges and the KHDL loading context.
+
+Parsing uses `json-syntax`. Dedicated resource limits are not yet provided, consistently with the rest of the compiler;
+extreme nesting or input sizes can exhaust resources or terminate compilation.
+
 ## Repository structure
 
 * Most of the compiler and surrounding infrastructure is is written in Rust. The workspace is at `rust/` and contains

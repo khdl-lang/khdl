@@ -85,12 +85,27 @@ pub fn collect_source_files_from_tree(
     span: Span,
     entry_path: PathBuf,
 ) -> DiagResult<Vec<(Vec<String>, PathBuf)>> {
-    let report_error = |m: String| diags.report_error_simple(m, span, "while collecting source here");
+    collect_files_from_tree(diags, span, entry_path, KHDL_FILE_EXTENSION)
+}
+
+pub fn collect_files_from_tree(
+    diags: &Diagnostics,
+    span: Span,
+    entry_path: PathBuf,
+    extension: &str,
+) -> DiagResult<Vec<(Vec<String>, PathBuf)>> {
+    let report_error = |m: String| diags.report_error_simple(m, span, "while collecting files here");
 
     let meta = std::fs::metadata(&entry_path)
         .map_err(|e| report_error(e.with_context(IoAction::Metadata, &entry_path).to_string()))?;
     if meta.is_file() {
         return Ok(vec![(vec![], entry_path)]);
+    }
+    if !meta.is_dir() {
+        return Err(report_error(format!(
+            "expected a regular file or directory: {}",
+            entry_path.display()
+        )));
     }
 
     let mut files = vec![];
@@ -102,7 +117,7 @@ pub fn collect_source_files_from_tree(
         }
 
         // filter by extension
-        if path_file.extension() != Some(OsStr::new(KHDL_FILE_EXTENSION)) {
+        if path_file.extension() != Some(OsStr::new(extension)) {
             return Ok(());
         }
 
@@ -130,7 +145,7 @@ pub fn collect_source_files_from_tree(
     .map_err(|e: IoErrorWithPath| report_error(e.to_string()))?;
 
     step_err?;
-
+    files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
 }
 

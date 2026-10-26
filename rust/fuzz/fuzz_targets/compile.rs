@@ -27,7 +27,9 @@ fn target(data: String) {
     let parsed = ParsedDatabase::new(&diags, &source, &hierarchy);
 
     let settings = CompileSettings { do_ir_cleanup: true };
+    let data = khdl_language::syntax::data::DataInputs::new();
     let fixed = CompileFixed {
+        data: &data,
         settings: &settings,
         source: &source,
         hierarchy: &hierarchy,

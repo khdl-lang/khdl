@@ -56,6 +56,8 @@ pub struct ElaboratedInterfaceView {
 }
 
 pub struct ElaborationArenas {
+    pub(crate) json_values:
+        ComputeOnceMap<(crate::syntax::source::FileId, Type), Result<CompileValue, DiagnosticError>>,
     elaborated_modules_internal: ElaborateItemArena<ElaboratedModuleInternal, ElaboratedModuleInternalInfo>,
     elaborated_modules_external: ElaborateItemArena<ElaboratedModuleExternal, ElaboratedModuleExternalInfo>,
     elaborated_interfaces: ElaborateItemArena<ElaboratedInterface, ElaboratedInterfaceInfo>,
@@ -92,6 +94,7 @@ impl Hash for UniqueDeclaration {
 impl ElaborationArenas {
     pub fn new() -> Self {
         ElaborationArenas {
+            json_values: ComputeOnceMap::new(),
             elaborated_modules_internal: ElaborateItemArena::new(),
             elaborated_modules_external: ElaborateItemArena::new(),
             elaborated_interfaces: ElaborateItemArena::new(),

@@ -13,6 +13,7 @@ use toml::de::{DeTable, DeValue};
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub source: ManifestSource,
+    pub data: ManifestSource,
 }
 
 #[derive(Debug, Clone)]
@@ -39,12 +40,16 @@ impl Manifest {
         })?;
 
         let mut manifest_source = None;
+        let mut manifest_data = ManifestSource { entries: vec![] };
         for (key, value) in root.get_ref() {
             match key.get_ref().as_ref() {
                 "source" => {
                     let mut entries = vec![];
                     collect_source_entries(diags, file, &mut vec![], value, &mut entries)?;
                     manifest_source = Some(ManifestSource { entries });
+                }
+                "data" => {
+                    collect_source_entries(diags, file, &mut vec![], value, &mut manifest_data.entries)?;
                 }
                 other => {
                     return Err(diags.report_error_simple(
@@ -63,7 +68,10 @@ impl Manifest {
                 "expected `source` field in this manifest",
             )
         })?;
-        Ok(Manifest { source })
+        Ok(Manifest {
+            source,
+            data: manifest_data,
+        })
     }
 }
 
@@ -104,7 +112,7 @@ fn collect_source_entries(
             Ok(())
         }
         _ => Err(diags.report_error_simple(
-            "invalid manifest source entry",
+            "invalid manifest file entry",
             file.span(node.span()),
             "expected a path string or a table of entries",
         )),

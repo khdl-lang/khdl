@@ -74,6 +74,7 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
     };
     let Manifest {
         source: manifest_source,
+        data: manifest_data,
     } = manifest.parsed;
 
     // collect source
@@ -86,12 +87,25 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+    let (data, _) = match khdl_language::syntax::data::collect_data_from_manifest(
+        &diags,
+        &mut source,
+        &manifest.path_parent,
+        &manifest_data,
+        |path| std::fs::read_to_string(path).map_err(|e| e.with_context(IoAction::Read, path).to_string()),
+    ) {
+        Ok(data) => data,
+        Err(_) => {
+            print_diagnostics(&source, diags);
+            return ExitCode::FAILURE;
+        }
+    };
     let time_source = start_source.elapsed();
 
     // print source info
     if debug_print_files {
         eprintln!("Collected sources:");
-        for file in source.files() {
+        for file in hierarchy.files() {
             let file_info = &source[file];
             eprintln!("  [{}]: {:?}", file.inner().index(), file_info.debug_info_path);
         }
@@ -121,6 +135,7 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
         ctrlc::set_handler(move || should_stop.store(true, Ordering::Relaxed)).expect("Failed to set Ctrl+C handler");
     }
     let fixed = CompileFixed {
+        data: &data,
         settings: &settings,
         source: &source,
         hierarchy: &hierarchy,
@@ -266,8 +281,14 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
         eprintln!();
         eprintln!("profiling info:");
         eprintln!("-----------------------------------------------");
-        eprintln!("input files:      {}", source.file_count());
-        eprintln!("input lines:      {}", source.total_lines_of_code());
+        eprintln!("source files:     {}", hierarchy.files().count());
+        eprintln!(
+            "source lines:     {}",
+            hierarchy
+                .files()
+                .map(|file| source[file].offsets.line_count() as u64)
+                .sum::<u64>()
+        );
         eprintln!("input tokens:     {total_tokens}");
         eprintln!("----------------------------------------");
         eprintln!("read source:      {time_source:?}");

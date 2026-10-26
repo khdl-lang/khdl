@@ -14,7 +14,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95.0"
+rust-version = "1.96.0"
 description = "An experimental new language for hardware design."
 license = "MIT"
 repository = "https://github.com/khdl-lang/khdl"
@@ -40,6 +40,7 @@ fnv = "1.0.7"
 getrandom = "0.2.15" # keep in sync with random
 indexmap = "2.2.6"
 itertools = "0.13.0"
+json-syntax = { version = "=0.13.1", default-features = false }
 js-sys = "0.3.70"
 lalrpop = { version = "0.20.2", features = [] }
 lalrpop-util = { version = "0.20.2", features = [] }

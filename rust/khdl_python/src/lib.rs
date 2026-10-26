@@ -62,6 +62,7 @@ mod convert;
 
 #[pyclass(module = "khdl")]
 struct Source {
+    data: khdl_language::syntax::data::DataInputs,
     source: RustSourceDatabase,
     hierarchy: SourceHierarchy,
     dummy_span: Span,
@@ -354,6 +355,7 @@ impl Source {
         map_diag_error(py, &diags, &source, r)?;
 
         Ok(Source {
+            data: khdl_language::syntax::data::DataInputs::new(),
             source,
             hierarchy,
             dummy_span,
@@ -379,18 +381,41 @@ impl Source {
         let manifest = map_diag_error(py, &diags, &source, manifest)?;
         let Manifest {
             source: manifest_source,
+            data: manifest_data,
         } = manifest;
 
         // collect hierarchy
         let hierarchy = collect_source_from_manifest(&diags, &mut source, manifest_parent, &manifest_source);
         let (hierarchy, _) = map_diag_error(py, &diags, &source, hierarchy)?;
 
+        let data = khdl_language::syntax::data::collect_data_from_manifest(
+            &diags,
+            &mut source,
+            manifest_parent,
+            &manifest_data,
+            |path| std::fs::read_to_string(path).map_err(|e| e.with_context(IoAction::Read, path).to_string()),
+        );
+        let (data, _) = map_diag_error(py, &diags, &source, data)?;
         let manifest_span = source.full_span(manifest_file);
         Ok(Source {
+            data,
             source,
             hierarchy,
             dummy_span: manifest_span,
         })
+    }
+
+    fn add_data_content(&mut self, py: Python, name: &str, debug_info_path: String, content: String) -> PyResult<()> {
+        let diags = Diagnostics::new();
+        let file = self.source.add_file(debug_info_path, content);
+        let result = self.data.add(
+            &diags,
+            &self.source,
+            name.split('.').map(str::to_owned).collect(),
+            file,
+            self.dummy_span,
+        );
+        map_diag_error(py, &diags, &self.source, result)
     }
 
     fn add_file_content(
@@ -431,10 +456,8 @@ impl Source {
 
     #[getter]
     fn files(&self) -> Vec<String> {
-        self.source
+        self.hierarchy
             .files()
-            // filter out the dummy file
-            .skip(1)
             .map(|id| self.source[id].debug_info_path.clone())
             .collect()
     }
@@ -468,6 +491,7 @@ impl Parsed {
             let parsed = slf.borrow(py);
             let source = parsed.source.borrow(py);
             let fixed = CompileFixed {
+                data: &source.data,
                 settings: &COMPILE_SETTINGS,
                 source: &source.source,
                 hierarchy: &source.hierarchy,
@@ -574,6 +598,7 @@ impl Compile {
         let print_handler = slf_ref.start_collect_prints();
         let refs = CompileRefs {
             fixed: CompileFixed {
+                data: &source_ref.data,
                 settings: &COMPILE_SETTINGS,
                 source,
                 hierarchy,
@@ -725,6 +750,7 @@ impl Value {
         let diags = Diagnostics::new();
         let refs = CompileRefs {
             fixed: CompileFixed {
+                data: &source_ref.data,
                 settings: &COMPILE_SETTINGS,
                 source,
                 hierarchy,
@@ -795,6 +821,7 @@ impl Value {
         let print_handler = compile.start_collect_prints();
         let refs = CompileRefs {
             fixed: CompileFixed {
+                data: &source_ref.data,
                 settings: &COMPILE_SETTINGS,
                 source,
                 hierarchy,
@@ -1716,6 +1743,7 @@ fn set_port_value(instance: &Py<VerilatedInstance>, port: IrPort, value: &Bound<
     let print_handler = compile.start_collect_prints();
     let refs = CompileRefs {
         fixed: CompileFixed {
+            data: &source.data,
             settings: &COMPILE_SETTINGS,
             source: &source.source,
             hierarchy: &source.hierarchy,

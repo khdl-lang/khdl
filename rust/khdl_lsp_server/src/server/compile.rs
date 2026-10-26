@@ -51,6 +51,7 @@ struct ManifestCollected {
 }
 
 struct ManifestCollectedInner {
+    data: khdl_language::syntax::data::DataInputs,
     #[allow(dead_code)]
     parsed: Manifest,
     hierarchy: SourceHierarchy,
@@ -123,6 +124,7 @@ impl ServerState {
                     do_ir_cleanup: false,
                 };
                 let fixed = CompileFixed {
+                    data: &inner.data,
                     settings: &settings,
                     source,
                     hierarchy,
@@ -242,6 +244,37 @@ impl ServerState {
                         &format!("*.{KHDL_FILE_EXTENSION}"),
                     ));
                 }
+                for entry in manifest.data.entries() {
+                    let entry_path = path_join_normalized(&manifest_folder, Path::new(&entry.path_relative))
+                        .map_err(|e| SendErrorOr::Other(RequestError::Vfs(VfsError::FailedNormalization(e))))?;
+                    if entry_path.is_dir() {
+                        watchers.push(build_watcher_any_file_with_name(
+                            abs_path_to_uri(&entry_path).map_err(|e| SendErrorOr::Other(RequestError::Vfs(e)))?,
+                            "*.json",
+                        ));
+                    } else if let (Some(parent), Some(name)) = (entry_path.parent(), entry_path.file_name()) {
+                        let pattern: String = name
+                            .to_string_lossy()
+                            .chars()
+                            .map(|c| {
+                                if "*?[]{}".contains(c) {
+                                    format!("[{c}]")
+                                } else {
+                                    c.to_string()
+                                }
+                            })
+                            .collect();
+                        watchers.push(lsp_types::FileSystemWatcher {
+                            glob_pattern: lsp_types::GlobPattern::Relative(lsp_types::RelativePattern {
+                                base_uri: lsp_types::OneOf::Right(
+                                    abs_path_to_uri(parent).map_err(|e| SendErrorOr::Other(RequestError::Vfs(e)))?,
+                                ),
+                                pattern,
+                            }),
+                            kind: None,
+                        });
+                    }
+                }
             }
 
             let common = ManifestCommon {
@@ -346,7 +379,22 @@ fn collect_manifest_sources(
         }
     }
 
-    Ok(Ok(ManifestCollectedInner { parsed, hierarchy }))
+    let (data, paths) = try_inner!(khdl_language::syntax::data::collect_data_from_manifest(
+        diags,
+        source,
+        &common.manifest_folder,
+        &parsed.data,
+        |path| vfs
+            .read_str_maybe_from_disk(path)
+            .map(str::to_owned)
+            .map_err(|e| format!("{e:?}")),
+    ));
+    common.file_to_path.extend(paths);
+    Ok(Ok(ManifestCollectedInner {
+        data,
+        parsed,
+        hierarchy,
+    }))
 }
 
 fn add_grouped_diagnostic_to_lsp(
@@ -485,5 +533,76 @@ fn footer_kind_to_string(kind: FooterKind) -> &'static str {
     match kind {
         FooterKind::Info => "info",
         FooterKind::Hint => "hint",
+    }
+}
+
+#[cfg(test)]
+mod data_tests {
+    use super::*;
+
+    #[test]
+    fn data_collection_uses_editor_overlay_and_reenumerates_trees() {
+        struct Project(PathBuf);
+        impl Drop for Project {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let project = Project(std::env::temp_dir().join(
+            format!("khdl-lsp-data-{}-{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()),
+        ));
+        std::fs::create_dir_all(project.0.join("data")).unwrap();
+        std::fs::write(project.0.join("top.kh"), "").unwrap();
+        let a = project.0.join("data/a.json");
+        std::fs::write(&a, "1").unwrap();
+        let mut vfs = Vfs::new();
+        vfs.create_or_update(a.clone(), b"2".to_vec());
+
+        let collect = |vfs: &mut Vfs| {
+            let mut source = SourceDatabase::new();
+            let file = source.add_file(
+                "khdl.toml".into(),
+                "[source]\ntop = 'top.kh'\n[data]\ntables = 'data'\n".into(),
+            );
+            let diags = Diagnostics::new();
+            let parsed = Manifest::parse_toml(&diags, &source, file).unwrap();
+            let mut common = ManifestCommon {
+                manifest_folder: project.0.clone(),
+                diags,
+                source,
+                file_to_path: IndexMap::new(),
+            };
+            let collected = collect_manifest_sources(vfs, &mut common, parsed).unwrap().unwrap();
+            assert_eq!(common.diags.len(), 0);
+            assert!(
+                collected
+                    .hierarchy
+                    .files()
+                    .all(|id| !common.source[id].debug_info_path.ends_with(".json"))
+            );
+            (common, collected)
+        };
+        let (first, collected) = collect(&mut vfs);
+        let file = collected.data.find("tables.a").unwrap();
+        assert_eq!(first.source[file].content, "2");
+        assert_eq!(first.file_to_path[&file], a);
+
+        vfs.clear_changed();
+        vfs.create_or_update(a.clone(), b"unsaved invalid JSON".to_vec());
+        std::fs::write(project.0.join("data/b.json"), "4").unwrap();
+        assert!(vfs.any_changed());
+        let (second, collected) = collect(&mut vfs);
+        assert_eq!(
+            second.source[collected.data.find("tables.a").unwrap()].content,
+            "unsaved invalid JSON"
+        );
+        assert!(collected.data.find("tables.b").is_some());
+
+        std::fs::remove_file(&a).unwrap();
+        vfs.delete_if_exists(&a);
+        let (_, collected) = collect(&mut vfs);
+        assert!(collected.data.find("tables.a").is_none());
+        assert!(collected.data.find("tables.b").is_some());
     }
 }

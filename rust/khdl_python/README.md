@@ -18,4 +18,19 @@ print(top.as_verilog().source)
 
 Simulation through Verilator requires `verilator`, `make` and a C++ compiler to be available on the `PATH`.
 
+Manifest loading also collects `[data]` inputs for compile-time `std.json.load(name, T)` calls.
+For in-memory projects, register data before compiling:
+
+```python
+source = khdl.Source()
+source.add_file_content(["top"], "top.kh", '''
+import std.json;
+pub const width = json.load("config", int(1..=64));
+''')
+source.add_data_content("config", "config.json", "32")
+assert source.compile().resolve("top.width") == 32
+```
+
+The data name is a logical alias; the diagnostic path labels the supplied text and does not cause file IO.
+
 See the [main repository](https://github.com/khdl-lang/khdl) for more information about the language itself.

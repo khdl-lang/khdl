@@ -136,6 +136,20 @@ impl CompileItemContext<'_, '_> {
 
         // handle the different builtins
         match (arg_0.as_str(), arg_1.as_str(), args_rest) {
+            ("fn", "json_load", &[name, ty]) => {
+                let name = self.eval_expression_as_compile(
+                    scope,
+                    flow,
+                    &Type::String,
+                    name,
+                    Spanned::new(target_span, "data alias"),
+                )?;
+                let name_span = name.span;
+                let name = check_type_is_string_compile(refs, type_reason, name)?;
+                let ty = self.eval_expression_as_ty(scope, flow, ty)?;
+                self.load_json(Spanned::new(name_span, name.as_str()), ty, expr_span)
+                    .map(Value::from)
+            }
             // types
             ("type", "any", &[]) => Ok(Value::new_ty(Type::Any)),
             ("type", "bool", &[]) => Ok(Value::new_ty(Type::Bool)),
