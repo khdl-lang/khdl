@@ -55,7 +55,7 @@ impl CompileItemContext<'_, '_> {
 
             // eval id and named
             let id = ctx.eval_id(scope, flow, id)?;
-            let named = ctx.eval_scoped_as_named(scope, id)?;
+            let named = ctx.eval_scoped_as_named(scope, flow, id)?;
             Ok((id, named))
         })?;
         let Some((id, named)) = id_name else {

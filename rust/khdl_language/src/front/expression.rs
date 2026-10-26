@@ -28,7 +28,8 @@ use crate::mid::ir::{
 };
 use crate::syntax::ast::{
     Args, ArrayComprehension, ArrayLiteralElement, BinaryOp, BlockExpression, DomainKind, DotIndexKind, Expression,
-    ExpressionKind, Identifier, IntLiteral, MaybeIdentifier, RangeLiteral, SimpleIdentifier, SyncDomain, UnaryOp,
+    ExpressionKind, Identifier, IntLiteral, MaybeIdentifier, ParameterSelfKind, RangeLiteral, SimpleIdentifier,
+    SyncDomain, UnaryOp,
 };
 use crate::syntax::pos::{HasSpan, Span, Spanned};
 use crate::util::big_int::{AnyInt, BigInt, BigUint, IsZero};
@@ -131,6 +132,43 @@ impl LrValue {
                 };
                 let remaining = TargetSteps::new(target.steps.steps[prefix_len..].to_vec());
                 let receiver = remaining.apply_to_value(ctx, &Type::Any, Spanned::new(target.base.span, receiver))?;
+                if let Type::Struct(elab) = receiver.ty()
+                    && let Some(method) = ctx
+                        .refs
+                        .shared
+                        .elaboration_arenas
+                        .struct_info(elab)
+                        .methods_self
+                        .get(field)
+                    && matches!(method.func_decl.params.slf.inner, ParameterSelfKind::RefSlf)
+                {
+                    let method = Arc::clone(method);
+                    if !target.steps.is_empty() {
+                        return Err(ctx.refs.diags.report_error_simple(
+                            "reference method receivers with target steps are not supported yet",
+                            step.span_full,
+                            "use a mutable whole variable instead of a field or indexed element",
+                        ));
+                    }
+                    let var_info = flow.var_info(target.base.map_inner(|_| var))?;
+                    let ty = var_info.ty.as_ref().map_or(Type::Any, |ty| ty.inner.clone());
+                    let rf = ReferenceWrapper::new_variable(
+                        flow.root_id(),
+                        var,
+                        Arc::new(ty),
+                        var_info.span_decl,
+                        step.span_full,
+                    );
+                    ctx.check_reference_receiver(flow, step.span_full, &rf, &Type::Struct(elab))?;
+                    result = LrValue::Right(ValueWithImplications::simple(Value::Compound(
+                        MixedCompoundValue::BoundMethod(BoundMethod {
+                            self_type: Type::Struct(elab),
+                            self_value: Box::new(Value::Simple(SimpleCompileValue::Reference(rf))),
+                            method,
+                        }),
+                    )));
+                    continue;
+                }
                 if is_reference_field(ctx.refs, &receiver.ty(), *field) {
                     let binding = TargetSteps::single(step.clone()).apply_to_value(
                         ctx,
@@ -255,12 +293,13 @@ impl<'a> CompileItemContext<'a, '_> {
     pub fn eval_scoped_as_lr(
         &mut self,
         scope: &Scope,
+        flow: &mut impl Flow,
         key: impl Into<ScopeKey<Spanned<Id>, Span>>,
     ) -> DiagResult<LrValue> {
         let key = key.into();
         let key_span = key.span();
 
-        let named = self.eval_scoped_as_named(scope, key)?;
+        let named = self.eval_scoped_as_named(scope, flow, key)?;
         let result = match named {
             NamedOrValue::Named(named_inner) => LrValue::from_named(key_span, named_inner),
             NamedOrValue::Value(value) => LrValue::Right(ValueWithImplications::simple(value)),
@@ -271,6 +310,7 @@ impl<'a> CompileItemContext<'a, '_> {
     pub fn eval_scoped_as_named(
         &mut self,
         scope: &Scope,
+        flow: &mut impl Flow,
         key: impl Into<ScopeKey<Spanned<Id>, Span>>,
     ) -> DiagResult<NamedOrValue> {
         let refs = self.refs;
@@ -296,6 +336,21 @@ impl<'a> CompileItemContext<'a, '_> {
                 }
             }
             ScopedEntry::Value(value) => NamedOrValue::Value(value),
+            ScopedEntry::Alias(rf) => {
+                let target = self.deref_value(
+                    flow,
+                    key_span,
+                    key_span,
+                    Spanned::new(key_span, Value::Simple(SimpleCompileValue::Reference(rf))),
+                )?;
+                match target {
+                    LrValue::LeftTarget(target) => match target.base.inner {
+                        SignalOrVariable::Variable(var) => NamedOrValue::Named(NamedValue::Variable(var)),
+                        _ => return Err(diags.report_error_internal(key_span, "receiver alias is not a variable")),
+                    },
+                    _ => return Err(diags.report_error_internal(key_span, "receiver alias is not a target")),
+                }
+            }
         };
         Ok(result)
     }
@@ -381,7 +436,7 @@ impl<'a> CompileItemContext<'a, '_> {
                 LrValue::Right(ValueWithImplications::simple(Value::Hardware(result)))
             }
             ExpressionKind::Type => LrValue::Right(Value::new_ty(Type::Type)),
-            ExpressionKind::Slf => self.eval_scoped_as_lr(scope, ScopeKey::Slf(expr.span))?,
+            ExpressionKind::Slf => self.eval_scoped_as_lr(scope, flow, ScopeKey::Slf(expr.span))?,
             &ExpressionKind::Builtin { span_keyword, ref args } => {
                 let result = self.eval_builtin(scope, flow, expr.span, span_keyword, args)?;
                 LrValue::Right(ValueWithImplications::simple(result))
@@ -409,7 +464,7 @@ impl<'a> CompileItemContext<'a, '_> {
             }
             &ExpressionKind::Id(id) => {
                 let id = self.eval_id(scope, flow, id)?;
-                self.eval_scoped_as_lr(scope, id)?
+                self.eval_scoped_as_lr(scope, flow, id)?
             }
             ExpressionKind::IntLiteral(pattern) => {
                 let parsed = match *pattern {
@@ -1147,6 +1202,55 @@ impl<'a> CompileItemContext<'a, '_> {
         })
     }
 
+    pub(super) fn check_reference_receiver(
+        &mut self,
+        flow: &mut impl Flow,
+        span: Span,
+        rf: &ReferenceWrapper,
+        expected_ty: &Type,
+    ) -> DiagResult {
+        let target = self
+            .deref_value(
+                flow,
+                span,
+                span,
+                Spanned::new(span, Value::Simple(SimpleCompileValue::Reference(rf.clone()))),
+            )?
+            .into_target(self, flow, span)?;
+        let var = match target.base.inner {
+            SignalOrVariable::Variable(var) => var,
+            _ => {
+                return Err(self
+                    .refs
+                    .diags
+                    .report_error_internal(span, "reference method receiver is not a variable"));
+            }
+        };
+        let info = flow.var_info(Spanned::new(span, var))?;
+        if !info.mutable {
+            return Err(DiagnosticError::new(
+                "reference method receiver must be mutable",
+                span,
+                "cannot borrow an immutable variable as ref self",
+            )
+            .add_info(info.span_decl, "immutable variable declared here")
+            .report(self.refs.diags));
+        }
+        let actual_ty = flow.type_of(self, target.base)?;
+        if &actual_ty != expected_ty {
+            return Err(self.refs.diags.report_error_simple(
+                "reference method receiver type changed",
+                span,
+                format!(
+                    "expected `{}`, found `{}`",
+                    expected_ty.value_string(self.refs),
+                    actual_ty.value_string(self.refs)
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn eval_call(
         &mut self,
         flow: &mut impl Flow,
@@ -1637,7 +1741,9 @@ impl<'a> CompileItemContext<'a, '_> {
             }
             ExpressionKind::Id(id) => {
                 let id = self.eval_id(scope, flow, id).map_err(Either::Right)?;
-                let named = self.eval_scoped_as_named(scope, id).map_err(|e| Either::Right(e))?;
+                let named = self
+                    .eval_scoped_as_named(scope, flow, id)
+                    .map_err(|e| Either::Right(e))?;
 
                 match named {
                     NamedOrValue::Value(_) => Err(build_err("a value")),
