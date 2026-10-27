@@ -8,5 +8,6 @@ cd "$(dirname "$0")"
 
 # Install dependencies
 npm ci
-# Build and run server
-npm run start
+
+# Build and run server, on port $PORT if set
+npm run start -- ${PORT:+--port "$PORT"}
