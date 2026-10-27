@@ -1019,19 +1019,19 @@ fn set_compile_value_impl(
     steps: &[SpannedStep<&TargetStepCompile>],
     assign_op_span: Span,
     source: Spanned<CompileValue>,
-    expected_ty: Option<Spanned<Type>>,
+    required_ty: Option<Spanned<Type>>,
 ) -> DiagResult {
     let diags = refs.diags;
     let elab = &refs.shared.elaboration_arenas;
 
     // if done just do the final assignment, otherwise get the next step
     let Some((step, steps)) = steps.split_first() else {
-        if let Some(expected_ty) = expected_ty {
+        if let Some(required_ty) = required_ty {
             let reason = TypeContainsReason::Assignment {
                 span_target: target.span,
-                span_target_ty: expected_ty.span,
+                span_target_ty: required_ty.span,
             };
-            check_type_contains_value(refs, reason, &expected_ty.inner, source.as_ref())?;
+            check_type_contains_value(refs, reason, &required_ty.inner, source.as_ref())?;
         }
 
         match target.inner {
@@ -1179,24 +1179,24 @@ fn set_compile_value_impl(
     // Preserve extra type constraints we encounter along the way. These can only come from struct fields.
     // * if this was a struct field, set the new expected type to the type of that field
     // * otherwise, just apply the step to the current expected type if there is one
-    let next_expected_ty = match field_ty {
+    let next_required_ty = match field_ty {
         Some(field_ty) => Some(field_ty),
-        None => expected_ty
-            .map(|ty| {
-                let span = ty.span;
+        None => required_ty
+            .map(|required_ty| {
+                let span = required_ty.span;
                 let step = SpannedStep {
                     span_full: step.span_full,
                     span_step: step.span_step,
                     step: TargetStep::Compile(step.step.clone()),
                 };
-                let new_ty = TargetSteps::single(step).apply_to_expected_type(refs, ty)?;
+                let new_ty = TargetSteps::single(step).apply_to_expected_type(refs, required_ty)?;
                 Ok(Spanned::new(span, new_ty))
             })
             .transpose()?,
     };
 
     let new_target = Spanned::new(step.span_full, new_target);
-    set_compile_value_impl(refs, new_target, steps, assign_op_span, source, next_expected_ty)
+    set_compile_value_impl(refs, new_target, steps, assign_op_span, source, next_required_ty)
 }
 
 fn check_target_is_array<'a>(
