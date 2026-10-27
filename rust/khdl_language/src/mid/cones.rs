@@ -489,7 +489,7 @@ fn compute_block_cones_impl(
                             "conditional branch here",
                         )
                             .add_info(signal.span(&module.signals), "for this signal")
-                            .add_footer_hint("This would not create valid combinatorial logic.\nEnsure both branches drive the same parts of the signal or do a default full assignment beforehand.")
+                            .add_footer_hint("This would not create valid combinatorial logic.\nEnsure all branches drive the same parts of the signal or do a default full assignment beforehand.")
                             .report(diags);
                         signal_errors.insert_first(signal, e);
                     }
