@@ -1,9 +1,9 @@
 use crate::mid::ir::{IrStructType, IrType};
 use crate::util::big_int::BigUint;
 use crate::util::range::ClosedRange;
-use crate::util::sparse_change_array::SparseChangeArray;
+use crate::util::sparse_change_array::{SparseChangeArray, ZipArrays};
 use crate::util::{Never, ResultNeverExt};
-use itertools::{Itertools, enumerate};
+use itertools::{Itertools, enumerate, zip_eq};
 use khdl_util::swrite;
 use std::fmt::Debug;
 use std::ops::ControlFlow;
@@ -23,15 +23,10 @@ impl<T> IrMask<T> {
     {
         match ty {
             IrType::Bool | IrType::Int(_) | IrType::Enum(_) => IrMask::Scalar(init),
-            IrType::Array(ty_inner, len) => {
-                let array = if len.is_zero() {
-                    SparseChangeArray::new_empty()
-                } else {
-                    let mask_inner = IrMask::new(ty_inner, init);
-                    SparseChangeArray::new(len.clone(), mask_inner)
-                };
-                IrMask::Array(Box::new(array))
-            }
+            IrType::Array(ty_inner, len) => IrMask::Array(Box::new(SparseChangeArray::new(
+                len.clone(),
+                IrMask::new(ty_inner, init),
+            ))),
             IrType::Tuple(ty_fields) => {
                 let mask_fields = ty_fields
                     .iter()
@@ -56,16 +51,17 @@ impl<T> IrMask<T> {
 
     pub fn canonicalize(&mut self)
     where
-        T: Eq,
+        T: Clone + Eq,
     {
         match self {
             IrMask::Scalar(_) => {}
             IrMask::Array(slf) => {
-                slf.for_each_block_mut(|_, inner| {
-                    inner.canonicalize();
-                    ControlFlow::Continue(())
-                })
-                .remove_never();
+                (&mut **slf)
+                    .for_each_block(|_, inner| {
+                        inner.canonicalize();
+                        ControlFlow::Continue(())
+                    })
+                    .remove_never();
                 slf.canonicalize()
             }
             IrMask::TupleOrStruct(slf) => slf.iter_mut().for_each(Self::canonicalize),
@@ -110,11 +106,11 @@ impl<T> IrMask<T> {
                 }
                 IrType::Array(ty_inner, _) => {
                     let slf = unwrap_match!(slf, IrMask::Array(slf) => slf);
-                    slf.for_each_block(|range, mask| {
-                        let range_full = ClosedRange {
-                            start: &BigUint::ZERO,
-                            end: slf.len(),
-                        };
+                    let range_full = ClosedRange {
+                        start: &BigUint::ZERO,
+                        end: slf.len(),
+                    };
+                    (&**slf).for_each_block(|range, mask| {
                         if range == range_full {
                             swrite!(prefix, "[..]")
                         } else if let Some(single) = range.as_single() {
@@ -160,40 +156,34 @@ impl<T> IrMask<T> {
     where
         T: Clone,
     {
-        self.for_each_leaf_mut(|leaf| {
+        self.for_each_leaf_mut(&mut |leaf| {
             *leaf = value.clone();
             ControlFlow::Continue(())
         })
         .remove_never();
     }
 
-    pub fn for_each_leaf<B>(&self, mut f: impl FnMut(&T) -> ControlFlow<B>) -> ControlFlow<B> {
-        fn for_each_leaf_impl<T, B>(slf: &IrMask<T>, f: &mut impl FnMut(&T) -> ControlFlow<B>) -> ControlFlow<B> {
-            match slf {
-                IrMask::Scalar(slf) => f(slf),
-                IrMask::Array(slf) => slf.for_each_block(|_, m| for_each_leaf_impl(m, f)),
-                IrMask::TupleOrStruct(values) => values.iter().try_for_each(|m| for_each_leaf_impl(m, f)),
-            }
+    pub fn for_each_leaf<B>(&self, f: &mut impl FnMut(&T) -> ControlFlow<B>) -> ControlFlow<B> {
+        match self {
+            IrMask::Scalar(slf) => f(slf),
+            IrMask::Array(slf) => (&**slf).for_each_block(|_, m| m.for_each_leaf(f)),
+            IrMask::TupleOrStruct(slf) => slf.iter().try_for_each(|m| m.for_each_leaf(f)),
         }
-        for_each_leaf_impl(self, &mut f)
     }
 
-    pub fn for_each_leaf_mut<B>(&mut self, mut f: impl FnMut(&mut T) -> ControlFlow<B>) -> ControlFlow<B> {
-        fn for_each_leaf_mut_impl<T, B>(
-            slf: &mut IrMask<T>,
-            f: &mut impl FnMut(&mut T) -> ControlFlow<B>,
-        ) -> ControlFlow<B> {
-            match slf {
-                IrMask::Scalar(slf) => f(slf),
-                IrMask::Array(slf) => slf.for_each_block_mut(|_, m| for_each_leaf_mut_impl(m, f)),
-                IrMask::TupleOrStruct(values) => values.iter_mut().try_for_each(|m| for_each_leaf_mut_impl(m, f)),
-            }
+    pub fn for_each_leaf_mut<B>(&mut self, f: &mut impl FnMut(&mut T) -> ControlFlow<B>) -> ControlFlow<B>
+    where
+        T: Clone,
+    {
+        match self {
+            IrMask::Scalar(slf) => f(slf),
+            IrMask::Array(slf) => (&mut **slf).for_each_block(|_, m| m.for_each_leaf_mut(f)),
+            IrMask::TupleOrStruct(slf) => slf.iter_mut().try_for_each(|m| m.for_each_leaf_mut(f)),
         }
-        for_each_leaf_mut_impl(self, &mut f)
     }
 
     pub fn any(&self, mut f: impl FnMut(&T) -> bool) -> bool {
-        self.for_each_leaf(|v| {
+        self.for_each_leaf(&mut |v| {
             if f(v) {
                 ControlFlow::Break(())
             } else {
@@ -215,16 +205,17 @@ impl<T> IrMask<T> {
             }
             IrMask::Array(a) => {
                 let b = unwrap_match!(b, IrMask::Array(b) => b);
-                SparseChangeArray::zip2_for_each_block::<_, Never>(a, b, |_, a, b| {
-                    Self::zip2_for_each(a, b, f);
-                    ControlFlow::Continue(())
-                })
-                .remove_never();
+                (&**a, &**b)
+                    .for_each_block::<Never>(|_, (a, b)| {
+                        Self::zip2_for_each(a, b, f);
+                        ControlFlow::Continue(())
+                    })
+                    .remove_never();
             }
             IrMask::TupleOrStruct(a) => {
                 let b = unwrap_match!(b, IrMask::TupleOrStruct(b) => b);
-                for i in 0..a.len() {
-                    Self::zip2_for_each(&a[i], &b[i], f);
+                for (a, b) in zip_eq(a, b) {
+                    Self::zip2_for_each(a, b, f);
                 }
             }
         }
@@ -234,14 +225,7 @@ impl<T> IrMask<T> {
     where
         T: Clone,
     {
-        IrMask::zip3_for_each_mut::<U, Never>(a, Some(b), None, &mut |a, b, c| {
-            let b = b.unwrap();
-            match c {
-                None => {}
-                Some(never) => never.unreachable(),
-            }
-            f(a, b)
-        })
+        IrMask::zip3_for_each_mut(a, Some(b), None::<&IrMask<Never>>, &mut |a, b, _| f(a, b.unwrap()))
     }
 
     pub fn zip3_for_each_mut<U: Debug, V: Debug>(
@@ -261,20 +245,19 @@ impl<T> IrMask<T> {
             IrMask::Array(a) => {
                 let b = b.map(|b| unwrap_match!(b, IrMask::Array(b) => &**b));
                 let c = c.map(|c| unwrap_match!(c, IrMask::Array(c) => &**c));
-                SparseChangeArray::zip3_for_each_block_mut::<_, _, Never>(a, b, c, |_, a, b, c| {
-                    Self::zip3_for_each_mut(a, b, c, f);
-                    ControlFlow::Continue(())
-                })
-                .remove_never();
+                (&mut **a, b, c)
+                    .for_each_block::<Never>(|_, (a, b, c)| {
+                        Self::zip3_for_each_mut(a, b, c, f);
+                        ControlFlow::Continue(())
+                    })
+                    .remove_never();
             }
             IrMask::TupleOrStruct(a) => {
                 let b = b.map(|b| unwrap_match!(b, IrMask::TupleOrStruct(b) => b));
                 let c = c.map(|c| unwrap_match!(c, IrMask::TupleOrStruct(c) => c));
 
-                for i in 0..a.len() {
-                    let b = b.map(|b| &b[i]);
-                    let c = c.map(|c| &c[i]);
-                    Self::zip3_for_each_mut(&mut a[i], b, c, f);
+                for (i, a) in enumerate(a) {
+                    Self::zip3_for_each_mut(a, b.map(|b| &b[i]), c.map(|c| &c[i]), f);
                 }
             }
         }

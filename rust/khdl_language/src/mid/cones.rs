@@ -11,7 +11,7 @@ use crate::util::ResultNeverExt;
 use crate::util::big_int::{AnyInt, BigUint, IsZero};
 use crate::util::data::{IndexMapExt, chain_keys};
 use crate::util::range::{ClosedNonEmptyRange, ClosedRange};
-use crate::util::sparse_change_array::SparseChangeArray;
+use crate::util::sparse_change_array::{SparseChangeArray, ZipArrays};
 use indexmap::{IndexMap, IndexSet};
 use khdl_util::constants::MAX_DRIVER_INFO_PATHS;
 use khdl_util::swrite;
@@ -149,7 +149,7 @@ pub fn compute_and_check_module_cones(diags: &Diagnostics, module: &IrModuleInfo
         let mut all_overlapping = true;
 
         if let Some(mask) = combined_drivers.get(&signal) {
-            mask.for_each_leaf(|v| {
+            mask.for_each_leaf(&mut |v| {
                 match v.len() {
                     0 => {
                         any_undriven = true;
@@ -691,7 +691,7 @@ fn check_combinatorial_self_loops(
     Ok(())
 }
 
-fn build_diag_info_message_paths<T: Eq + Debug>(
+fn build_diag_info_message_paths<T: Clone + Eq + Debug>(
     msg: &str,
     signal_ty: &IrType,
     signal_name: &str,
@@ -810,11 +810,12 @@ impl IrMask<bool> {
                                 start: &start,
                                 end: &(&start + len),
                             };
-                            slf.for_each_block_in_range_mut(range_full, |_, v| {
-                                v.fill(true);
-                                ControlFlow::Continue(())
-                            })
-                            .remove_never();
+                            (&mut **slf)
+                                .for_each_block_in_range(range_full, |_, v| {
+                                    v.fill(true);
+                                    ControlFlow::Continue(())
+                                })
+                                .remove_never();
                         }
                         IntKind::Range(start_range) => {
                             let full_range = ClosedRange {
@@ -844,13 +845,14 @@ impl IrMask<bool> {
                             end: &end,
                         };
                         let mut result = Ok(());
-                        slf.for_each_block_in_range_mut(range, |_, m| {
-                            result = result.and_then(|()| {
-                                m.write_steps_impl(module, process_kind, vars, steps_scalar, step_slice)
-                            });
-                            ControlFlow::Continue(())
-                        })
-                        .remove_never();
+                        (&mut **slf)
+                            .for_each_block_in_range(range, |_, m| {
+                                result = result.and_then(|()| {
+                                    m.write_steps_impl(module, process_kind, vars, steps_scalar, step_slice)
+                                });
+                                ControlFlow::Continue(())
+                            })
+                            .remove_never();
                         result?;
                     }
                     IntKind::Range(index_range) => {
@@ -890,7 +892,7 @@ impl IrMask<bool> {
             ProcessKind::Clocked => {
                 // always allowed, report everything that is maybe driven
                 full_array
-                    .for_each_block_in_range_mut(full_range, |_, m| {
+                    .for_each_block_in_range(full_range, |_, m| {
                         m.for_each_possible_leaf_after_steps_mut(
                             None,
                             module,
@@ -905,7 +907,7 @@ impl IrMask<bool> {
             }
             ProcessKind::Combinatorial => {
                 // only allowed if everything that could be driven is already driven
-                let fully_driven = full_array
+                let fully_driven = (&*full_array)
                     .for_each_block_in_range(full_range, |_, m| {
                         let fully_driven = m.all_after_steps(module, vars, steps_scalar, step_slice);
                         if fully_driven {
@@ -969,11 +971,12 @@ impl IrMask<bool> {
                         start: &start_range.start,
                         end: &(start_range.end + len_1),
                     };
-                    slf.zip2_for_each_block_in_range_mut(full_range, other, |_, slf, other| {
-                        f(slf, other);
-                        ControlFlow::Continue(())
-                    })
-                    .remove_never();
+                    (&mut **slf, other)
+                        .for_each_block_in_range(full_range, |_, (slf, other)| {
+                            f(slf, other);
+                            ControlFlow::Continue(())
+                        })
+                        .remove_never();
                 }
             }
             return;
@@ -985,15 +988,12 @@ impl IrMask<bool> {
                 let other = other.map(|other| unwrap_match!(other, IrMask::Array(other) => &**other));
                 let index_range = unwrap_uint_range(module, vars, index);
 
-                slf.zip2_for_each_block_in_range_mut(
-                    ClosedRange::from(index_range.as_ref()),
-                    other,
-                    |_, m, m_other| {
+                (&mut **slf, other)
+                    .for_each_block_in_range(ClosedRange::from(index_range.as_ref()), |_, (m, m_other)| {
                         m.for_each_possible_leaf_after_steps_mut(m_other, module, vars, steps_scalar, step_slice, f);
                         ControlFlow::Continue(())
-                    },
-                )
-                .remove_never();
+                    })
+                    .remove_never();
             }
             &IrTargetStepScalar::TupleIndex(index) | &IrTargetStepScalar::StructField(index) => {
                 let slf = unwrap_match!(self, IrMask::TupleOrStruct(slf) => slf);
@@ -1030,11 +1030,12 @@ impl IrMask<bool> {
                         start: &start_range.start,
                         end: &(start_range.end + len_1),
                     };
-                    slf.for_each_block_in_range(full_range, |_, m| {
-                        f(m);
-                        ControlFlow::Continue(())
-                    })
-                    .remove_never();
+                    (&**slf)
+                        .for_each_block_in_range(full_range, |_, m| {
+                            f(m);
+                            ControlFlow::Continue(())
+                        })
+                        .remove_never();
                 }
             }
             return;
@@ -1046,11 +1047,12 @@ impl IrMask<bool> {
 
                 let index_range = unwrap_uint_range(module, vars, index);
 
-                slf.for_each_block_in_range(ClosedRange::from(index_range.as_ref()), |_, m| {
-                    m.for_each_possible_leaf_after_steps(module, vars, steps_scalar, step_slice, f);
-                    ControlFlow::Continue(())
-                })
-                .remove_never();
+                (&**slf)
+                    .for_each_block_in_range(ClosedRange::from(index_range.as_ref()), |_, m| {
+                        m.for_each_possible_leaf_after_steps(module, vars, steps_scalar, step_slice, f);
+                        ControlFlow::Continue(())
+                    })
+                    .remove_never();
             }
             &IrTargetStepScalar::TupleIndex(index) | &IrTargetStepScalar::StructField(index) => {
                 let slf = unwrap_match!(self, IrMask::TupleOrStruct(slf) => slf);

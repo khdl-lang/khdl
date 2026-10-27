@@ -1,18 +1,20 @@
 use crate::util::big_int::BigUint;
-use crate::util::iter::IterExt;
 use crate::util::range::ClosedRange;
-use crate::util::{Never, ResultNeverExt};
-use itertools::enumerate;
 use std::fmt::Debug;
-use std::ops::ControlFlow;
+use std::iter::{Map, Peekable};
+use std::ops::{ControlFlow, Range};
 
 /// Data structure for arrays that are sparse, not in their values, but in _changes_ to their values.
 ///
-/// For all visitor methods:
+/// Multiple instances instances of this array can be visited together, similar to `zip`,
+/// using [ZipArrays::for_each_block].
+/// Any combination of  `&SparseChangeArray`, `&mut SparseChangeArray`, `Option` and tuples implements the zip trait.
+///
+/// For all visitor calls:
 ///   The number of times the callback is called is not necessarily the same as the length of the array or range,
 ///   sub-ranges that don't contain any change points are only visited once.
 ///
-/// For mutating visitor methods:
+/// For mutating visitor calls:
 ///   Range boundry indices are added to the array,
 ///   to ensure modifications to the inner element don't incorrectly affect elements outside the range.
 ///
@@ -36,33 +38,16 @@ impl<T> SparseChangeArray<T> {
         }
     }
 
-    pub fn new_empty() -> SparseChangeArray<T> {
-        SparseChangeArray {
-            len: BigUint::ZERO,
-            start: None,
-            changes: vec![],
-        }
-    }
-
     pub fn len(&self) -> &BigUint {
         &self.len
     }
 
     pub fn get(&self, index: &BigUint) -> &T {
         assert!(index < &self.len);
-        match self.changes.binary_search_by_key(&index, pair_first) {
-            Ok(found) => &self.changes[found].1,
-            Err(insert) => {
-                if insert == 0 {
-                    self.start.as_ref().unwrap()
-                } else {
-                    &self.changes[insert - 1].1
-                }
-            }
-        }
+        self.value_before(self.changes.partition_point(|(i, _)| i <= index))
     }
 
-    pub fn assert_valid(&self) {
+    fn assert_valid(&self) {
         if self.len.is_zero() {
             assert!(self.start.is_none());
             assert!(self.changes.is_empty());
@@ -101,275 +86,179 @@ impl<T> SparseChangeArray<T> {
         }
     }
 
-    #[allow(clippy::needless_lifetimes)]
-    pub fn for_each_block<'a, B>(
-        &'a self,
-        mut f: impl FnMut(ClosedRange<&BigUint>, &'a T) -> ControlFlow<B>,
-    ) -> ControlFlow<B> {
-        if let Some(start) = &self.start {
-            let start_range = ClosedRange {
-                start: &BigUint::ZERO,
-                end: self.changes.first().map(pair_first).unwrap_or(&self.len),
-            };
-            f(start_range, start)?;
-
-            for (i, (curr_index, curr_value)) in enumerate(&self.changes) {
-                let next_index = self.changes.get(i + 1).map(pair_first).unwrap_or(&self.len);
-                let curr_range = ClosedRange {
-                    start: curr_index,
-                    end: next_index,
-                };
-                f(curr_range, curr_value)?;
-            }
-        }
-
-        ControlFlow::Continue(())
+    /// The range of change positions that are strictly inside `range`.
+    fn change_range(&self, range: ClosedRange<&BigUint>) -> Range<usize> {
+        let change_start = self.changes.partition_point(|(i, _)| i <= range.start);
+        let change_end = self.changes.partition_point(|(i, _)| i < range.end);
+        change_start..change_end
     }
 
-    pub fn for_each_block_mut<B>(
-        &mut self,
-        mut f: impl FnMut(ClosedRange<&BigUint>, &mut T) -> ControlFlow<B>,
-    ) -> ControlFlow<B> {
-        if let Some(start) = &mut self.start {
-            let start_range = ClosedRange {
-                start: &BigUint::ZERO,
-                end: self.changes.first().map(pair_first).unwrap_or(&self.len),
-            };
-            f(start_range, start)?;
-
-            for (i, last) in (0..self.changes.len()).with_last() {
-                let (curr_index, curr_value, next_index) = if last {
-                    let (curr_index, curr_value) = &mut self.changes[i];
-                    (&*curr_index, curr_value, &self.len)
-                } else {
-                    let [(curr_index, curr_value), (next_index, _)] =
-                        self.changes.get_disjoint_mut([i, i + 1]).unwrap();
-                    (&*curr_index, curr_value, &*next_index)
-                };
-
-                let curr_range = ClosedRange {
-                    start: curr_index,
-                    end: next_index,
-                };
-                f(curr_range, curr_value)?;
-            }
+    /// The active value right before change `change`.
+    fn value_before(&self, change: usize) -> &T {
+        match change.checked_sub(1) {
+            None => self.start.as_ref().unwrap(),
+            Some(prev) => &self.changes[prev].1,
         }
-
-        ControlFlow::Continue(())
     }
+}
 
-    #[allow(clippy::needless_lifetimes)]
-    pub fn for_each_block_in_range<'a, B>(
-        &'a self,
-        range: ClosedRange<&BigUint>,
-        mut f: impl FnMut(ClosedRange<&BigUint>, &'a T) -> ControlFlow<B>,
-    ) -> ControlFlow<B> {
-        // unwrap and handle edge cases
-        let Some(start) = &self.start else {
-            assert!(range.start.is_zero());
-            assert!(range.is_empty());
+/// A zip iterator over a combination of array views.
+pub trait ZipArrays<'a>: Sized {
+    /// The same as [Self::for_each_block_in_range], for the the entire arrays.
+    fn for_each_block<B>(self, f: impl FnMut(ClosedRange<&BigUint>, Self::Item) -> ControlFlow<B>) -> ControlFlow<B> {
+        let Some(len) = self.len().cloned() else {
             return ControlFlow::Continue(());
         };
+        let range = ClosedRange {
+            start: &BigUint::ZERO,
+            end: &len,
+        };
+        self.for_each_block_in_range(range, f)
+    }
 
-        let ClosedRange {
-            start: range_start,
-            end: range_end,
-        } = range;
+    /// Visit all blocks of the arrays that are inside `range`, calling `f` with the range and value of each block.
+    ///
+    /// Within each block the value is constant for all arrays.
+    /// The start of the first block and the end of the last block always match exactly with the given range.
+    fn for_each_block_in_range<B>(
+        mut self,
+        range: ClosedRange<&BigUint>,
+        mut f: impl FnMut(ClosedRange<&BigUint>, Self::Item) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        // check lengths and range, handle empty edge cases
+        let Some(len) = self.len() else {
+            return ControlFlow::Continue(());
+        };
         range.assert_valid();
-        assert!(range_end <= &self.len);
-
+        assert!(range.end <= len);
         if range.is_empty() {
             return ControlFlow::Continue(());
         }
 
-        // get indices
-        let change_start = match self.changes.binary_search_by_key(&range_start, pair_first) {
-            Ok(found) => Some(found),
-            Err(insert) => insert.checked_sub(1),
-        };
-        let change_end = self
-            .changes
-            .binary_search_by_key(&range_end, pair_first)
-            .unwrap_or_else(|insert| insert);
-
-        // actually visit
-        let change_start_unwrap = change_start.unwrap_or(0);
-        if change_start.is_none() {
-            let curr_range = ClosedRange {
-                start: range_start,
-                end: self.changes.first().map(pair_first).unwrap_or(&self.len).min(range_end),
-            };
-            f(curr_range, start)?;
-        }
-        for i in change_start_unwrap..change_end {
-            let (curr_index, curr_value) = &self.changes[i];
-            let curr_end = self.changes.get(i + 1).map(pair_first).unwrap_or(&self.len);
-            let curr_range = ClosedRange {
-                start: curr_index.max(range_start),
-                end: curr_end.min(range_end),
-            };
-            f(curr_range, curr_value)?;
+        // ensure mutable arrays contain all change points we might need
+        //   If there are no mutable arrays this can be skipped.
+        //   If there is only one mutable array we can skip collecting its change points,
+        //     since it is already guaranteed to have them.
+        if Self::COUNT_MUT > 0 {
+            let mut indices = vec![];
+            if !range.start.is_zero() {
+                indices.push(range.start.clone());
+            }
+            if range.end < len {
+                indices.push(range.end.clone());
+            }
+            self.collect_indices(range, Self::COUNT_MUT > 1, &mut indices);
+            indices.sort();
+            indices.dedup();
+            indices.retain(|i| !i.is_zero() && i != len);
+            self.ensure_indices(&indices);
         }
 
+        // walk over the union of all change indices
+        let mut cursor = self.cursor(range);
+        let mut block_start = None;
+        loop {
+            let (item, next) = Self::cursor_next(&mut cursor, block_start);
+            let block = ClosedRange {
+                start: block_start.unwrap_or(range.start),
+                end: next.unwrap_or(range.end),
+            };
+            f(block, item)?;
+
+            let Some(next) = next else { break };
+            block_start = Some(next);
+        }
+
+        // TODO consider calling `canonicalize` on each mutable array here,
+        //   to remove the split indices that turned out to be unnecessary
         ControlFlow::Continue(())
     }
 
-    pub fn for_each_block_in_range_mut<B>(
-        &mut self,
-        range: ClosedRange<&BigUint>,
-        mut f: impl FnMut(ClosedRange<&BigUint>, &mut T) -> ControlFlow<B>,
-    ) -> ControlFlow<B>
-    where
-        T: Clone,
-    {
-        self.zip2_for_each_block_in_range_mut::<Never, B>(range, None, |block, slf, n| {
-            n.copied().remove_never();
-            f(block, slf)
-        })
+    /// Internal types.
+    type Item;
+    type Cursor;
+
+    /// The number of mutable arrays this zip has.
+    const COUNT_MUT: usize;
+
+    /// The length of all arrays, or None if there are none.
+    fn len(&self) -> Option<&BigUint>;
+
+    /// Collect all change indices that fall inside the given range in any of the arrays.
+    /// Only include those of mutable arrays if `include_mut` is set.
+    fn collect_indices(&self, range: ClosedRange<&BigUint>, include_mut: bool, indices: &mut Vec<BigUint>);
+    /// Ensure `indices` are present in the arrays, by splitting up blocks if necessary.
+    /// This only has to do something for mutable arrays, immutable arrays don't need all indices to be present.
+    fn ensure_indices(&mut self, indices: &[BigUint]);
+
+    /// Get the initial cursor for walking through the arrays.
+    fn cursor(self, range: ClosedRange<&BigUint>) -> Self::Cursor;
+    /// Advance the cursor for all arrays that change at `advance_to`, or advance to the first change if None.
+    /// Returns the current item in each array, and the lowest next change index if any.
+    fn cursor_next(cursor: &mut Self::Cursor, advance_to: Option<&BigUint>) -> (Self::Item, Option<&'a BigUint>);
+}
+
+impl<'a, T> ZipArrays<'a> for &'a SparseChangeArray<T> {
+    type Item = &'a T;
+    type Cursor = (&'a T, &'a [(BigUint, T)]);
+
+    const COUNT_MUT: usize = 0;
+
+    fn len(&self) -> Option<&BigUint> {
+        Some(&self.len)
     }
 
-    pub fn zip2_for_each_block_in_range_mut<U, B>(
-        &mut self,
-        range: ClosedRange<&BigUint>,
-        other: Option<&SparseChangeArray<U>>,
-        mut f: impl FnMut(ClosedRange<&BigUint>, &mut T, Option<&U>) -> ControlFlow<B>,
-    ) -> ControlFlow<B>
-    where
-        T: Clone,
-    {
-        // check lengths and handle some (empty) edge cases
-        if let Some(other) = other {
-            assert_eq!(&self.len, &other.len);
-        }
-        if self.start.is_none() {
-            assert!(range.start.is_zero());
-            assert!(range.is_empty());
-            return ControlFlow::Continue(());
-        };
-
-        let ClosedRange {
-            start: range_start,
-            end: range_end,
-        } = range;
-        range.assert_valid();
-        assert!(range_end <= &self.len);
-
-        if range.is_empty() {
-            return ControlFlow::Continue(());
-        }
-
-        // ensure the necessary indices exist
-        let range_end_sub_1 = range_end.sub_1().unwrap();
-        self.ensure_indices([range_start, &range_end_sub_1, range_end]);
-
-        if let Some(other) = other {
-            let other_change_start = other.changes.partition_point(|(i, _)| i < range_start);
-            let other_change_end = other.changes.partition_point(|(i, _)| i < range_end);
-            let other_changes = &other.changes[other_change_start..other_change_end];
-            self.ensure_indices(other_changes.iter().map(pair_first));
-        }
-
-        // find self change range (this needs to happen after potentially having added indices)
-        let slf_change_start = if range_start.is_zero() {
-            None
-        } else {
-            Some(self.changes.binary_search_by_key(&range_start, pair_first).unwrap())
-        };
-        let slf_change_end = if range_end == &self.len {
-            self.changes.len()
-        } else {
-            self.changes.binary_search_by_key(&range_end, pair_first).unwrap()
-        };
-
-        // visit start if necessary
-        if slf_change_start.is_none() {
-            let first_range_end = self.changes.first().map(pair_first).unwrap_or(&self.len).min(range_end);
-            let curr_range = ClosedRange {
-                start: range_start,
-                end: first_range_end,
-            };
-
-            let slf_value = self.start.as_mut().unwrap();
-            let other_value = other.map(|other| other.get(range_start));
-
-            f(curr_range, slf_value, other_value)?;
-        }
-
-        // visit change blocks
-        for (slf_change_index, last) in (slf_change_start.unwrap_or(0)..slf_change_end).with_last() {
-            // get indices and value from self
-            let (curr_index, slf_value, next_index) = if last {
-                let (curr_index, curr_value) = &mut self.changes[slf_change_index];
-                (&*curr_index, curr_value, range_end)
-            } else {
-                let [(curr_index, curr_value), (next_index, _)] = self
-                    .changes
-                    .get_disjoint_mut([slf_change_index, slf_change_index + 1])
-                    .unwrap();
-                (&*curr_index, curr_value, &*next_index)
-            };
-
-            let curr_range = ClosedRange {
-                start: curr_index,
-                end: next_index,
-            };
-
-            let other_value = other.map(|other| other.get(curr_index));
-
-            f(curr_range, slf_value, other_value)?;
-        }
-
-        ControlFlow::Continue(())
+    fn collect_indices(&self, range: ClosedRange<&BigUint>, _: bool, indices: &mut Vec<BigUint>) {
+        indices.extend(self.changes[self.change_range(range)].iter().map(|(i, _)| i.clone()));
     }
 
-    /// Ensure the given `indices` are present in this array. The past indices must be non-decreasing.
-    /// This is useful to prepare for a mutation that needs particular indices to exist,
-    ///   to avoid editing wrong parts of the array.
-    fn ensure_indices<'a>(&mut self, indices: impl IntoIterator<Item = &'a BigUint>)
-    where
-        T: Clone,
-    {
-        let indices = indices.into_iter();
+    fn ensure_indices(&mut self, _: &[BigUint]) {
+        // immutable array, we don't need to do anything
+    }
 
-        let Some(start) = &self.start else {
-            assert!(indices.is_empty());
-            return;
-        };
+    fn cursor(self, range: ClosedRange<&BigUint>) -> Self::Cursor {
+        let changes = self.change_range(range);
+        (self.value_before(changes.start), &self.changes[changes])
+    }
 
-        // TODO faster implementation without constant array reshuffling
-        let mut prev_index = None;
-        for new_index in indices {
-            // correctness checks
-            assert!(new_index <= &self.len);
-            if let Some(prev_index) = prev_index {
-                assert!(prev_index <= new_index);
-            }
-            prev_index = Some(new_index);
+    fn cursor_next(cursor: &mut Self::Cursor, advance_to: Option<&BigUint>) -> (Self::Item, Option<&'a BigUint>) {
+        let (curr, rest) = cursor;
+        if let Some(((index, value), rest_next)) = rest.split_first()
+            && Some(index) == advance_to
+        {
+            *curr = value;
+            *rest = rest_next;
+        }
+        (*curr, rest.first().map(pair_first))
+    }
+}
 
-            // skip index zero (which always exists as `start`)
-            //   and index len (which should never exist)
-            if new_index.is_zero() {
-                continue;
-            }
-            if new_index == &self.len {
-                continue;
-            }
+// Sadly rust does not support specifying a specific function as the type, so we have to use a function pointer.
+type MutIterSlice<'a, T> = std::slice::IterMut<'a, (BigUint, T)>;
+type MutIterMap<'a, T> = Map<MutIterSlice<'a, T>, fn(&'a mut (BigUint, T)) -> (&'a BigUint, &'a mut T)>;
 
-            // find new index
-            match self.changes.binary_search_by_key(&new_index, pair_first) {
-                Ok(_) => {
-                    // index already exists, nothing to do
-                }
-                Err(insert) => {
-                    // index does not yet exist, create it as a copy of the previous value
-                    let prev_value = if insert == 0 {
-                        start.clone()
-                    } else {
-                        self.changes[insert - 1].1.clone()
-                    };
+impl<'a, T: Clone> ZipArrays<'a> for &'a mut SparseChangeArray<T> {
+    type Item = &'a mut T;
+    type Cursor = (Option<&'a mut T>, Peekable<MutIterMap<'a, T>>);
 
-                    self.changes.insert(insert, (new_index.clone(), prev_value));
-                }
+    const COUNT_MUT: usize = 1;
+
+    fn len(&self) -> Option<&BigUint> {
+        Some(&self.len)
+    }
+
+    fn collect_indices(&self, range: ClosedRange<&BigUint>, include_mut: bool, indices: &mut Vec<BigUint>) {
+        if include_mut {
+            (&**self).collect_indices(range, include_mut, indices);
+        }
+    }
+
+    fn ensure_indices(&mut self, indices: &[BigUint]) {
+        // TODO this can be optimized
+        for index in indices {
+            if let Err(insert) = self.changes.binary_search_by_key(&index, pair_first) {
+                let prev_value = self.value_before(insert);
+                self.changes.insert(insert, (index.clone(), prev_value.clone()));
             }
         }
 
@@ -378,203 +267,119 @@ impl<T> SparseChangeArray<T> {
         }
     }
 
-    pub fn zip2_for_each_block<U, R>(
-        a: &SparseChangeArray<T>,
-        b: &SparseChangeArray<U>,
-        mut f: impl FnMut(ClosedRange<&BigUint>, &T, &U) -> ControlFlow<R>,
-    ) -> ControlFlow<R> {
-        zip_impl::<Never, _, _, _>(None, Some(a), Some(b), |range, _, a, b| {
-            f(range, a.unwrap(), b.unwrap())
-        })
+    fn cursor(self, range: ClosedRange<&BigUint>) -> Self::Cursor {
+        let changes = self.change_range(range);
+        let SparseChangeArray {
+            len: _,
+            start,
+            changes: all_changes,
+        } = self;
+
+        let (before, rest) = all_changes[..changes.end].split_at_mut(changes.start);
+        let curr = match before.last_mut() {
+            None => start.as_mut().unwrap(),
+            Some((_, value)) => value,
+        };
+        let rest = rest.iter_mut().map(split_pair_mut as fn(_) -> _).peekable();
+        (Some(curr), rest)
     }
 
-    pub fn zip3_for_each_block_mut<U, V, R>(
-        a: &mut SparseChangeArray<T>,
-        b: Option<&SparseChangeArray<U>>,
-        c: Option<&SparseChangeArray<V>>,
-        mut f: impl FnMut(ClosedRange<&BigUint>, &mut T, Option<&U>, Option<&V>) -> ControlFlow<R>,
-    ) -> ControlFlow<R>
-    where
-        T: Clone,
-    {
-        zip_impl(Some(a), b, c, |range, a, b, c| f(range, a.unwrap(), b, c))
+    fn cursor_next(cursor: &mut Self::Cursor, advance_to: Option<&BigUint>) -> (Self::Item, Option<&'a BigUint>) {
+        let (curr, rest) = cursor;
+        if let Some((_, value)) = rest.next_if(|&(index, _)| Some(index) == advance_to) {
+            *curr = Some(value);
+        }
+        (curr.take().unwrap(), rest.peek().map(|&(index, _)| index))
     }
 }
 
-fn zip_impl<A: Clone, B, C, R>(
-    a: Option<&mut SparseChangeArray<A>>,
-    b: Option<&SparseChangeArray<B>>,
-    c: Option<&SparseChangeArray<C>>,
-    mut f: impl FnMut(ClosedRange<&BigUint>, Option<&mut A>, Option<&B>, Option<&C>) -> ControlFlow<R>,
-) -> ControlFlow<R> {
-    // check array lengths match and handle no args or empty array cases
-    let mut len = a.as_ref().map(|a| a.len.clone());
-    if let Some(b) = b {
-        assert!(len.is_none_or(|len| len == b.len));
-        len = Some(b.len.clone());
-    }
-    if let Some(c) = c {
-        assert!(len.is_none_or(|len| len == c.len));
-        len = Some(c.len.clone());
+impl<'a, A: ZipArrays<'a>> ZipArrays<'a> for Option<A> {
+    type Item = Option<A::Item>;
+    type Cursor = Option<A::Cursor>;
+
+    const COUNT_MUT: usize = A::COUNT_MUT;
+
+    fn len(&self) -> Option<&BigUint> {
+        self.as_ref().and_then(A::len)
     }
 
-    let Some(len) = len else {
-        return ControlFlow::Continue(());
-    };
-    if len.is_zero() {
-        return ControlFlow::Continue(());
+    fn collect_indices(&self, range: ClosedRange<&BigUint>, include_mut: bool, indices: &mut Vec<BigUint>) {
+        if let Some(a) = self {
+            a.collect_indices(range, include_mut, indices);
+        }
     }
 
-    if let Some(a) = a {
-        // ensure we have the necessary indices
-        // TODO do this in a single combined pass?
-        if let Some(b) = b {
-            a.ensure_indices(b.changes.iter().map(pair_first));
+    fn ensure_indices(&mut self, indices: &[BigUint]) {
+        if let Some(a) = self {
+            a.ensure_indices(indices);
         }
-        if let Some(c) = c {
-            a.ensure_indices(c.changes.iter().map(pair_first));
-        }
+    }
 
-        // build state
-        let mut state_b = b.map(|b| (b.start.as_ref().unwrap(), b.changes.as_slice()));
-        let mut state_c = c.map(|c| (c.start.as_ref().unwrap(), c.changes.as_slice()));
+    fn cursor(self, range: ClosedRange<&BigUint>) -> Self::Cursor {
+        self.map(|a| a.cursor(range))
+    }
 
-        // visit first element
-        {
-            let start_range = ClosedRange {
-                start: &BigUint::ZERO,
-                end: a.changes.first().map(pair_first).unwrap_or(&a.len),
-            };
-            f(
-                start_range,
-                Some(a.start.as_mut().unwrap()),
-                state_b.map(|(s, _)| s),
-                state_c.map(|(s, _)| s),
-            )?;
-        }
+    fn cursor_next(cursor: &mut Self::Cursor, advance_to: Option<&BigUint>) -> (Self::Item, Option<&'a BigUint>) {
+        let (item, next) = cursor.as_mut().map(|cursor| A::cursor_next(cursor, advance_to)).unzip();
+        (item, next.flatten())
+    }
+}
 
-        // visit change elements
-        // just walk over all indices in the base, and step the others when relevant
-        for (i, last) in (0..a.changes.len()).with_last() {
-            // figure out the range
-            let (curr_index, curr_a, next_index) = if last {
-                let (curr_index, curr_a) = &mut a.changes[i];
-                (&*curr_index, curr_a, &a.len)
-            } else {
-                let [(curr_index, curr_a), (next_index, _)] = a.changes.get_disjoint_mut([i, i + 1]).unwrap();
-                (&*curr_index, curr_a, &*next_index)
-            };
-            let curr_range = ClosedRange {
-                start: curr_index,
-                end: next_index,
-            };
+macro_rules! impl_zip_arrays_tuple {
+    ($($A:ident $a:ident),*) => {
+        impl<'a, $($A: ZipArrays<'a>),*> ZipArrays<'a> for ($($A,)*) {
+            type Item = ($($A::Item,)*);
+            type Cursor = ($($A::Cursor,)*);
 
-            // pop b/c if necessary
-            {
-                if let Some((curr_b, changes_b)) = &mut state_b {
-                    if let Some(((index_b, next_b), rest_b)) = changes_b.split_first() {
-                        debug_assert!(curr_index <= index_b);
-                        if curr_index == index_b {
-                            *curr_b = next_b;
-                            *changes_b = rest_b;
-                        }
+            const COUNT_MUT: usize = 0 $(+ $A::COUNT_MUT)*;
+
+            fn len(&self) -> Option<&BigUint> {
+                let ($($a,)*) = self;
+                let mut len = None;
+                $(
+                    if let Some(a_len) = $a.len() {
+                        assert!(len.is_none_or(|len| len == a_len), "array lengths must match");
+                        len = Some(a_len);
                     }
-                }
-                if let Some((curr_c, changes_c)) = &mut state_c {
-                    if let Some(((index_c, next_c), rest_c)) = changes_c.split_first() {
-                        debug_assert!(curr_index <= index_c);
-                        if curr_index == index_c {
-                            *curr_c = next_c;
-                            *changes_c = rest_c;
-                        }
-                    }
-                }
+                )*
+                len
             }
 
-            // visit change element
-            f(
-                curr_range,
-                Some(curr_a),
-                state_b.map(|(s, _)| s),
-                state_c.map(|(s, _)| s),
-            )?;
+            fn collect_indices(&self, range: ClosedRange<&BigUint>, include_mut: bool, indices: &mut Vec<BigUint>) {
+                let ($($a,)*) = self;
+                $($a.collect_indices(range, include_mut, indices);)*
+            }
+
+            fn ensure_indices(&mut self, indices: &[BigUint]) {
+                let ($($a,)*) = self;
+                $($a.ensure_indices(indices);)*
+            }
+
+            fn cursor(self, range: ClosedRange<&BigUint>) -> Self::Cursor {
+                let ($($a,)*) = self;
+                ($($a.cursor(range),)*)
+            }
+
+            fn cursor_next(cursor: &mut Self::Cursor, advance_to: Option<&BigUint>) -> (Self::Item, Option<&'a BigUint>) {
+                let ($($a,)*) = cursor;
+                let mut next: Option<&'a BigUint> = None;
+                let item = ($({
+                    let (item, a_next) = $A::cursor_next($a, advance_to);
+                    next = [next, a_next].into_iter().flatten().min();
+                    item
+                },)*);
+                (item, next)
+            }
         }
+    };
+}
 
-        if let Some((_, changes_b)) = state_b {
-            debug_assert!(changes_b.is_empty());
-        }
-        if let Some((_, changes_c)) = state_c {
-            debug_assert!(changes_c.is_empty());
-        }
-    } else {
-        // handle simple cases first
-        let (b, c) = match (b, c) {
-            (None, None) => return ControlFlow::Continue(()),
-            (Some(b), None) => return b.for_each_block(|range, b| f(range, None, Some(b), None)),
-            (None, Some(c)) => return c.for_each_block(|range, c| f(range, None, None, Some(c))),
-            (Some(b), Some(c)) => (b, c),
-        };
+impl_zip_arrays_tuple!(A a, B b);
+impl_zip_arrays_tuple!(A a, B b, C c);
+impl_zip_arrays_tuple!(A a, B b, C c, D d);
 
-        // build state
-        let mut prev_index = &BigUint::ZERO;
-        let mut curr_b = b.start.as_ref().unwrap();
-        let mut changes_b = b.changes.as_slice();
-        let mut curr_c = c.start.as_ref().unwrap();
-        let mut changes_c = c.changes.as_slice();
-
-        loop {
-            let prev_b = curr_b;
-            let prev_c = curr_c;
-
-            // figure out which side has the lowest next change index, and pop it
-            let next_index = match (changes_b.split_first(), changes_c.split_first()) {
-                (None, None) => {
-                    // done, still visit the last element
-                    let curr_range = ClosedRange {
-                        start: prev_index,
-                        end: &len,
-                    };
-                    f(curr_range, None, Some(curr_b), Some(curr_c))?;
-                    break;
-                }
-                (Some(((index_b, next_b), rest_b)), None) => {
-                    curr_b = next_b;
-                    changes_b = rest_b;
-                    index_b
-                }
-                (None, Some(((index_c, next_c), rest_c))) => {
-                    curr_c = next_c;
-                    changes_c = rest_c;
-                    index_c
-                }
-                (Some(((index_b, next_b), rest_b)), Some(((index_c, next_c), rest_c))) => {
-                    let cmp = index_b.cmp(index_c);
-                    if cmp.is_le() {
-                        curr_b = next_b;
-                        changes_b = rest_b;
-                    }
-                    if cmp.is_ge() {
-                        curr_c = next_c;
-                        changes_c = rest_c;
-                    }
-
-                    if cmp.is_le() { index_b } else { index_c }
-                }
-            };
-
-            // visit previous element
-            let prev_range = ClosedRange {
-                start: prev_index,
-                end: next_index,
-            };
-            f(prev_range, None, Some(prev_b), Some(prev_c))?;
-
-            // update prev
-            prev_index = next_index;
-        }
-    }
-
-    ControlFlow::Continue(())
+fn split_pair_mut<A, B>((a, b): &mut (A, B)) -> (&A, &mut B) {
+    (a, b)
 }
 
 fn pair_first<A, B>(x: &(A, B)) -> &A {
@@ -583,11 +388,10 @@ fn pair_first<A, B>(x: &(A, B)) -> &A {
 
 #[cfg(test)]
 mod tests {
-    use super::zip_impl;
     use crate::util::big_int::BigUint;
     use crate::util::exhaust::exhaust;
     use crate::util::range::ClosedRange;
-    use crate::util::sparse_change_array::SparseChangeArray;
+    use crate::util::sparse_change_array::{SparseChangeArray, ZipArrays};
     use crate::util::{Never, ResultNeverExt};
     use indexmap::IndexSet;
     use itertools::{Itertools, enumerate};
@@ -645,7 +449,7 @@ mod tests {
                 let (actual_visit, actual_cover) = {
                     let mut r = vec![];
                     let mut c = vec![false; len];
-                    array_change
+                    (&array_change)
                         .for_each_block_in_range::<Never>(range.as_ref(), |block, &x| {
                             r.push(x);
                             cover_check_set(&mut c, block);
@@ -667,8 +471,8 @@ mod tests {
                 let mut array_change_mut = array_change.clone();
                 let mut actual_cover_mut = vec![false; len];
 
-                array_change_mut
-                    .for_each_block_in_range_mut::<Never>(range.as_ref(), |block, x| {
+                (&mut array_change_mut)
+                    .for_each_block_in_range::<Never>(range.as_ref(), |block, x| {
                         *x = VALUE_LIMIT;
                         cover_check_set(&mut actual_cover_mut, block);
                         ControlFlow::Continue(())
@@ -682,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zip_impl_exhaust() {
+    fn test_zip3_exhaust() {
         const LEN_LIMIT: usize = 5;
         const VALUE_LIMIT: u64 = 2;
 
@@ -739,17 +543,17 @@ mod tests {
             let mut seen_change = IndexSet::new();
             let mut cover_change = vec![false; len];
 
-            zip_impl(
+            (
                 a_pair.as_mut().map(|(_, a)| a),
                 b_pair.as_ref().map(|(_, b)| b),
                 c_pair.as_ref().map(|(_, c)| c),
-                |block, a, b, c| {
+            )
+                .for_each_block(|block, (a, b, c)| {
                     op(&mut seen_change, a, b, c);
                     cover_check_set(&mut cover_change, block);
                     ControlFlow::Continue(())
-                },
-            )
-            .remove_never();
+                })
+                .remove_never();
 
             // check match (including set order)
             assert_eq!(
@@ -763,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zip2_in_range_mut_exhaust() {
+    fn test_zip2_range_mut_exhaust() {
         const LEN_LIMIT: usize = 5;
         const VALUE_LIMIT: u64 = 3;
 
@@ -814,17 +618,13 @@ mod tests {
                 let mut actual_cover = vec![false; len];
                 let mut seen = vec![];
 
-                actual_change
-                    .zip2_for_each_block_in_range_mut::<u64, Never>(
-                        range.as_ref(),
-                        other_pair.as_ref().map(|(_, b)| b),
-                        |block, a, b| {
-                            seen.push((*a, b.copied()));
-                            op(a, b);
-                            cover_check_set(&mut actual_cover, block);
-                            ControlFlow::Continue(())
-                        },
-                    )
+                (&mut actual_change, other_pair.as_ref().map(|(_, b)| b))
+                    .for_each_block_in_range::<Never>(range.as_ref(), |block, (a, b)| {
+                        seen.push((*a, b.copied()));
+                        op(a, b);
+                        cover_check_set(&mut actual_cover, block);
+                        ControlFlow::Continue(())
+                    })
                     .remove_never();
 
                 let mut expected_cover = vec![false; len];
@@ -872,7 +672,11 @@ mod tests {
         mut include_dummy_change: impl FnMut(usize) -> bool,
     ) -> SparseChangeArray<T> {
         let result = match array_dense.split_first() {
-            None => SparseChangeArray::new_empty(),
+            None => SparseChangeArray {
+                len: BigUint::ZERO,
+                start: None,
+                changes: vec![],
+            },
             Some((first, rest)) => {
                 let mut changes = vec![];
                 let mut prev = first;
