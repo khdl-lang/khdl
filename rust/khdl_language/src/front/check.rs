@@ -473,7 +473,7 @@ pub fn check_type_is_range_compile(
     refs: CompileRefs,
     reason: TypeContainsReason,
     value: Spanned<CompileValue>,
-) -> DiagResult<Range<BigInt>> {
+) -> DiagResult<MultiRange<BigInt>> {
     let diags = refs.diags;
     check_type_contains_value(refs, reason, &Type::Range, value.as_ref())?;
 
@@ -502,5 +502,29 @@ pub fn check_port_is_output(
             Err(diag)
         }
         PortDirection::Output => Ok(()),
+    }
+}
+
+pub fn check_range_is_compile_for_member(
+    refs: CompileRefs,
+    member_span: Span,
+    value: Spanned<Value>,
+) -> DiagResult<MultiRange<BigInt>> {
+    let diags = refs.diags;
+    let range_span = value.span;
+
+    let range = check_type_is_range(refs, TypeContainsReason::Operator(member_span), value)?;
+    match range {
+        RangeValue::Compile(range) => Ok(range),
+        RangeValue::HardwareBounds(_) | RangeValue::HardwareStartLength { start: _, length: _ } => {
+            let diag = DiagnosticError::new(
+                "range attributes and methods require compile-time ranges",
+                range_span,
+                "range with hardware bounds here",
+            )
+            .add_info(member_span, "for attribute or method here")
+            .report(diags);
+            Err(diag)
+        }
     }
 }

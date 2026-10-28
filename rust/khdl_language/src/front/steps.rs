@@ -1,13 +1,17 @@
-use crate::front::check::{TypeContainsReason, check_hardware_type_for_bit_operation, check_type_contains_value};
+use crate::front::check::{
+    TypeContainsReason, check_hardware_type_for_bit_operation, check_range_is_compile_for_member,
+    check_type_contains_value,
+};
 use crate::front::compile::{CompileItemContext, CompileRefs, resolve_import_final};
 use crate::front::diagnostic::{DiagError, DiagResult, DiagnosticError, Diagnostics};
 use crate::front::domain::ValueDomain;
 use crate::front::function::{
-    FunctionBits, FunctionBitsKind, FunctionBody, FunctionValue, error_cannot_infer_generic_params,
-    error_unique_mismatch,
+    FunctionBits, FunctionBitsKind, FunctionBody, FunctionRangeMethod, FunctionValue, RangeMethodKind,
+    error_cannot_infer_generic_params, error_unique_mismatch,
 };
 use crate::front::implication::{HardwareValueWithImplications, ValueWithImplications};
 use crate::front::item::{ElaboratedInterfaceView, FunctionItemBody};
+use crate::front::string::range_value_string;
 use crate::front::types::{HardwareType, Type, Typed};
 use crate::front::value::{
     BoundMethod, CompileCompoundValue, CompileValue, EnumValue, HardwareUInt, HardwareValue, MaybeCompile,
@@ -21,8 +25,8 @@ use crate::util::big_int::{BigInt, BigUint};
 use crate::util::data::VecExt;
 use crate::util::intern::Id;
 use crate::util::iter::IterExt;
-use crate::util::range::ClosedNonEmptyRange;
-use crate::util::range_multi::{AnyMultiRange, ClosedNonEmptyMultiRange};
+use crate::util::range::{ClosedNonEmptyRange, Range, RangeOpen};
+use crate::util::range_multi::{AnyMultiRange, ClosedMultiRange, ClosedNonEmptyMultiRange, MultiRange};
 use itertools::{Either, Itertools, zip_eq};
 use std::sync::Arc;
 
@@ -669,6 +673,9 @@ impl TargetSteps<&TargetStepCompile> {
 
 pub const POSSIBLE_BUILTIN_TYPE_MEMBERS: &[&str] = &["size_bits", "to_bits", "from_bits", "from_bits_unsafe", "new"];
 
+pub const ERROR_ENCLOSING_EMPTY_RANGE: &str = "cannot get the enclosing range of an empty range";
+pub const ERROR_LEN_UNBOUNDED_RANGE: &str = "cannot get the length of an unbounded range";
+
 fn eval_dot_index_id(
     ctx: &mut CompileItemContext,
     expected_ty: &Type,
@@ -985,6 +992,44 @@ fn eval_dot_index_id(
         };
     }
 
+    // range attributes and methods
+    if let Type::Range = base_ty
+        && let Some(member) = RangeMember::from_name(index_str)
+    {
+        let base = check_range_is_compile_for_member(refs, index.span, base.map_inner(|v| v.into_value()))?;
+        let new_range = |range| Value::from(CompileValue::Compound(CompileCompoundValue::Range(range)));
+
+        let result = match member {
+            RangeMember::Enclosing => match base.enclosing() {
+                Some(range) => new_range(MultiRange::from(Range::from(range.cloned()))),
+                None => {
+                    return Err(diags.report_error_simple(
+                        ERROR_ENCLOSING_EMPTY_RANGE,
+                        expr_span,
+                        format!("got {}", range_value_string(&base)),
+                    ));
+                }
+            },
+            RangeMember::Complement => new_range(base.complement()),
+            RangeMember::Len => {
+                let base = ClosedMultiRange::try_from(base.clone()).map_err(|_: RangeOpen| {
+                    diags.report_error_simple(
+                        ERROR_LEN_UNBOUNDED_RANGE,
+                        expr_span,
+                        format!("got {}", range_value_string(&base)),
+                    )
+                })?;
+
+                Value::new_int(base.len().into())
+            }
+            RangeMember::Method(kind) => {
+                let func = FunctionRangeMethod { base, kind };
+                Value::Simple(SimpleCompileValue::Function(FunctionValue::RangeMethod(func)))
+            }
+        };
+        return Ok(ValueWithImplications::simple(result));
+    }
+
     // fallthrough into error
     let diag = DiagnosticError::new(
         "invalid dot index expression",
@@ -994,6 +1039,27 @@ fn eval_dot_index_id(
     .add_info(base.span, format!("base has type `{}`", base_ty.value_string(refs)))
     .report(diags);
     Err(diag)
+}
+
+enum RangeMember {
+    Enclosing,
+    Complement,
+    Len,
+    Method(RangeMethodKind),
+}
+
+impl RangeMember {
+    fn from_name(name: &str) -> Option<RangeMember> {
+        match name {
+            "enclosing" => Some(RangeMember::Enclosing),
+            "complement" => Some(RangeMember::Complement),
+            "len" => Some(RangeMember::Len),
+            "union" => Some(RangeMember::Method(RangeMethodKind::Union)),
+            "intersect" => Some(RangeMember::Method(RangeMethodKind::Intersect)),
+            "subtract" => Some(RangeMember::Method(RangeMethodKind::Subtract)),
+            _ => None,
+        }
+    }
 }
 
 enum SetCompileTarget<'a> {
@@ -1229,7 +1295,7 @@ pub fn check_range_index(
     let ClosedNonEmptyRange {
         start: _,
         end: index_end,
-    } = index.inner.enclosing_range();
+    } = index.inner.enclosing();
 
     if array_len.inner.is_none_or(|array_len| index_end <= array_len) {
         Ok(())
@@ -1314,7 +1380,7 @@ pub fn check_range_slice(
     let ClosedNonEmptyRange {
         start: _,
         end: slice_start_end,
-    } = slice_start.inner.enclosing_range();
+    } = slice_start.inner.enclosing();
 
     if array_len
         .inner

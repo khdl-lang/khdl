@@ -7,6 +7,7 @@ use crate::front::flow::{Flow, FlowHardware, ImplicationContradiction};
 use crate::front::implication::{HardwareValueWithImplications, Implication, ValueWithImplications};
 use crate::front::item::{ElaboratedEnum, HardwareChecked};
 use crate::front::scope::{NamedValue, Scope, ScopedEntry};
+use crate::front::string::range_value_string;
 use crate::front::types::{HardwareType, NonHardwareType, Type, Typed};
 use crate::front::value::{CompileCompoundValue, CompileValue, NotCompile, SimpleCompileValue, Value, ValueCommon};
 use crate::mid::ir::{
@@ -15,7 +16,7 @@ use crate::mid::ir::{
 use crate::syntax::ast::{Block, BlockStatement, MatchBranch, MatchPattern, MatchStatement, MaybeIdentifier};
 use crate::syntax::pos::{HasSpan, Pos, Span, Spanned};
 use crate::util::big_int::BigInt;
-use crate::util::range::Range;
+use crate::util::range::{NonEmptyRange, Range};
 use crate::util::range_multi::{AnyMultiRange, ClosedMultiRange, MultiRange};
 use itertools::{Itertools, zip_eq};
 use unwrap_match::unwrap_match;
@@ -25,7 +26,7 @@ pub enum EvaluatedMatchPattern {
     Wildcard,
     WildcardVal(MaybeIdentifier),
     EqualTo(Spanned<CompileValue>),
-    InRange(Spanned<Range<BigInt>>),
+    InRange(Spanned<MultiRange<BigInt>>),
     IsEnumVariant {
         variant_index: usize,
         payload_id: Option<MaybeIdentifier>,
@@ -651,23 +652,20 @@ impl CompileItemContext<'_, '_> {
                     MatchCoverage::Int { rem_range } => {
                         // TODO warn if parts of range already covered
                         // TODO share code with ordinary comparisons?
-                        let range_multi = MultiRange::from(range.inner.clone());
-
-                        if rem_range.intersect(&range_multi).is_empty() {
+                        if rem_range.intersect(&range.inner).is_empty() {
                             warn_unreachable_branch(
                                 branch_pattern.span,
                                 &coverage_remaining,
-                                Some(format!("in {}", range.inner)),
+                                Some(format!("in {}", range_value_string(&range.inner))),
                             );
                             continue;
                         }
-                        *rem_range = rem_range.subtract(&range_multi);
+                        *rem_range = rem_range.subtract(&range.inner);
 
-                        let cond =
-                            build_ir_int_in_range(&mut self.large, &target_value.value.expr, range.inner.clone());
+                        let cond = build_ir_int_in_multi_range(&mut self.large, &target_value.value.expr, &range.inner);
 
                         let implications = if let Some(target_version) = target_version {
-                            vec![Implication::new_int(target_version, range_multi)]
+                            vec![Implication::new_int(target_version, range.inner.clone())]
                         } else {
                             vec![]
                         };
@@ -837,9 +835,31 @@ impl CompileItemContext<'_, '_> {
     }
 }
 
-fn build_ir_int_in_range(large: &mut IrLargeArena, value: &IrExpression, range: Range<BigInt>) -> Option<IrExpression> {
-    range.assert_valid();
-    let Range { start, end } = range;
+/// Evaluate if `value` is in `range`. Returns `None` if the condition is always true.
+fn build_ir_int_in_multi_range(
+    large: &mut IrLargeArena,
+    value: &IrExpression,
+    range: &MultiRange<BigInt>,
+) -> Option<IrExpression> {
+    // TODO reason about the value range too, we can return a definitive answer even more often here
+    let mut curr = None;
+    for range in range.ranges() {
+        let cond = build_ir_int_in_range(large, value, range.clone())?;
+        let next = match curr {
+            None => cond,
+            Some(curr) => large.push_expr(IrExpressionLarge::BoolBinaryScalar(IrBoolBinaryOp::Or, curr, cond)),
+        };
+        curr = Some(next);
+    }
+    Some(curr.unwrap_or(IrExpression::Bool(false)))
+}
+
+fn build_ir_int_in_range(
+    large: &mut IrLargeArena,
+    value: &IrExpression,
+    range: NonEmptyRange<BigInt>,
+) -> Option<IrExpression> {
+    let NonEmptyRange { start, end } = range;
 
     let cond_start = start.map(|start| {
         large.push_expr(IrExpressionLarge::IntCompare(

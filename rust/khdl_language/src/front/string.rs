@@ -72,8 +72,12 @@ impl StringBuilder {
                     }
                 }
                 MixedCompoundValue::Range(value) => match value {
-                    RangeValue::Normal(range) => {
-                        let Range { start, end } = range;
+                    RangeValue::Compile(range) => {
+                        self.push_str(range_value_string(range));
+                    }
+                    RangeValue::HardwareBounds(range) => {
+                        let Range { start, end } = range.range();
+                        self.push_str("Range(");
                         if let Some(start) = start {
                             self.push_value(refs, &Value::from(start.clone()));
                         }
@@ -81,11 +85,14 @@ impl StringBuilder {
                         if let Some(end) = end {
                             self.push_value(refs, &Value::from(end.clone()));
                         }
+                        self.push_str(")");
                     }
                     RangeValue::HardwareStartLength { start, length } => {
+                        self.push_str("Range(");
                         self.push_value(refs, &Value::Hardware(start.clone().map_type(HardwareType::Int)));
                         self.push_str("+..");
                         self.push_str(length.to_string());
+                        self.push_str(")");
                     }
                 },
                 MixedCompoundValue::Tuple(elements) => {
@@ -641,24 +648,16 @@ impl HardwareType {
     }
 }
 
+pub fn range_value_string(range: &MultiRange<BigInt>) -> String {
+    format!("Range({})", range.ranges().iter().format(", "))
+}
+
 impl CompileCompoundValue {
     pub fn value_string<'a>(&self, refs: impl Into<StringRefs<'a>>) -> String {
         let refs = refs.into();
         match self {
             CompileCompoundValue::String(v) => v.as_ref().clone(),
-            CompileCompoundValue::Range(v) => {
-                let Range { start, end } = v;
-
-                let mut f = String::new();
-                if let Some(start) = start {
-                    swrite!(f, "{start}");
-                }
-                swrite!(f, "..");
-                if let Some(end) = end {
-                    swrite!(f, "{end}");
-                }
-                f
-            }
+            CompileCompoundValue::Range(v) => range_value_string(v),
             CompileCompoundValue::Tuple(v) => {
                 let mut f = String::new();
                 swrite!(f, "(");

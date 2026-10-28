@@ -657,7 +657,7 @@ pub trait Flow: FlowPrivate {
                         ty: HardwareType::Int(range.clone()),
                         domain: value_full_raw_without_copy.domain,
                         expr: ctx.large.push_expr(IrExpressionLarge::ConstrainIntRange(
-                            range.enclosing_range().cloned(),
+                            range.enclosing().cloned(),
                             value_full_raw_without_copy.expr,
                         )),
                     },
@@ -2298,7 +2298,7 @@ impl VariableValueHardware {
                 &Implied::BoolConst(value) => Value::new_bool(value),
                 Implied::IntRange(range) => {
                     let expr = large.push_expr(IrExpressionLarge::ConstrainIntRange(
-                        range.enclosing_range().cloned(),
+                        range.enclosing().cloned(),
                         IrExpression::Variable(value_raw.expr),
                     ));
                     Value::Hardware(HardwareValue {

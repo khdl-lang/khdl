@@ -16,8 +16,10 @@ use khdl_language::front::flow::{FlowCompile, FlowRoot};
 use khdl_language::front::function::CallArgs;
 use khdl_language::front::item::ElaboratedModule;
 use khdl_language::front::print::{CollectPrintHandler, PrintHandler, StdoutPrintHandler};
-use khdl_language::front::steps::{SpannedStep, TargetStepCompile, TargetSteps};
-use khdl_language::front::string::StringRefs;
+use khdl_language::front::steps::{
+    ERROR_ENCLOSING_EMPTY_RANGE, ERROR_LEN_UNBOUNDED_RANGE, SpannedStep, TargetStepCompile, TargetSteps,
+};
+use khdl_language::front::string::{StringRefs, range_value_string};
 use khdl_language::front::types::{Type as RustType, Typed};
 use khdl_language::front::value::{
     CompileValue as RustCompileValue, EnumValue as RustEnumValue, NotCompile, SimpleCompileValue,
@@ -36,7 +38,8 @@ use khdl_language::syntax::source::SourceDatabase as RustSourceDatabase;
 use khdl_language::util::big_int::BigInt;
 use khdl_language::util::nd_array::{NdArray, NdArrayShape};
 use khdl_language::util::pool::ThreadPool;
-use khdl_language::util::range::Range as RustRange;
+use khdl_language::util::range::{NonEmptyRange, Range as RustRange, RangeOpen};
+use khdl_language::util::range_multi::{AnyMultiRange, ClosedMultiRange, MultiRange as RustMultiRange};
 use khdl_language::util::{NON_ZERO_USIZE_ONE, get_num_cpus};
 use khdl_util::constants::{DUMMY_FILE_PYTHON, DUMMY_FILE_PYTHON_CONTENT};
 use khdl_util::io::{IoAction, IoErrorExt, IoErrorWithPath};
@@ -104,9 +107,10 @@ struct Value {
 
 // This intentionally does not inherit from Value,
 //   to avoid needing a compile reference and being unable to share ranges across compilation contexts.
-#[pyclass(module = "khdl")]
+#[pyclass(module = "khdl", eq, hash, frozen)]
+#[derive(PartialEq, Hash)]
 struct Range {
-    range: RustRange<BigInt>,
+    range: RustMultiRange<BigInt>,
 }
 
 #[pyclass(module = "khdl", extends=Value)]
@@ -897,18 +901,35 @@ impl Range {
             }
         }
 
-        let range = RustRange { start, end };
+        let range = RustMultiRange::from(RustRange { start, end });
         Ok(Range { range })
     }
 
     #[getter]
-    fn start(&self) -> Option<num_bigint::BigInt> {
-        self.range.start.as_ref().map(|b| b.clone().into_num_bigint())
+    fn ranges(&self) -> Vec<Range> {
+        self.range
+            .ranges()
+            .iter()
+            .map(|r| Range {
+                range: RustMultiRange::from(RustRange::from(r.clone())),
+            })
+            .collect()
     }
 
     #[getter]
-    fn end(&self) -> Option<num_bigint::BigInt> {
-        self.range.end.as_ref().map(|b| b.clone().into_num_bigint())
+    fn start(&self) -> PyResult<Option<num_bigint::BigInt>> {
+        let NonEmptyRange { start, end: _ } = self.single_range()?;
+        Ok(start.as_ref().map(|b| b.clone().into_num_bigint()))
+    }
+
+    #[getter]
+    fn end(&self) -> PyResult<Option<num_bigint::BigInt>> {
+        let NonEmptyRange { start: _, end } = self.single_range()?;
+        Ok(end.as_ref().map(|b| b.clone().into_num_bigint()))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.range.ranges().is_empty()
     }
 
     fn contains(&self, value: num_bigint::BigInt) -> bool {
@@ -917,11 +938,70 @@ impl Range {
     }
 
     fn contains_range(&self, other: &Range) -> bool {
-        self.range.contains_range(other.range.as_ref())
+        self.range.contains_multi_range(&other.range)
+    }
+
+    #[getter]
+    fn enclosing(&self) -> PyResult<Range> {
+        match self.range.enclosing() {
+            Some(range) => Ok(Range {
+                range: RustMultiRange::from(RustRange::from(range.cloned())),
+            }),
+            None => Err(PyValueError::new_err(ERROR_ENCLOSING_EMPTY_RANGE)),
+        }
+    }
+
+    #[getter]
+    fn complement(&self) -> Range {
+        Range {
+            range: self.range.complement(),
+        }
+    }
+
+    #[getter]
+    fn len(&self) -> PyResult<num_bigint::BigUint> {
+        match ClosedMultiRange::try_from(self.range.clone()) {
+            Ok(range) => Ok(range.len().into_num_biguint()),
+            Err(RangeOpen) => Err(PyValueError::new_err(ERROR_LEN_UNBOUNDED_RANGE)),
+        }
+    }
+
+    fn union(&self, other: &Range) -> Range {
+        Range {
+            range: self.range.union(&other.range),
+        }
+    }
+
+    fn intersect(&self, other: &Range) -> Range {
+        Range {
+            range: self.range.intersect(&other.range),
+        }
+    }
+
+    fn subtract(&self, other: &Range) -> Range {
+        Range {
+            range: self.range.subtract(&other.range),
+        }
     }
 
     fn __str__(&self) -> String {
-        format!("Range({})", self.range)
+        range_value_string(&self.range)
+    }
+
+    fn __repr__(&self) -> String {
+        range_value_string(&self.range)
+    }
+}
+
+impl Range {
+    fn single_range(&self) -> PyResult<&NonEmptyRange<BigInt>> {
+        match self.range.ranges() {
+            [single] => Ok(single),
+            [] | [_, _, ..] => Err(PyValueError::new_err(format!(
+                "range bounds are only available for a single non-empty contiguous range, got {}",
+                range_value_string(&self.range)
+            ))),
+        }
     }
 }
 

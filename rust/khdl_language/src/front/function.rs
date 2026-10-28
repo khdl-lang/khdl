@@ -1,5 +1,7 @@
 use crate::front::block::{BlockEnd, EarlyExitKind};
-use crate::front::check::{TypeContainsReason, check_type_contains_value, check_type_is_bool_array};
+use crate::front::check::{
+    TypeContainsReason, check_range_is_compile_for_member, check_type_contains_value, check_type_is_bool_array,
+};
 use crate::front::compile::{CompileItemContext, CompileRefs, StackEntry};
 use crate::front::diagnostic::{DiagError, DiagResult, DiagnosticError};
 use crate::front::exit::{ExitFlag, ExitStack, ReturnEntry, ReturnEntryHardware, ReturnEntryKind};
@@ -13,8 +15,8 @@ use crate::front::item::{
 use crate::front::scope::{FrozenScope, NamedValue, Scope, ScopeKey, ScopedEntry};
 use crate::front::types::{HardwareType, Type};
 use crate::front::value::{
-    BoundMethod, CompileValue, EnumValue, HardwareValue, MaybeCompile, MethodInfo, MixedCompoundValue, NotCompile,
-    SimpleCompileValue, StructValue, Value, ValueCommon,
+    BoundMethod, CompileCompoundValue, CompileValue, EnumValue, HardwareValue, MaybeCompile, MethodInfo,
+    MixedCompoundValue, NotCompile, SimpleCompileValue, StructValue, Value, ValueCommon,
 };
 use crate::mid::bits::{FromBitsInvalidValue, FromBitsWrongLength, ToBitsWrongType};
 use crate::mid::ir::{IrExpressionLarge, IrLargeArena};
@@ -23,7 +25,9 @@ use crate::syntax::ast::{
 };
 use crate::syntax::pos::{HasSpan, Span, Spanned};
 use crate::util::ResultDoubleExt;
+use crate::util::big_int::BigInt;
 use crate::util::intern::Id;
+use crate::util::range_multi::MultiRange;
 use itertools::{Either, Itertools};
 use std::hash::Hash;
 use std::sync::Arc;
@@ -36,6 +40,7 @@ pub enum FunctionValue {
     StructNewInfer(UniqueDeclaration),
     EnumNew(ElaboratedEnum, usize),
     EnumNewInfer(UniqueDeclaration, Id),
+    RangeMethod(FunctionRangeMethod),
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +53,19 @@ pub struct FunctionBits {
 pub enum FunctionBitsKind {
     ToBits,
     FromBits { is_unsafe: bool },
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionRangeMethod {
+    pub base: MultiRange<BigInt>,
+    pub kind: RangeMethodKind,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum RangeMethodKind {
+    Union,
+    Intersect,
+    Subtract,
 }
 
 // TODO find a better name for this
@@ -346,6 +364,7 @@ impl CompileItemContext<'_, '_> {
                 self.call_user_function(flow, *span_decl, scope_captured, params, body, span_call, None, args)
             }
             FunctionValue::Bits(function) => self.call_bits_function(flow, span_call, span_target, function, args),
+            FunctionValue::RangeMethod(function) => self.call_range_method(flow, span_target, function, args),
             &FunctionValue::StructNew(struct_elab) => self.call_struct_new(flow, struct_elab, args),
             &FunctionValue::StructNewInfer(func_unique) => match *expected_ty {
                 Type::Struct(expected_elab) => {
@@ -730,6 +749,30 @@ impl CompileItemContext<'_, '_> {
         check_function_end(self.refs, flow, &mut self.large, body.span, return_entry, end)
     }
 
+    fn call_range_method(
+        &mut self,
+        flow: &mut impl Flow,
+        span_target: Span,
+        function: &FunctionRangeMethod,
+        mut args: CallArgs<'_, '_, '_>,
+    ) -> DiagResult<Value> {
+        let refs = self.refs;
+        let FunctionRangeMethod { base, kind } = function;
+
+        let param = Param::Positional { span: span_target };
+        let other = args.require_value(self, flow, param, Spanned::new(span_target, &Type::Range))?;
+        args.finish(self, flow, span_target)?;
+        let other = check_range_is_compile_for_member(refs, span_target, other.map_inner(|v| v.into_value()))?;
+
+        let result = match kind {
+            RangeMethodKind::Union => base.union(&other),
+            RangeMethodKind::Intersect => base.intersect(&other),
+            RangeMethodKind::Subtract => base.subtract(&other),
+        };
+
+        Ok(Value::from(CompileValue::Compound(CompileCompoundValue::Range(result))))
+    }
+
     fn call_bits_function(
         &mut self,
         flow: &mut impl Flow,
@@ -954,6 +997,7 @@ impl FunctionValue {
             StructNewInfer(UniqueDeclaration),
             EnumNew(ElaboratedEnum, usize),
             EnumNewInfer(UniqueDeclaration, Id),
+            RangeMethod(&'a MultiRange<BigInt>, RangeMethodKind),
         }
 
         match self {
@@ -977,6 +1021,7 @@ impl FunctionValue {
             &FunctionValue::StructNewInfer(ref_struct) => Key::StructNewInfer(ref_struct),
             FunctionValue::EnumNew(elab, index) => Key::EnumNew(*elab, *index),
             &FunctionValue::EnumNewInfer(ref_struct, variant) => Key::EnumNewInfer(ref_struct, variant),
+            FunctionValue::RangeMethod(FunctionRangeMethod { base, kind }) => Key::RangeMethod(base, *kind),
         }
     }
 }

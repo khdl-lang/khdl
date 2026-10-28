@@ -289,7 +289,7 @@ impl HardwareType {
         match self {
             HardwareType::Undefined => IrType::Tuple(vec![]),
             HardwareType::Bool => IrType::Bool,
-            HardwareType::Int(range) => IrType::Int(range.enclosing_range().cloned()),
+            HardwareType::Int(range) => IrType::Int(range.enclosing().cloned()),
             HardwareType::Array(inner, len) => IrType::Array(Box::new(inner.as_ir(refs)), len.clone()),
             HardwareType::Tuple(inner) => IrType::Tuple(inner.iter().map(|ty| ty.as_ir(refs)).collect_vec()),
             &HardwareType::Struct(ty) => {
@@ -335,7 +335,7 @@ impl HardwareType {
             HardwareType::Undefined => true,
             HardwareType::Bool => true,
             HardwareType::Int(range) => {
-                let repr = IntRepresentation::for_range(range.enclosing_range());
+                let repr = IntRepresentation::for_range(range.enclosing());
                 &ClosedNonEmptyMultiRange::from(repr.range()) == range
             }
             HardwareType::Array(inner, _len) => inner.every_bit_pattern_is_valid(refs),

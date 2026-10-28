@@ -1,4 +1,4 @@
-use crate::util::big_int::AnyInt;
+use crate::util::big_int::{AnyInt, BigInt, BigUint};
 use crate::util::data::VecExt;
 use crate::util::range::{ClosedNonEmptyRange, ClosedRange, NonEmptyRange, Range, RangeEmpty, RangeOpen};
 use itertools::{Either, Itertools};
@@ -83,8 +83,8 @@ impl<T> MultiRange<T> {
         }
     }
 
-    pub fn ranges(&self) -> impl Iterator<Item = NonEmptyRange<&T>> {
-        self.ranges.iter().map(NonEmptyRange::as_ref)
+    pub fn ranges(&self) -> &[NonEmptyRange<T>] {
+        &self.ranges
     }
 
     pub fn as_single_range(&self) -> Option<&NonEmptyRange<T>> {
@@ -113,7 +113,7 @@ impl<T> MultiRange<T> {
     }
 
     #[must_use]
-    pub fn enclosing_range(&self) -> Option<NonEmptyRange<&T>>
+    pub fn enclosing(&self) -> Option<NonEmptyRange<&T>>
     where
         T: Ord,
     {
@@ -274,17 +274,17 @@ impl<T> ClosedMultiRange<T> {
         self.inner.assert_valid();
 
         // check that enclosing range is closed
-        if let Some(range) = self.enclosing_range() {
+        if let Some(range) = self.enclosing() {
             range.assert_valid();
         }
     }
 
-    pub fn enclosing_range(&self) -> Option<ClosedNonEmptyRange<&T>>
+    pub fn enclosing(&self) -> Option<ClosedNonEmptyRange<&T>>
     where
         T: Ord,
     {
         Some(
-            ClosedNonEmptyRange::try_from(self.inner.enclosing_range()?)
+            ClosedNonEmptyRange::try_from(self.inner.enclosing()?)
                 .expect("started from closed, result should be closed again"),
         )
     }
@@ -322,6 +322,12 @@ impl<T> ClosedMultiRange<T> {
     }
 }
 
+impl ClosedMultiRange<BigInt> {
+    pub fn len(&self) -> BigUint {
+        self.ranges().map(|r| BigUint::try_from(r.end - r.start).unwrap()).sum()
+    }
+}
+
 impl<T> ClosedNonEmptyMultiRange<T> {
     pub fn ranges(&self) -> impl Iterator<Item = ClosedNonEmptyRange<&T>>
     where
@@ -333,7 +339,7 @@ impl<T> ClosedNonEmptyMultiRange<T> {
         })
     }
 
-    pub fn enclosing_range(&self) -> ClosedNonEmptyRange<&T> {
+    pub fn enclosing(&self) -> ClosedNonEmptyRange<&T> {
         ClosedNonEmptyRange {
             start: self.inner.ranges.first().unwrap().start.as_ref().unwrap(),
             end: self.inner.ranges.last().unwrap().end.as_ref().unwrap(),
@@ -405,6 +411,16 @@ impl<T> TryFrom<ClosedMultiRange<T>> for ClosedNonEmptyMultiRange<T> {
             Err(RangeEmpty)
         } else {
             Ok(ClosedNonEmptyMultiRange { inner })
+        }
+    }
+}
+
+impl<T> TryFrom<MultiRange<T>> for ClosedMultiRange<T> {
+    type Error = RangeOpen;
+    fn try_from(value: MultiRange<T>) -> Result<Self, Self::Error> {
+        match (value.ranges.first(), value.ranges.last()) {
+            (Some(first), Some(last)) if first.start.is_none() || last.end.is_none() => Err(RangeOpen),
+            _ => Ok(ClosedMultiRange { inner: value }),
         }
     }
 }

@@ -218,7 +218,7 @@ pub struct MixedString {
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum CompileCompoundValue {
     String(Arc<String>),
-    Range(Range<BigInt>),
+    Range(MultiRange<BigInt>),
     Tuple(Vec<CompileValue>),
     Struct(StructValue<CompileValue>),
     Enum(EnumValue<Box<CompileValue>>),
@@ -240,9 +240,43 @@ pub type HardwareBool = HardwareValue<TypeBool>;
 
 #[derive(Debug, Clone)]
 pub enum RangeValue {
-    Normal(Range<MaybeCompile<BigInt, HardwareInt>>),
+    Compile(MultiRange<BigInt>),
+    HardwareBounds(HardwareBoundsRange),
     // TODO allow hardware length, really only useful for "in" expressions
     HardwareStartLength { start: HardwareInt, length: BigUint },
+}
+
+/// Range where at least one of the bounds is a hardware value.
+/// Do not construct directly, use [RangeValue::from_range] instead.
+#[derive(Debug, Clone)]
+pub struct HardwareBoundsRange {
+    range: Range<MaybeCompile<BigInt, HardwareInt>>,
+}
+
+impl HardwareBoundsRange {
+    pub fn range(&self) -> &Range<MaybeCompile<BigInt, HardwareInt>> {
+        &self.range
+    }
+}
+
+impl RangeValue {
+    pub fn from_range(range: Range<MaybeCompile<BigInt, HardwareInt>>) -> RangeValue {
+        fn as_compile(bound: &Option<MaybeCompile<BigInt, HardwareInt>>) -> Option<Option<&BigInt>> {
+            match bound {
+                None => Some(None),
+                Some(MaybeCompile::Compile(bound)) => Some(Some(bound)),
+                Some(MaybeCompile::Hardware(_)) => None,
+            }
+        }
+
+        match (as_compile(&range.start), as_compile(&range.end)) {
+            (Some(start), Some(end)) => RangeValue::Compile(MultiRange::from(Range {
+                start: start.cloned(),
+                end: end.cloned(),
+            })),
+            (None, _) | (_, None) => RangeValue::HardwareBounds(HardwareBoundsRange { range }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -382,8 +416,7 @@ impl ValueCommon for SimpleCompileValue {
             },
             SimpleCompileValue::Int(v) => match &ty {
                 HardwareType::Int(ty) if ty.contains(v) => {
-                    let expr =
-                        IrExpressionLarge::ExpandIntRange(ty.enclosing_range().cloned(), IrExpression::Int(v.clone()));
+                    let expr = IrExpressionLarge::ExpandIntRange(ty.enclosing().cloned(), IrExpression::Int(v.clone()));
                     Ok(large.push_expr(expr))
                 }
                 _ => Err(err_type()),
@@ -431,8 +464,9 @@ impl ValueCommon for MixedCompoundValue {
                 }
 
                 match v {
-                    RangeValue::Normal(value) => {
-                        let Range { start, end } = value;
+                    RangeValue::Compile(_) => ValueDomain::CompileTime,
+                    RangeValue::HardwareBounds(value) => {
+                        let Range { start, end } = value.range();
                         ValueDomain::join(opt_domain(start.as_ref()), opt_domain(end.as_ref()))
                     }
                     RangeValue::HardwareStartLength { start, length } => {
@@ -610,7 +644,7 @@ impl ValueCommon for HardwareValue {
             (HardwareType::Int(ty_curr), HardwareType::Int(ty)) => {
                 if ty.contains_multi_range(ty_curr) {
                     Ok(large.push_expr(IrExpressionLarge::ExpandIntRange(
-                        ty.enclosing_range().cloned(),
+                        ty.enclosing().cloned(),
                         self.expr.clone(),
                     )))
                 } else {
@@ -811,9 +845,7 @@ impl From<CompileCompoundValue> for MixedCompoundValue {
                 };
                 MixedCompoundValue::String(Arc::new(MixedString { pieces }))
             }
-            CompileCompoundValue::Range(v) => {
-                MixedCompoundValue::Range(RangeValue::Normal(v.map(MaybeCompile::Compile)))
-            }
+            CompileCompoundValue::Range(v) => MixedCompoundValue::Range(RangeValue::Compile(v)),
             CompileCompoundValue::Tuple(v) => MixedCompoundValue::Tuple(v.into_iter().map(Value::from).collect_vec()),
             CompileCompoundValue::Struct(StructValue { ty, fields }) => {
                 let fields = fields.into_iter().map(Value::from).collect();
@@ -865,7 +897,7 @@ impl TryFrom<HardwareInt> for HardwareUInt {
     type Error = HardwareInt;
 
     fn try_from(value: HardwareInt) -> Result<Self, Self::Error> {
-        if value.ty.enclosing_range().start.is_negative() {
+        if value.ty.enclosing().start.is_negative() {
             Err(value)
         } else {
             let HardwareInt { ty, domain, expr } = value;
@@ -899,10 +931,12 @@ impl TryFrom<&MixedCompoundValue> for CompileCompoundValue {
     fn try_from(v: &MixedCompoundValue) -> Result<Self, Self::Error> {
         match v {
             MixedCompoundValue::String(v) => v.try_as_compile().map(CompileCompoundValue::String),
-            MixedCompoundValue::Range(v) => {
-                let v = Range::<BigInt>::try_from(v)?;
-                Ok(CompileCompoundValue::Range(v))
-            }
+            MixedCompoundValue::Range(v) => match v {
+                RangeValue::Compile(v) => Ok(CompileCompoundValue::Range(v.clone())),
+                RangeValue::HardwareBounds(_) | RangeValue::HardwareStartLength { start: _, length: _ } => {
+                    Err(NotCompile)
+                }
+            },
             MixedCompoundValue::Tuple(v) => {
                 let v = v.iter().map(CompileValue::try_from).try_collect_vec()?;
                 Ok(CompileCompoundValue::Tuple(v))
@@ -931,27 +965,6 @@ impl TryFrom<&MixedCompoundValue> for CompileCompoundValue {
                     method: Arc::clone(&m.method),
                 }))
             }
-        }
-    }
-}
-
-impl TryFrom<&RangeValue> for Range<BigInt> {
-    type Error = NotCompile;
-    fn try_from(v: &RangeValue) -> Result<Self, Self::Error> {
-        fn try_map_bound<I: Clone>(
-            b: &MaybeCompile<I, HardwareValue<ClosedNonEmptyMultiRange<I>>>,
-        ) -> Result<I, NotCompile> {
-            match b {
-                MaybeCompile::Compile(b) => Ok(b.clone()),
-                MaybeCompile::Hardware(_) => Err(NotCompile),
-            }
-        }
-        match v {
-            RangeValue::Normal(Range { start, end }) => Ok(Range {
-                start: start.as_ref().map(try_map_bound).transpose()?,
-                end: end.as_ref().map(try_map_bound).transpose()?,
-            }),
-            RangeValue::HardwareStartLength { start: _, length: _ } => Err(NotCompile),
         }
     }
 }
