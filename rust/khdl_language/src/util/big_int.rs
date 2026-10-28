@@ -285,6 +285,17 @@ impl BigInt {
         }
     }
 
+    pub fn div_ceil(&self, rhs: &BigInt) -> Result<BigInt, DivideByZero> {
+        // TODO small fast path
+        if rhs.is_zero() {
+            Err(DivideByZero)
+        } else {
+            Ok(BigInt::new(Storage::from_maybe_big(
+                self.clone().into_num_bigint().div_ceil(&rhs.clone().into_num_bigint()),
+            )))
+        }
+    }
+
     pub fn pow(&self, exp: &BigUint) -> BigInt {
         if let (&Storage::Small(base), &Storage::Small(exp)) = (self.storage(), exp.storage())
             && let Ok(exp) = u32::try_from(exp)

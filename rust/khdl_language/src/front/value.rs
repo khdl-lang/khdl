@@ -900,21 +900,8 @@ impl TryFrom<&MixedCompoundValue> for CompileCompoundValue {
         match v {
             MixedCompoundValue::String(v) => v.try_as_compile().map(CompileCompoundValue::String),
             MixedCompoundValue::Range(v) => {
-                fn try_map_bound<I: Clone>(
-                    b: &MaybeCompile<I, HardwareValue<ClosedNonEmptyMultiRange<I>>>,
-                ) -> Result<I, NotCompile> {
-                    match b {
-                        MaybeCompile::Compile(b) => Ok(b.clone()),
-                        MaybeCompile::Hardware(_) => Err(NotCompile),
-                    }
-                }
-                match v {
-                    RangeValue::Normal(Range { start, end }) => Ok(CompileCompoundValue::Range(Range {
-                        start: start.as_ref().map(try_map_bound).transpose()?,
-                        end: end.as_ref().map(try_map_bound).transpose()?,
-                    })),
-                    RangeValue::HardwareStartLength { start: _, length: _ } => Err(NotCompile),
-                }
+                let v = Range::<BigInt>::try_from(v)?;
+                Ok(CompileCompoundValue::Range(v))
             }
             MixedCompoundValue::Tuple(v) => {
                 let v = v.iter().map(CompileValue::try_from).try_collect_vec()?;
@@ -944,6 +931,27 @@ impl TryFrom<&MixedCompoundValue> for CompileCompoundValue {
                     method: Arc::clone(&m.method),
                 }))
             }
+        }
+    }
+}
+
+impl TryFrom<&RangeValue> for Range<BigInt> {
+    type Error = NotCompile;
+    fn try_from(v: &RangeValue) -> Result<Self, Self::Error> {
+        fn try_map_bound<I: Clone>(
+            b: &MaybeCompile<I, HardwareValue<ClosedNonEmptyMultiRange<I>>>,
+        ) -> Result<I, NotCompile> {
+            match b {
+                MaybeCompile::Compile(b) => Ok(b.clone()),
+                MaybeCompile::Hardware(_) => Err(NotCompile),
+            }
+        }
+        match v {
+            RangeValue::Normal(Range { start, end }) => Ok(Range {
+                start: start.as_ref().map(try_map_bound).transpose()?,
+                end: end.as_ref().map(try_map_bound).transpose()?,
+            }),
+            RangeValue::HardwareStartLength { start: _, length: _ } => Err(NotCompile),
         }
     }
 }

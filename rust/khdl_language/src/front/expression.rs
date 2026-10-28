@@ -1,7 +1,7 @@
 use crate::front::assignment::AssignmentTarget;
 use crate::front::check::{
     TypeContainsReason, check_type_contains_value, check_type_is_bool, check_type_is_bool_array, check_type_is_int,
-    check_type_is_string_compile, check_type_is_uint, check_type_is_uint_compile,
+    check_type_is_range, check_type_is_string_compile, check_type_is_uint, check_type_is_uint_compile,
 };
 use crate::front::compile::{CompileItemContext, CompileRefs, StackEntry};
 use crate::front::diagnostic::{DiagError, DiagResult, DiagnosticError, Diagnostics};
@@ -39,7 +39,7 @@ use crate::front::exit::ExitStack;
 use crate::front::extra::{ExtraCursor, ExtraScope};
 use crate::front::flow::Flow;
 use crate::front::range_arithmetic::{
-    multi_range_binary_add, multi_range_binary_bitwise, multi_range_binary_ceil_div, multi_range_binary_foor_div,
+    multi_range_binary_add, multi_range_binary_bitwise, multi_range_binary_div_ceil, multi_range_binary_div_floor,
     multi_range_binary_mod, multi_range_binary_mul, multi_range_binary_pow, multi_range_binary_sub,
     multi_range_unary_bitwise_not, multi_range_unary_neg,
 };
@@ -52,7 +52,7 @@ use crate::util::int::IntRepresentation;
 use crate::util::intern::Id;
 use crate::util::iter::IterExt;
 use crate::util::nd_array::NdArray;
-use crate::util::range::{ClosedNonEmptyRange, NonEmptyRange, Range};
+use crate::util::range::{ClosedNonEmptyRange, NonEmptyRange, Range, RangeEmpty, RangeOpen};
 use crate::util::range_multi::{AnyMultiRange, ClosedNonEmptyMultiRange, MultiRange};
 use itertools::{Either, zip_eq};
 use std::sync::Arc;
@@ -1929,357 +1929,393 @@ pub fn eval_binary_expression(
     right: Spanned<ValueWithImplications>,
 ) -> DiagResult<ValueWithImplications> {
     let diags = refs.diags;
-    let elab = &refs.shared.elaboration_arenas;
 
-    // extract spans
     let op_reason = TypeContainsReason::Operator(op.span);
     let op_span = op.span;
-    let left_span = left.span;
-    let right_span = right.span;
 
     // common utility functions
-    let check_both_int = |left, right| {
-        let left = check_type_is_int(refs, op_reason, left);
-        let right = check_type_is_int(refs, op_reason, right);
-        Ok((left?, right?))
-    };
-
-    let eval_binary_bool = |large, left, right, op| eval_binary_bool(refs, large, op_reason, left, right, op);
-    let eval_binary_int_compare = |large, left, right, op| {
+    let eval_arithmetic =
+        |large, left, right, op| eval_binary_arithmetic(refs, large, expr_span, Spanned::new(op_span, op), left, right);
+    let eval_bool = |large, left, right, op| eval_binary_bool(refs, large, op_reason, left, right, op);
+    let eval_eq = |large, left, right, eq| eval_binary_eq(refs, large, op_reason, op_span, left, right, eq);
+    let eval_compare = |large, left, right, op| {
         eval_binary_int_compare(refs, large, op_reason, left, right, op).map(ValueWithImplications::from)
     };
-    let eval_binary_eq = |large, left, right, eq| eval_binary_eq(refs, large, op_reason, op_span, left, right, eq);
-    let eval_binary_bitwise =
-        |large, left, right, op| eval_binary_bitwise(refs, large, op_reason, op_span, left, right, op);
+    let eval_bitwise = |large, left, right, op| eval_binary_bitwise(refs, large, op_reason, op_span, left, right, op);
 
     // handle operation
     let result_simple: Value<_> = match op.inner {
-        // (int, int)
-        BinaryOp::Add => {
-            let (left, right) =
-                check_both_int(left.map_inner(|e| e.into_value()), right.map_inner(|e| e.into_value()))?;
-            match pair_compile_int(left, right) {
-                MaybeCompile::Compile((left, right)) => Value::new_int(left + right),
-                MaybeCompile::Hardware((left, right)) => {
-                    let range = multi_range_binary_add(&left.ty, &right.ty);
-                    let result = build_binary_int_arithmetic_op(IrIntArithmeticOp::Add, large, range, left, right);
-                    Value::Hardware(HardwareValue::from(result))
-                }
-            }
-        }
-        BinaryOp::Sub => {
-            let (left, right) =
-                check_both_int(left.map_inner(|e| e.into_value()), right.map_inner(|e| e.into_value()))?;
-            match pair_compile_int(left, right) {
-                MaybeCompile::Compile((left, right)) => Value::new_int(left - right),
-                MaybeCompile::Hardware((left, right)) => {
-                    let range = multi_range_binary_sub(&left.ty, &right.ty);
-                    let result = build_binary_int_arithmetic_op(IrIntArithmeticOp::Sub, large, range, left, right);
-                    Value::Hardware(HardwareValue::from(result))
-                }
-            }
-        }
-        BinaryOp::Mul => {
-            // TODO do we want to keep using multiplication as the "array repeat" syntax?
-            //   if so, maybe allow tuples on the right side for multidimensional repeating
-            // TODO maybe put a general cap on array sizes,
-            //   to avoid memory overflows and different behavior between compile and hardware values?
-            let right = check_type_is_int(refs, op_reason, right.map_inner(|e| e.into_value()));
-            match left.inner.ty() {
-                Type::Array(left_ty_inner, left_len) => {
-                    let left_len = left_len.expect("array value has known length");
+        // arithmetic:
+        //   (int, int), (range, range)
+        BinaryOp::Add => eval_arithmetic(large, left, right, IrIntArithmeticOp::Add)?,
+        BinaryOp::Sub => eval_arithmetic(large, left, right, IrIntArithmeticOp::Sub)?,
+        BinaryOp::Mul => match left.inner.ty() {
+            Type::Array(_, _) => eval_array_repeat(refs, large, expr_span, op_reason, left, right)?,
+            _ => eval_arithmetic(large, left, right, IrIntArithmeticOp::Mul)?,
+        },
+        BinaryOp::FloorDiv => eval_arithmetic(large, left, right, IrIntArithmeticOp::FloorDiv)?,
+        BinaryOp::CeilDiv => eval_arithmetic(large, left, right, IrIntArithmeticOp::CeilDiv)?,
+        BinaryOp::Mod => eval_arithmetic(large, left, right, IrIntArithmeticOp::Mod)?,
+        BinaryOp::Pow => eval_arithmetic(large, left, right, IrIntArithmeticOp::Pow)?,
+        BinaryOp::Shl => eval_arithmetic(large, left, right, IrIntArithmeticOp::Shl)?,
+        BinaryOp::Shr => eval_arithmetic(large, left, right, IrIntArithmeticOp::Shr)?,
 
-                    let right = right?;
-                    let right_inner = match right {
-                        MaybeCompile::Compile(right_inner) => right_inner,
-                        MaybeCompile::Hardware(_) => {
-                            return Err(diags.report_error_simple(
-                                "array repeat right hand side must be compile-time value",
-                                right_span,
-                                "got non-compile-time value here",
-                            ));
-                        }
-                    };
-                    let right_inner = BigUint::try_from(right_inner).map_err(|right_inner| {
-                        diags.report_error_simple(
-                            "array repeat right hand side cannot be negative",
-                            right_span,
-                            format!("got value `{right_inner}`"),
-                        )
-                    })?;
-                    let right_inner = usize::try_from(right_inner).map_err(|right_inner| {
-                        diags.report_error_simple(
-                            "array repeat right hand side too large",
-                            right_span,
-                            format!("got value `{right_inner}`"),
-                        )
-                    })?;
+        // boolean:
+        //   (bool, bool)
+        // TODO these should short-circuit, so delay evaluation of right
+        BinaryOp::BoolAnd => return eval_bool(large, left, right, IrBoolBinaryOp::And),
+        BinaryOp::BoolOr => return eval_bool(large, left, right, IrBoolBinaryOp::Or),
+        BinaryOp::BoolXor => return eval_bool(large, left, right, IrBoolBinaryOp::Xor),
 
-                    match left.inner.into_value() {
-                        Value::Simple(SimpleCompileValue::Array(left_inner)) => {
-                            // do the repetition at compile-time
-                            let result_len = usize::try_from(BigUint::from(left_inner.len()) * right_inner).map_err(
-                                |result_len| {
-                                    diags.report_error_simple(
-                                        "array repeat result size too large",
-                                        right_span,
-                                        format!("got value `{result_len}`"),
-                                    )
-                                },
-                            )?;
+        // bitwise:
+        //   (bool, bool), (int, int), (bool, []bool), ([]bool, bool), ([]bool, []bool)
+        BinaryOp::BitAnd => return eval_bitwise(large, left, right, IrBoolBinaryOp::And),
+        BinaryOp::BitOr => return eval_bitwise(large, left, right, IrBoolBinaryOp::Or),
+        BinaryOp::BitXor => return eval_bitwise(large, left, right, IrBoolBinaryOp::Xor),
 
-                            let mut result = try_vec_with_capacity(diags, expr_span, result_len)?;
-                            for _ in 0..right_inner {
-                                result.extend_from_slice(&left_inner);
-                            }
-                            Value::Simple(SimpleCompileValue::Array(Arc::new(result)))
-                        }
-                        Value::Hardware(value) => {
-                            // implement runtime repetition through spread array literal
-                            let element = IrArrayLiteralElement::Spread(value.expr);
-                            let mut elements = try_vec_with_capacity(diags, expr_span, right_inner)?;
-                            elements.resize(right_inner, element);
+        // comparison
+        //   (T, T)
+        BinaryOp::CmpEq => return eval_eq(large, left, right, true),
+        BinaryOp::CmpNeq => return eval_eq(large, left, right, false),
+        BinaryOp::CmpLt => return eval_compare(large, left, right, IrIntCompareOp::Lt),
+        BinaryOp::CmpLte => return eval_compare(large, left, right, IrIntCompareOp::Lte),
+        BinaryOp::CmpGt => return eval_compare(large, left, right, IrIntCompareOp::Gt),
+        BinaryOp::CmpGte => return eval_compare(large, left, right, IrIntCompareOp::Gte),
 
-                            let left_ty_inner_hw = left_ty_inner.as_hardware_type(elab).unwrap();
-                            let result_len = left_len * right_inner;
-                            let result_expr = IrExpressionLarge::ArrayLiteral(
-                                left_ty_inner_hw.as_ir(refs),
-                                result_len.clone(),
-                                elements,
-                            );
-                            Value::Hardware(HardwareValue {
-                                ty: HardwareType::Array(Arc::new(left_ty_inner_hw.clone()), result_len),
-                                domain: value.domain,
-                                expr: large.push_expr(result_expr),
-                            })
-                        }
-                        Value::Simple(_) | Value::Compound(_) => {
-                            return Err(diags.report_error_internal(
-                                left.span,
-                                "compile-time value with type array is not actually an array",
-                            ));
-                        }
-                    }
-                }
-                Type::Int(_) => {
-                    let left = check_type_is_int(refs, op_reason, left.map_inner(|e| e.into_value()))
-                        .expect("int, already checked");
-                    let right = right?;
-                    match pair_compile_int(left, right) {
-                        MaybeCompile::Compile((left, right)) => Value::new_int(left * right),
-                        MaybeCompile::Hardware((left, right)) => {
-                            let range = multi_range_binary_mul(&left.ty, &right.ty);
-                            let result =
-                                build_binary_int_arithmetic_op(IrIntArithmeticOp::Mul, large, range, left, right);
-                            Value::Hardware(HardwareValue::from(result))
-                        }
-                    }
-                }
-                _ => {
-                    return Err(diags.report_error_simple(
-                        "left hand side of multiplication must be an array or an integer",
-                        left.span,
-                        format!("got value with type `{}`", left.inner.ty().value_string(refs)),
-                    ));
-                }
-            }
-        }
-        // (int, non-zero int)
-        BinaryOp::FloorDiv | BinaryOp::CeilDiv => {
-            let ceil = matches!(op.inner, BinaryOp::CeilDiv);
+        // contains
+        //   (int, range) or (T:Eq, array)
+        // TODO share code with match "in" pattern
+        // TODO for hardware ranges, also check if start <(=) end, otherwise this might have false positives
+        BinaryOp::In => return Err(diags.report_error_todo(expr_span, "binary op In")),
+    };
 
-            let (left, right) =
-                check_both_int(left.map_inner(|e| e.into_value()), right.map_inner(|e| e.into_value()))?;
+    Ok(Value::simple(result_simple))
+}
 
-            // check nonzero
-            let right_range = right.range();
-            if right_range.contains(&BigInt::ZERO) {
-                let msg_right = message_range_or_single("right", &right_range, Some("which contains zero"));
-                let diag = DiagnosticError::new("division by zero is not allowed", right_span, msg_right)
-                    .add_info(op.span, "for operator here")
-                    .report(diags);
-                return Err(diag);
-            }
+fn eval_binary_arithmetic(
+    refs: CompileRefs,
+    large: &mut IrLargeArena,
+    expr_span: Span,
+    op: Spanned<IrIntArithmeticOp>,
+    left: Spanned<ValueWithImplications>,
+    right: Spanned<ValueWithImplications>,
+) -> DiagResult<Value> {
+    let diags = refs.diags;
+    let left_span = left.span;
+    let right_span = right.span;
+    let op_reason = TypeContainsReason::Operator(op.span);
 
+    match (left.inner.ty(), right.inner.ty()) {
+        (Type::Int(_), Type::Int(_)) => {
+            // type cast
+            let left = check_type_is_int(refs, op_reason, left.map_inner(|e| e.into_value()))
+                .map_err(|_| diags.report_error_internal(left_span, "expected int"))?;
+            let right = check_type_is_int(refs, op_reason, right.map_inner(|e| e.into_value()))
+                .map_err(|_| diags.report_error_internal(right_span, "expected int"))?;
+
+            // check operands valid for operator and compute result range
+            let range = arithmetic_result_range(
+                diags,
+                expr_span,
+                op,
+                Spanned::new(left_span, &left.range()),
+                Spanned::new(right_span, &right.range()),
+            )?;
+
+            // handle compile/hardware
             match pair_compile_int(left, right) {
                 MaybeCompile::Compile((left, right)) => {
-                    let result = if ceil {
-                        -(-left).div_floor(&right).unwrap()
-                    } else {
-                        left.div_floor(&right).unwrap()
-                    };
-                    Value::new_int(result)
+                    Ok(Value::new_int(arithmetic_result_compile(op.inner, left, right)))
                 }
                 MaybeCompile::Hardware((left, right)) => {
-                    let (op, range) = if ceil {
-                        (
-                            IrIntArithmeticOp::CeilDiv,
-                            multi_range_binary_ceil_div(&left.ty, &right.ty),
-                        )
-                    } else {
-                        (
-                            IrIntArithmeticOp::FloorDiv,
-                            multi_range_binary_foor_div(&left.ty, &right.ty),
-                        )
-                    };
-                    let range = range.expect("already checked for zero");
-                    let result = build_binary_int_arithmetic_op(op, large, range, left, right);
-                    Value::Hardware(HardwareValue::from(result))
+                    let result = build_binary_int_arithmetic_op(op.inner, large, range, left, right);
+                    Ok(Value::Hardware(HardwareValue::from(result)))
                 }
             }
         }
-        BinaryOp::Mod => {
-            let (left, right) =
-                check_both_int(left.map_inner(|e| e.into_value()), right.map_inner(|e| e.into_value()))?;
+        (Type::Range, Type::Range) => {
+            let left = check_arithmetic_range_operand(refs, op.span, left);
+            let right = check_arithmetic_range_operand(refs, op.span, right);
+            let (left, right) = (left?, right?);
 
-            // check nonzero
-            let right_range = right.range();
-            if right_range.contains(&BigInt::ZERO) {
-                let msg_right = message_range_or_single("right", &right_range, Some("which contains zero"));
-                let diag = DiagnosticError::new("modulo by zero is not allowed", right_span, msg_right)
-                    .add_info(op.span, "for operator here")
-                    .report(diags);
-                return Err(diag);
-            }
+            let result = arithmetic_result_range(
+                diags,
+                expr_span,
+                op,
+                Spanned::new(left_span, &left),
+                Spanned::new(right_span, &right),
+            )?;
 
-            match pair_compile_int(left, right) {
-                MaybeCompile::Compile((left, right)) => {
-                    let result = left.mod_floor(&right).unwrap();
-                    Value::new_int(result)
-                }
-                MaybeCompile::Hardware((left, right)) => {
-                    let range = multi_range_binary_mod(&left.ty, &right.ty).expect("already checked for zero");
-                    let result = build_binary_int_arithmetic_op(IrIntArithmeticOp::Mod, large, range, left, right);
-                    Value::Hardware(HardwareValue::from(result))
-                }
-            }
+            Ok(range_arithmetic_result_value(result))
         }
-        // (nonzero int, non-negative int) or (non-negative int, positive int)
-        BinaryOp::Pow => {
-            let base_span = left_span;
-            let exp_span = right_span;
-            let (base, exp) = check_both_int(left.map_inner(|e| e.into_value()), right.map_inner(|e| e.into_value()))?;
+        (left_ty, right_ty) => {
+            let diag = DiagnosticError::new(
+                "arithmetic operators require either two ints or two ranges",
+                op.span,
+                "for operator here",
+            )
+            .add_info(
+                left_span,
+                format!("left operand has type `{}`", left_ty.value_string(refs)),
+            )
+            .add_info(
+                right_span,
+                format!("right operand has type `{}`", right_ty.value_string(refs)),
+            )
+            .report(diags);
+            Err(diag)
+        }
+    }
+}
 
-            let zero = BigInt::ZERO;
-            let base_range = base.range();
-            let exp_range = exp.range();
+fn check_arithmetic_range_operand(
+    refs: CompileRefs,
+    op_span: Span,
+    value: Spanned<ValueWithImplications>,
+) -> DiagResult<ClosedNonEmptyMultiRange<BigInt>> {
+    let diags = refs.diags;
+    let range_span = value.span;
+
+    // type cast
+    let op_reason = TypeContainsReason::Operator(op_span);
+    let range = check_type_is_range(refs, op_reason, value.map_inner(|e| e.into_value()))
+        .map_err(|_| diags.report_error_internal(range_span, "expected range"))?;
+    let range = Spanned::new(range_span, range);
+
+    // check compile
+    let range = Range::<BigInt>::try_from(&range.inner).map_err(|e| {
+        let _: NotCompile = e;
+        DiagnosticError::new(
+            "range arithmetic requires compile-time ranges",
+            range_span,
+            "range with hardware bounds here",
+        )
+        .add_info(op_span, "for operator here")
+        .report(diags)
+    })?;
+
+    // check closed
+    match ClosedNonEmptyRange::try_from(range.clone()) {
+        Ok(range) => Ok(ClosedNonEmptyMultiRange::from(range)),
+        Err(e) => {
+            let reason = match e {
+                Either::Left(RangeEmpty) => "empty",
+                Either::Right(RangeOpen) => "open",
+            };
+            let diag = DiagnosticError::new(
+                format!("range arithmetic requires non-empty closed ranges, got {reason} range"),
+                range_span,
+                format!("got range `{range}` here"),
+            )
+            .add_info(op_span, "for operator here")
+            .report(diags);
+            Err(diag)
+        }
+    }
+}
+
+fn range_arithmetic_result_value(result: ClosedNonEmptyMultiRange<BigInt>) -> Value {
+    // TODO preserve multi-range
+    let result = Range::from(result.enclosing_range().cloned());
+    Value::from(CompileValue::Compound(CompileCompoundValue::Range(result)))
+}
+
+/// Evaluate an arithmetic operation on compile-time ints, the operands must have been checked already.
+fn arithmetic_result_compile(op: IrIntArithmeticOp, left: BigInt, right: BigInt) -> BigInt {
+    let right_uint = || BigUint::try_from(right.clone()).expect("already checked non-negative");
+    match op {
+        IrIntArithmeticOp::Add => &left + &right,
+        IrIntArithmeticOp::Sub => &left - &right,
+        IrIntArithmeticOp::Mul => &left * &right,
+        IrIntArithmeticOp::FloorDiv => left.div_floor(&right).expect("already checked non-zero"),
+        IrIntArithmeticOp::CeilDiv => left.div_ceil(&right).expect("already checked non-zero"),
+        IrIntArithmeticOp::Mod => left.mod_floor(&right).expect("already checked non-zero"),
+        IrIntArithmeticOp::Pow => left.pow(&right_uint()),
+        IrIntArithmeticOp::Shl => left * BigUint::pow_2_to(&right_uint()),
+        IrIntArithmeticOp::Shr => left
+            .div_floor(&BigInt::from(BigUint::pow_2_to(&right_uint())))
+            .expect("known nonzero"),
+    }
+}
+
+/// Check that the operation is valid for all values in the operand ranges,
+/// and compute the range of the result.
+fn arithmetic_result_range(
+    diags: &Diagnostics,
+    expr_span: Span,
+    op: Spanned<IrIntArithmeticOp>,
+    left: Spanned<&ClosedNonEmptyMultiRange<BigInt>>,
+    right: Spanned<&ClosedNonEmptyMultiRange<BigInt>>,
+) -> DiagResult<ClosedNonEmptyMultiRange<BigInt>> {
+    // utilities
+    let check_right_nonzero = |op_name: &str| {
+        if right.inner.contains(&BigInt::ZERO) {
+            let msg_right = message_range_or_single("right", right.inner, Some("which contains zero"));
+            let diag = DiagnosticError::new(format!("{op_name} by zero is not allowed"), right.span, msg_right)
+                .add_info(op.span, "for operator here")
+                .report(diags);
+            return Err(diag);
+        }
+        Ok(())
+    };
+    let check_right_shift_factor = || {
+        if right.inner.enclosing_range().start.is_negative() {
+            let diag = DiagnosticError::new(
+                "shift amount must be non-negative",
+                right.span,
+                message_range_or_single("right", right.inner, None),
+            )
+            .add_info(op.span, "for operator here")
+            .report(diags);
+            return Err(diag);
+        }
+
+        let right_uint = right.inner.clone().map(|x| BigUint::try_from(x).unwrap());
+        let factor =
+            multi_range_binary_pow(&ClosedNonEmptyMultiRange::single(BigInt::TWO), &right_uint).expect("non-zero base");
+        Ok(factor)
+    };
+
+    let result = match op.inner {
+        IrIntArithmeticOp::Add => multi_range_binary_add(left.inner, right.inner),
+        IrIntArithmeticOp::Sub => multi_range_binary_sub(left.inner, right.inner),
+        IrIntArithmeticOp::Mul => multi_range_binary_mul(left.inner, right.inner),
+        IrIntArithmeticOp::FloorDiv => {
+            check_right_nonzero("division")?;
+            multi_range_binary_div_floor(left.inner, right.inner).expect("already checked for zero")
+        }
+        IrIntArithmeticOp::CeilDiv => {
+            check_right_nonzero("division")?;
+            multi_range_binary_div_ceil(left.inner, right.inner).expect("already checked for zero")
+        }
+        IrIntArithmeticOp::Mod => {
+            check_right_nonzero("modulo")?;
+            multi_range_binary_mod(left.inner, right.inner).expect("already checked for zero")
+        }
+        IrIntArithmeticOp::Pow => {
+            let (base, exp) = (left, right);
 
             // check exp >= 0
-            if *exp_range.enclosing_range().start < zero {
+            if exp.inner.enclosing_range().start.is_negative() {
                 let diag = DiagnosticError::new("invalid power operation", expr_span, "exponent must be non-negative")
-                    .add_info(exp_span, message_range_or_single("exponent", &exp_range, None))
+                    .add_info(exp.span, message_range_or_single("exponent", exp.inner, None))
                     .report(diags);
                 return Err(diag);
             }
 
             // check not 0 ** 0
             // TODO is there actually a reason to ban this? `1` makes sense as the answer
-            if base_range.contains(&zero) && exp_range.contains(&zero) {
-                let msg_base = message_range_or_single("base", &base_range, Some("which contains zero"));
-                let msg_exp = message_range_or_single("exponent", &exp_range, Some("which contains zero"));
+            if base.inner.contains(&BigInt::ZERO) && exp.inner.contains(&BigInt::ZERO) {
+                let msg_base = message_range_or_single("base", base.inner, Some("which contains zero"));
+                let msg_exp = message_range_or_single("exponent", exp.inner, Some("which contains zero"));
                 let diag = DiagnosticError::new(
                     "invalid power operation `0 ** 0`",
                     expr_span,
                     "base and exponent could both be zero",
                 )
-                .add_info(base_span, msg_base)
-                .add_info(exp_span, msg_exp)
+                .add_info(base.span, msg_base)
+                .add_info(exp.span, msg_exp)
                 .report(diags);
                 return Err(diag);
             }
 
-            match pair_compile_int(base, exp) {
-                MaybeCompile::Compile((base, exp)) => {
-                    let exp = BigUint::try_from(exp)
-                        .map_err(|_| diags.report_error_internal(exp_span, "got negative exp"))?;
-                    Value::new_int(base.pow(&exp))
-                }
-                MaybeCompile::Hardware((base, exp)) => {
-                    // we checked that exp is non-negative earlier
-                    let exp_range = exp.ty.clone().map(|b| BigUint::try_from(b).unwrap());
-
-                    let range = multi_range_binary_pow(&base.ty, &exp_range).expect("already checked for 0**0");
-                    let result = build_binary_int_arithmetic_op(IrIntArithmeticOp::Pow, large, range, base, exp);
-                    Value::Hardware(HardwareValue::from(result))
-                }
-            }
+            let exp_uint = exp.inner.clone().map(|x| BigUint::try_from(x).unwrap());
+            multi_range_binary_pow(base.inner, &exp_uint).expect("already checked for 0**0")
         }
-
-        BinaryOp::Shl => {
-            let left = check_type_is_int(refs, op_reason, left.map_inner(|e| e.into_value()));
-            let right = check_type_is_uint(refs, op_reason, right.map_inner(|e| e.into_value()));
-
-            let left = left?;
-            let right = right?;
-
-            match pair_compile_int(left, right) {
-                MaybeCompile::Compile((left, right)) => {
-                    let factor = BigUint::pow_2_to(&right);
-                    Value::new_int(left * factor)
-                }
-                MaybeCompile::Hardware((left, right)) => {
-                    let factor_range =
-                        multi_range_binary_pow(&ClosedNonEmptyMultiRange::single(BigInt::TWO), &right.ty)
-                            .expect("non-zero expr");
-                    let result_range = multi_range_binary_mul(&left.ty, &factor_range);
-
-                    let right = HardwareInt::from(right);
-                    let result =
-                        build_binary_int_arithmetic_op(IrIntArithmeticOp::Shl, large, result_range, left, right);
-                    Value::Hardware(HardwareValue::from(result))
-                }
-            }
+        IrIntArithmeticOp::Shl => multi_range_binary_mul(left.inner, &check_right_shift_factor()?),
+        IrIntArithmeticOp::Shr => {
+            multi_range_binary_div_floor(left.inner, &check_right_shift_factor()?).expect("non-zero divisor")
         }
-        BinaryOp::Shr => {
-            let left = check_type_is_int(refs, op_reason, left.map_inner(|e| e.into_value()));
-            let right = check_type_is_uint(refs, op_reason, right.map_inner(|e| e.into_value()));
+    };
+    Ok(result)
+}
 
-            let left = left?;
-            let right = right?;
+fn eval_array_repeat(
+    refs: CompileRefs,
+    large: &mut IrLargeArena,
+    expr_span: Span,
+    op_reason: TypeContainsReason,
+    left: Spanned<ValueWithImplications>,
+    right: Spanned<ValueWithImplications>,
+) -> DiagResult<Value> {
+    // TODO do we want to keep using multiplication as the "array repeat" syntax?
+    //   if so, maybe allow tuples on the right side for multidimensional repeating
+    // TODO maybe put a general cap on array sizes,
+    //   to avoid memory overflows and different behavior between compile and hardware values?
+    let diags = refs.diags;
+    let elab = &refs.shared.elaboration_arenas;
 
-            match pair_compile_int(left, right) {
-                MaybeCompile::Compile((left, right)) => {
-                    let divisor = BigUint::pow_2_to(&right);
-                    let result = left.div_floor(&BigInt::from(divisor)).expect("non-zero div");
-                    Value::new_int(result)
-                }
-                MaybeCompile::Hardware((left, right)) => {
-                    let divisor_range =
-                        multi_range_binary_pow(&ClosedNonEmptyMultiRange::single(BigInt::TWO), &right.ty)
-                            .expect("non-zero expr");
-                    let result_range = multi_range_binary_foor_div(&left.ty, &divisor_range).expect("non-zero divisor");
+    let (left_ty_inner, left_len) = unwrap_match!(left.inner.ty(), Type::Array(inner, len) => (inner, len));
+    let left_len = left_len.expect("array value has known length");
 
-                    let right = HardwareInt::from(right);
-                    let result =
-                        build_binary_int_arithmetic_op(IrIntArithmeticOp::Shr, large, result_range, left, right);
-                    Value::Hardware(HardwareValue::from(result))
-                }
-            }
+    let right_span = right.span;
+    let right = check_type_is_int(refs, op_reason, right.map_inner(|e| e.into_value()))?;
+    let right_inner = match right {
+        MaybeCompile::Compile(right_inner) => right_inner,
+        MaybeCompile::Hardware(_) => {
+            return Err(diags.report_error_simple(
+                "array repeat right hand side must be compile-time value",
+                right_span,
+                "got non-compile-time value here",
+            ));
         }
+    };
+    let right_inner = BigUint::try_from(right_inner).map_err(|right_inner| {
+        diags.report_error_simple(
+            "array repeat right hand side cannot be negative",
+            right_span,
+            format!("got value `{right_inner}`"),
+        )
+    })?;
+    let right_inner = usize::try_from(right_inner).map_err(|right_inner| {
+        diags.report_error_simple(
+            "array repeat right hand side too large",
+            right_span,
+            format!("got value `{right_inner}`"),
+        )
+    })?;
 
-        // (bool, bool)
-        // TODO these should short-circuit, so delay evaluation of right
-        BinaryOp::BoolAnd => return eval_binary_bool(large, left, right, IrBoolBinaryOp::And),
-        BinaryOp::BoolOr => return eval_binary_bool(large, left, right, IrBoolBinaryOp::Or),
-        BinaryOp::BoolXor => return eval_binary_bool(large, left, right, IrBoolBinaryOp::Xor),
-        // (T, T)
-        BinaryOp::CmpEq => return eval_binary_eq(large, left, right, true),
-        BinaryOp::CmpNeq => return eval_binary_eq(large, left, right, false),
-        BinaryOp::CmpLt => return eval_binary_int_compare(large, left, right, IrIntCompareOp::Lt),
-        BinaryOp::CmpLte => return eval_binary_int_compare(large, left, right, IrIntCompareOp::Lte),
-        BinaryOp::CmpGt => return eval_binary_int_compare(large, left, right, IrIntCompareOp::Gt),
-        BinaryOp::CmpGte => return eval_binary_int_compare(large, left, right, IrIntCompareOp::Gte),
-        // (int, range) or (T:Eq, array)
-        // TODO share code with match "in" pattern
-        // TODO for hardware ranges, also check if start <(=) end, otherwise this might have false positives
-        BinaryOp::In => return Err(diags.report_error_todo(expr_span, "binary op In")),
-        // (bool, bool), (int, int), (bool, []bool), ([]bool, bool), ([]bool, []bool)
-        BinaryOp::BitAnd => return eval_binary_bitwise(large, left, right, IrBoolBinaryOp::And),
-        BinaryOp::BitOr => return eval_binary_bitwise(large, left, right, IrBoolBinaryOp::Or),
-        BinaryOp::BitXor => return eval_binary_bitwise(large, left, right, IrBoolBinaryOp::Xor),
+    let result = match left.inner.into_value() {
+        Value::Simple(SimpleCompileValue::Array(left_inner)) => {
+            // do the repetition at compile-time
+            let result_len = usize::try_from(BigUint::from(left_inner.len()) * right_inner).map_err(|result_len| {
+                diags.report_error_simple(
+                    "array repeat result size too large",
+                    right_span,
+                    format!("got value `{result_len}`"),
+                )
+            })?;
+
+            let mut result = try_vec_with_capacity(diags, expr_span, result_len)?;
+            for _ in 0..right_inner {
+                result.extend_from_slice(&left_inner);
+            }
+            Value::Simple(SimpleCompileValue::Array(Arc::new(result)))
+        }
+        Value::Hardware(value) => {
+            // implement runtime repetition through spread array literal
+            let element = IrArrayLiteralElement::Spread(value.expr);
+            let mut elements = try_vec_with_capacity(diags, expr_span, right_inner)?;
+            elements.resize(right_inner, element);
+
+            let left_ty_inner_hw = left_ty_inner.as_hardware_type(elab).unwrap();
+            let result_len = left_len * right_inner;
+            let result_expr =
+                IrExpressionLarge::ArrayLiteral(left_ty_inner_hw.as_ir(refs), result_len.clone(), elements);
+            Value::Hardware(HardwareValue {
+                ty: HardwareType::Array(Arc::new(left_ty_inner_hw.clone()), result_len),
+                domain: value.domain,
+                expr: large.push_expr(result_expr),
+            })
+        }
+        Value::Simple(_) | Value::Compound(_) => {
+            return Err(
+                diags.report_error_internal(left.span, "compile-time value with type array is not actually an array")
+            );
+        }
     };
 
-    Ok(Value::simple(result_simple))
+    Ok(result)
 }
 
 /// Logical not for bools, bitwise not for ints and bool arrays.
@@ -2378,11 +2414,13 @@ fn eval_binary_bitwise(
     enum Kind {
         Bool,
         Int,
+        Range,
         BoolArray,
     }
     let kind_of = |ty: &Type| match ty {
         Type::Bool => Some(Kind::Bool),
         Type::Int(_) => Some(Kind::Int),
+        Type::Range => Some(Kind::Range),
         Type::Array(inner, _) if matches!(**inner, Type::Bool) => Some(Kind::BoolArray),
         _ => None,
     };
@@ -2404,6 +2442,14 @@ fn eval_binary_bitwise(
             };
             Ok(ValueWithImplications::simple(result))
         }
+        (Some(Kind::Range), Some(Kind::Range)) => {
+            let left = check_arithmetic_range_operand(refs, op_span, left);
+            let right = check_arithmetic_range_operand(refs, op_span, right);
+            let (left, right) = (left?, right?);
+
+            let result = multi_range_binary_bitwise(op, &left, &right);
+            Ok(ValueWithImplications::simple(range_arithmetic_result_value(result)))
+        }
         (Some(Kind::Bool | Kind::BoolArray), Some(Kind::Bool | Kind::BoolArray)) => {
             let left = check_bit_operand(refs, op_reason, left)?;
             let right = check_bit_operand(refs, op_reason, right)?;
@@ -2418,7 +2464,7 @@ fn eval_binary_bitwise(
             )
             .add_info(left.span, format!("left operand has type `{}`", left_ty.value_string(refs)))
             .add_info(right.span, format!("right operand has type `{}`", right_ty.value_string(refs)))
-            .add_footer_hint("bitwise operators support `(bool, bool)`, `(int, int)`, `([_]bool, [_]bool)`, `(bool, [_]bool)` and `([_]bool, bool)`")
+            .add_footer_hint("bitwise operators support `(bool, bool)`, `(int, int)`, `(Range, Range)`, `([_]bool, [_]bool)`, `(bool, [_]bool)` and `([_]bool, bool)`")
             .report(refs.diags);
             Err(diag)
         }
@@ -2598,9 +2644,7 @@ fn eval_binary_bool(
 ) -> DiagResult<ValueWithImplications> {
     let left = check_type_is_bool(refs, op_reason, left);
     let right = check_type_is_bool(refs, op_reason, right);
-
-    let left = left?;
-    let right = right?;
+    let (left, right) = (left?, right?);
 
     Ok(eval_binary_bool_typed(large, op, left, right).into())
 }

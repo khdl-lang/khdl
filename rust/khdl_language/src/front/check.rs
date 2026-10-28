@@ -6,7 +6,7 @@ use crate::front::signal::PortInfo;
 use crate::front::types::{HardwareType, Type, TypeBool, Typed};
 use crate::front::value::{
     CompileCompoundValue, CompileValue, HardwareInt, HardwareUInt, HardwareValue, MaybeCompile, MixedCompoundValue,
-    MixedString, SimpleCompileValue, Value,
+    MixedString, RangeValue, SimpleCompileValue, Value,
 };
 use crate::syntax::ast::{PortDirection, SyncDomain};
 use crate::syntax::pos::{Span, Spanned};
@@ -453,6 +453,20 @@ pub fn check_hardware_type_for_bit_operation(refs: CompileRefs, ty: Spanned<&Typ
         )
         .report(diags)
     })
+}
+
+pub fn check_type_is_range(
+    refs: CompileRefs,
+    reason: TypeContainsReason,
+    value: Spanned<Value>,
+) -> DiagResult<RangeValue> {
+    let diags = refs.diags;
+    check_type_contains_value(refs, reason, &Type::Range, value.as_ref())?;
+
+    match value.inner {
+        Value::Compound(MixedCompoundValue::Range(range)) => Ok(range),
+        _ => Err(diags.report_error_internal(value.span, "expected range value")),
+    }
 }
 
 pub fn check_type_is_range_compile(
