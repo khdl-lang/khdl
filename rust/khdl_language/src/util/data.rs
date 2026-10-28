@@ -134,12 +134,12 @@ impl<T> SliceExt<T> for [T] {
 
 /// Variant of Vec that provides stable references to its elements.
 /// In return it's not possible to remove elements from it.
-pub struct GrowVec<T> {
+pub struct StableVec<T> {
     // TODO instead of boxing, use a stack of growing arrays?
     inner: RefCell<Vec<Box<T>>>,
 }
 
-impl<T> GrowVec<T> {
+impl<T> StableVec<T> {
     pub fn new() -> Self {
         Self {
             inner: RefCell::new(Vec::new()),

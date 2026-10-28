@@ -15,7 +15,7 @@ use crate::syntax::pos::{Span, Spanned};
 use crate::try_inner;
 use crate::util::arena::Arena;
 use crate::util::big_int::{BigInt, BigUint, Sign};
-use crate::util::data::{GrowVec, IndexMapExt, VecExt};
+use crate::util::data::{IndexMapExt, StableVec, VecExt};
 use crate::util::int::{IntRepresentation, Signed};
 use crate::util::iter::IterExt;
 use crate::util::range::{ClosedNonEmptyRange, ClosedRange};
@@ -763,7 +763,7 @@ fn lower_combinatorial_process(
         variable_name_map: &variable_name_map,
     };
 
-    let temporaries = GrowVec::new();
+    let temporaries = StableVec::new();
     let mut ctx = LowerBlockContext {
         diags,
         module: module_info,
@@ -856,7 +856,7 @@ fn lower_clocked_process(
     let pos_end_of_shadow_init = f_body.len();
 
     // lower body itself
-    let temporaries = GrowVec::new();
+    let temporaries = StableVec::new();
     let mut ctx = LowerBlockContext {
         diags,
         module: module_info,
@@ -1012,7 +1012,12 @@ fn declare_shadow_signals(
     Ok(shadowing_reg_name_map)
 }
 
-fn declare_temporaries(f_decl: &mut String, f_init: &mut String, indent: Indent, temporaries: GrowVec<TemporaryInfo>) {
+fn declare_temporaries(
+    f_decl: &mut String,
+    f_init: &mut String,
+    indent: Indent,
+    temporaries: StableVec<TemporaryInfo>,
+) {
     for tmp in temporaries.into_vec() {
         let TemporaryInfo { name, ty } = *tmp;
         declare_local(f_decl, f_init, indent, ty, &name);
@@ -1144,7 +1149,7 @@ struct LowerBlockContext<'a, 'n> {
     is_clocked_process: bool,
     name_map: ProcessNameMap<'n>,
     name_scope: &'a mut LoweredNameScope<'n>,
-    temporaries: &'n GrowVec<TemporaryInfo>,
+    temporaries: &'n StableVec<TemporaryInfo>,
 
     indent: Indent,
     f: &'a mut String,
