@@ -1,5 +1,5 @@
 use crate::front::compile::CompileRefs;
-use crate::front::diagnostic::{DiagError, DiagResult, DiagnosticError, Diagnostics};
+use crate::front::diagnostic::{DiagError, DiagId, DiagResult, DiagnosticError, Diagnostics};
 use crate::front::expression::LeftInterfaceInfo;
 use crate::front::flow::{Flow, Variable};
 use crate::front::signal::Signal;
@@ -8,9 +8,11 @@ use crate::syntax::ast::MaybeIdentifier;
 use crate::syntax::parsed::AstRefItem;
 use crate::syntax::pos::{HasSpan, Span, Spanned};
 use crate::util::ResultExt;
+use crate::util::data::NonEmptyVec;
 use crate::util::edit_distance::hint_options_by_edit_distance;
 use crate::util::intern::{Id, Interner};
 use indexmap::map::{Entry, IndexMap};
+use itertools::Itertools;
 use khdl_util::constants::MAX_IDENTIFIER_SUGGESTIONS;
 use std::cell::RefCell;
 use std::fmt::Debug;
@@ -86,8 +88,15 @@ pub enum CaptureFailed {
 // TODO we store the span twice, why?
 #[derive(Debug)]
 enum DeclaredValue {
-    Once { value: DiagResult<ScopedEntry>, span: Span },
-    Multiple { spans: Vec<Span>, err: DiagError },
+    Once {
+        value: DiagResult<ScopedEntry>,
+        span: Span,
+    },
+    Multiple {
+        spans: Vec<Span>,
+        err: DiagError,
+        diag_id: Option<DiagId>,
+    },
     Error(DiagError),
 }
 
@@ -203,8 +212,12 @@ impl<'p> Scope<'p> {
         }
     }
 
-    pub fn into_content(self) -> ScopeContent {
-        self.content.into_inner()
+    pub fn into_content(self, remember_diag_ids: bool) -> ScopeContent {
+        let mut content = self.content.into_inner();
+        if !remember_diag_ids {
+            content.forget_diag_ids();
+        }
+        content
     }
 
     pub fn for_each_immediate_entry(&self, f: impl FnMut(ScopeKey<Id, ()>, DeclaredValueSingle<&ScopedEntry>)) {
@@ -392,7 +405,7 @@ impl<'p> Scope<'p> {
         for (_, v) in &self.content.borrow().values {
             match v {
                 DeclaredValue::Once { .. } => {}
-                &DeclaredValue::Multiple { spans: _, err } => return Err(err),
+                &DeclaredValue::Multiple { err, .. } => return Err(err),
                 &DeclaredValue::Error(e) => return Err(e),
             }
         }
@@ -405,6 +418,22 @@ impl ScopeContent {
         ScopeContent {
             span,
             values: IndexMap::new(),
+        }
+    }
+
+    fn forget_diag_ids(&mut self) {
+        for value in self.values.values_mut() {
+            match value {
+                DeclaredValue::Once { value: _, span: _ } => {}
+                DeclaredValue::Multiple {
+                    spans: _,
+                    err: _,
+                    diag_id,
+                } => {
+                    *diag_id = None;
+                }
+                DeclaredValue::Error(_) => {}
+            }
         }
     }
 
@@ -438,14 +467,13 @@ impl ScopeContent {
                 let declared = entry.get_mut();
 
                 // get all spans
-                let mut spans = match declared {
-                    DeclaredValue::Once { value: _, span } => vec![*span],
-                    DeclaredValue::Multiple { spans, err: _ } => std::mem::take(spans),
+                let (mut spans, prev_diag_id) = match declared {
+                    DeclaredValue::Once { value: _, span } => (vec![*span], None),
+                    DeclaredValue::Multiple { spans, err: _, diag_id } => (std::mem::take(spans), *diag_id),
                     DeclaredValue::Error(_) => return,
                 };
 
                 // report error
-                // TODO this creates O(n^2) lines of errors, ideally we only want to report the final O(n) one
                 let title = match key.inner {
                     ScopeKey::Id(id) => {
                         let id_str = id.str(interner);
@@ -453,16 +481,29 @@ impl ScopeContent {
                     }
                     ScopeKey::Slf(()) => "self declared multiple times".to_string(),
                 };
-                let mut diag = DiagnosticError::new(title, key.span, "declared again here");
-                for span in &spans {
-                    diag = diag.add_info(*span, "previously declared here");
+
+                spans.push(key.span);
+                let (&span_first, spans_rest) = spans.split_first().unwrap();
+
+                let messages = spans_rest
+                    .iter()
+                    .map(|&span| (span, "declared again here".to_owned()))
+                    .collect_vec();
+                let messages = NonEmptyVec::try_from(messages).unwrap();
+                let mut diag =
+                    DiagnosticError::new_multiple(title, messages).add_info(span_first, "first declared here");
+                if let Some(prev_diag_id) = prev_diag_id {
+                    diag = diag.suppress(prev_diag_id);
                 }
-                let err = diag.report(diags);
+                let (err, diag_id) = diag.report_with_id(diags);
 
                 // insert error value into scope to avoid downstream errors
                 //   caused by only considering the first declared value
-                spans.push(key.span);
-                *declared = DeclaredValue::Multiple { spans, err };
+                *declared = DeclaredValue::Multiple {
+                    spans,
+                    err,
+                    diag_id: Some(diag_id),
+                };
             }
             Entry::Vacant(entry) => {
                 entry.insert(DeclaredValue::Once { value, span: key.span });
@@ -488,7 +529,11 @@ impl ScopeContent {
         if let Some(declared) = self.values.get(&key) {
             let (value, span_decl) = match *declared {
                 DeclaredValue::Once { ref value, span } => (value.as_ref_ok()?, span),
-                DeclaredValue::Multiple { spans: _, err } => return Err(err),
+                DeclaredValue::Multiple {
+                    spans: _,
+                    err,
+                    diag_id: _,
+                } => return Err(err),
                 DeclaredValue::Error(err) => return Err(err),
             };
 
@@ -505,7 +550,11 @@ impl ScopeContent {
         let result = if let Some(value) = self.values.get(&key) {
             match value {
                 &DeclaredValue::Once { value: _, span } => Some(span),
-                DeclaredValue::Multiple { spans, err: _ } => Some(spans[0]),
+                DeclaredValue::Multiple {
+                    spans,
+                    err: _,
+                    diag_id: _,
+                } => Some(spans[0]),
                 &DeclaredValue::Error(e) => return Err(e),
             }
         } else {
@@ -521,7 +570,11 @@ impl ScopeContent {
                     Ok(value) => DeclaredValueSingle::Value { span, value },
                     &Err(e) => DeclaredValueSingle::Error(e),
                 },
-                DeclaredValue::Multiple { spans: _, err } => DeclaredValueSingle::Error(err),
+                DeclaredValue::Multiple {
+                    spans: _,
+                    err,
+                    diag_id: _,
+                } => DeclaredValueSingle::Error(err),
                 DeclaredValue::Error(err) => DeclaredValueSingle::Error(err),
             };
             f(k, v)

@@ -3,6 +3,7 @@
 
 use crate::syntax::pos::Span;
 use crate::syntax::source::{FileId, SourceDatabase};
+use crate::util::arena::RandomCheck;
 use crate::util::data::NonEmptyVec;
 use annotate_snippets::renderer::{AnsiColor, Color, DEFAULT_HELP_STYLE, DEFAULT_NOTE_STYLE, Style};
 use annotate_snippets::{AnnotationKind, Group, Level, Renderer, Snippet};
@@ -34,18 +35,49 @@ pub type DiagResult<T = ()> = Result<T, DiagError>;
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct Diagnostics {
-    diagnostics: RefCell<Vec<Diagnostic>>,
+    check: RandomCheck,
+    // None means this diagnostic was suppressed by a later one
+    diagnostics: RefCell<Vec<Option<Diagnostic>>>,
+}
+
+/// A unique identifier for each diagnostic reported by [DiagnosticError::report_with_id],
+/// which allows a later diagnostic to suppress it with [DiagnosticError::suppress].
+///
+/// An id is only valid for the [Diagnostics] instance that created it.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct DiagId {
+    check: RandomCheck,
+    index: usize,
 }
 
 impl Diagnostics {
     pub fn new() -> Self {
         Self {
+            check: RandomCheck::new(),
             diagnostics: RefCell::new(vec![]),
         }
     }
 
     pub fn push(&self, diag: Diagnostic) {
-        self.diagnostics.borrow_mut().push(diag);
+        self.push_impl(diag, &[]);
+    }
+
+    fn push_impl(&self, diag: Diagnostic, suppress: &[DiagId]) -> DiagId {
+        let check = self.check;
+        let mut diags = self.diagnostics.borrow_mut();
+
+        for &id in suppress {
+            assert_eq!(
+                check, id.check,
+                "DiagId {id:?} used in diagnostics which did not create it"
+            );
+            diags[id.index] = None;
+        }
+
+        let index = diags.len();
+        diags.push(Some(diag));
+
+        DiagId { check, index }
     }
 
     pub fn report_error_simple(&self, title: impl Into<String>, span: Span, label: impl Into<String>) -> DiagError {
@@ -62,11 +94,11 @@ impl Diagnostics {
     }
 
     pub fn finish(self) -> Vec<Diagnostic> {
-        self.diagnostics.into_inner()
+        self.diagnostics.into_inner().into_iter().flatten().collect()
     }
 
     pub fn len(&self) -> usize {
-        self.diagnostics.borrow().len()
+        self.diagnostics.borrow().iter().filter(|d| d.is_some()).count()
     }
 }
 
@@ -100,6 +132,7 @@ pub enum FooterKind {
 #[derive(Debug, Clone)]
 pub struct DiagnosticError {
     content: DiagnosticContent,
+    suppress: Vec<DiagId>,
 }
 
 #[must_use]
@@ -120,12 +153,18 @@ pub struct DiagnosticContent {
 impl DiagnosticError {
     pub fn new(title: impl Into<String>, span: Span, message: impl Into<String>) -> Self {
         let content = DiagnosticContent::new(title, span, message);
-        Self { content }
+        Self {
+            content,
+            suppress: vec![],
+        }
     }
 
     pub fn new_multiple(title: impl Into<String>, messages: NonEmptyVec<(Span, String)>) -> Self {
         let content = DiagnosticContent::new_multiple(title, messages);
-        Self { content }
+        Self {
+            content,
+            suppress: vec![],
+        }
     }
 
     pub fn new_todo(feature: impl AsRef<str>, span: Span) -> Self {
@@ -156,12 +195,24 @@ impl DiagnosticError {
         self
     }
 
+    pub fn suppress(mut self, other: DiagId) -> Self {
+        self.suppress.push(other);
+        self
+    }
+
     pub fn report(self, diagnostics: &Diagnostics) -> DiagError {
-        diagnostics.push(Diagnostic {
+        let (err, _) = self.report_with_id(diagnostics);
+        err
+    }
+
+    pub fn report_with_id(self, diagnostics: &Diagnostics) -> (DiagError, DiagId) {
+        let DiagnosticError { content, suppress } = self;
+        let diag = Diagnostic {
             level: DiagnosticLevel::Error,
-            content: self.content,
-        });
-        DiagError::promise_error_has_been_reported()
+            content,
+        };
+        let id = diagnostics.push_impl(diag, &suppress);
+        (DiagError::promise_error_has_been_reported(), id)
     }
 }
 

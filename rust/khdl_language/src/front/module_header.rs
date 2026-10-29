@@ -138,7 +138,8 @@ impl CompileRefs<'_, '_> {
         });
 
         // save scope and flow
-        let scope_ports = scope_ports.into_content();
+        //   the body will be elaborated with different diagnostics, so diag ids can't be kept
+        let scope_ports = scope_ports.into_content(false);
         let flow = flow.into_content();
 
         // collect results

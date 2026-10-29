@@ -221,7 +221,7 @@ impl<'a, 's, 'p, T> ExtraCursor<'a, 's, 'p, T> {
                                 declare.declare(ctx, &mut scope_child, flow)?;
                             }
 
-                            Ok(Some(FramePush::Block(Some(scope_child.into_content()), block)))
+                            Ok(Some(FramePush::Block(Some(scope_child.into_content(true)), block)))
                         }
                         ExtraListItem::For(stmt) => {
                             let header = ctx.elaborate_for_statement_header(scope.scope, flow, stmt)?;
@@ -264,7 +264,7 @@ impl<'a, 's, 'p, T> ExtraCursor<'a, 's, 'p, T> {
                             index_value,
                         )?;
 
-                        Ok(scope_iter.into_content())
+                        Ok(scope_iter.into_content(true))
                     })?;
 
                     self.push_block(Some(scope_iter), &stmt.body);
@@ -334,7 +334,7 @@ fn with_scope<R>(
 
         // restore scope content
         assert!(next_slot.is_none());
-        *next_slot = Some(next_scope.into_content());
+        *next_slot = Some(next_scope.into_content(true));
     }
 
     let mut result = None;
