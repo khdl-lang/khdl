@@ -353,3 +353,11 @@ fn wrap_on_trailing_comma() {
     assert_formats_to(src_bare, src_bare);
     assert_formats_to(src_trailing, expected_trailing);
 }
+
+#[test]
+fn struct_reference_fields() {
+    assert_formats_to(
+        "struct S(T:type){ref value:T,ref channel:Link(T),ordinary:Ref(T)}",
+        "struct S(T: type) {\n    ref value: T,\n    ref channel: Link(T),\n    ordinary: Ref(T),\n}\n",
+    );
+}

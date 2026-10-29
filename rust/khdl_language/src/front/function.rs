@@ -474,8 +474,8 @@ impl CompileItemContext<'_, '_> {
         } = refs.shared.elaboration_arenas.struct_info(elab);
 
         let mut field_values = vec![];
-        for &(field_id, ref field_ty) in fields.values() {
-            let value = args.require_value(self, flow, Param::Named(field_id), field_ty.as_ref())?;
+        for field in fields.values() {
+            let value = args.require_value(self, flow, Param::Named(field.id), field.ty.as_ref())?;
             field_values.push(value.inner.into_value());
         }
         args.finish(self, flow, span_body)?;
