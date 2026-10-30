@@ -1139,10 +1139,11 @@ impl BodyContext {
                     let connector = match id_to_connector.get(&id.inner) {
                         Some(&connector) => connector,
                         None => {
+                            let id_str = id.inner.str(interner);
                             let diag = DiagnosticError::new(
                                 "connection does not match any port",
                                 id.span,
-                                "invalid connection here",
+                                format!("connection to unknown port `{id_str}` here"),
                             )
                             .add_info(def_ports_span, "ports declared here")
                             .report(diags);

@@ -125,9 +125,14 @@ impl CompileItemContext<'_, '_> {
                     match signal_map.entry(signal_id.inner) {
                         Entry::Occupied(mut entry) => {
                             let prev: &mut ElaboratedInterfaceSignalInfo = entry.get_mut();
-                            let e = DiagnosticError::new("signal declared twice", signal_id.span(), "redeclared here")
-                                .add_info(prev.id.span, "previously declared here")
-                                .report(diags);
+                            let signal_str = signal_id.inner.str(&refs.shared.interner);
+                            let e = DiagnosticError::new(
+                                "signal declared twice",
+                                signal_id.span(),
+                                format!("signal `{signal_str}` redeclared here"),
+                            )
+                            .add_info(prev.id.span, format!("signal `{signal_str}` previously declared here"))
+                            .report(diags);
                             prev.ty = Err(e);
                         }
                         Entry::Vacant(entry) => {
@@ -188,19 +193,28 @@ impl CompileItemContext<'_, '_> {
                     let slot = &mut port_dir_vec[port_index];
                     if let Some(prev) = &*slot {
                         if let Ok((prev_id, _)) = prev {
-                            let e = DiagnosticError::new("port direction set twice", port_id.span(), "set again here")
-                                .add_info(prev_id.span(), "previously set here")
-                                .report(diags);
+                            let port_str = port_id.inner.str(&refs.shared.interner);
+                            let e = DiagnosticError::new(
+                                "port direction set twice",
+                                port_id.span(),
+                                format!("direction of port `{port_str}` set again here"),
+                            )
+                            .add_info(
+                                prev_id.span(),
+                                format!("direction of port `{port_str}` previously set here"),
+                            )
+                            .report(diags);
                             *slot = Some(Err(e));
                         }
                     } else {
                         *slot = Some(Ok((port_id, port_dir)));
                     }
                 } else {
+                    let port_str = port_id.inner.str(&refs.shared.interner);
                     any_view_err = Err(diags.report_error_simple(
                         "port not found in this interface",
                         port_id.span(),
-                        "attempt to set direction here",
+                        format!("attempt to set direction of unknown port `{port_str}` here"),
                     ));
                 }
             }
@@ -236,18 +250,29 @@ impl CompileItemContext<'_, '_> {
                 port_dirs: port_dir_vec,
             };
             if let MaybeIdentifier::Identifier(view_id) = &view_id {
+                let view_str = view_id.inner.str(&refs.shared.interner);
                 if let Some(prev) = signal_map.get(&view_id.inner) {
-                    let _ =
-                        DiagnosticError::new("view name conflicts with port name", view_id.span, "view declared here")
-                            .add_info(prev.id.span(), "port declared here")
-                            .report(diags);
+                    let _ = DiagnosticError::new(
+                        "view name conflicts with port name",
+                        view_id.span,
+                        format!("view `{view_str}` declared here"),
+                    )
+                    .add_info(prev.id.span(), format!("port `{view_str}` declared here"))
+                    .report(diags);
                 }
 
                 match view_map.entry(view_id.inner) {
                     Entry::Occupied(mut entry) => {
-                        let e = DiagnosticError::new("view name already declared", view_id.span, "redeclared here")
-                            .add_info(entry.get().id.span(), "previously declared here")
-                            .report(diags);
+                        let e = DiagnosticError::new(
+                            "view name already declared",
+                            view_id.span,
+                            format!("view `{view_str}` redeclared here"),
+                        )
+                        .add_info(
+                            entry.get().id.span(),
+                            format!("view `{view_str}` previously declared here"),
+                        )
+                        .report(diags);
                         entry.get_mut().port_dirs = Err(e);
                     }
                     Entry::Vacant(entry) => {

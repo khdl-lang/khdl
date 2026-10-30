@@ -204,7 +204,7 @@ fn check_identifier_valid(diags: &Diagnostics, id: Spanned<&str>) -> DiagResult 
         return Err(diags.report_error_simple(
             "invalid verilog identifier: first character must be alphabetic or underscore",
             id.span,
-            "identifier used here",
+            format!("identifier `{s}` used here"),
         ));
     }
     for c in s.chars() {
@@ -212,7 +212,7 @@ fn check_identifier_valid(diags: &Diagnostics, id: Spanned<&str>) -> DiagResult 
             return Err(diags.report_error_simple(
                 format!("invalid verilog identifier: character `{c}` not allowed in identifier"),
                 id.span,
-                "identifier used here",
+                format!("identifier `{s}` used here"),
             ));
         }
     }

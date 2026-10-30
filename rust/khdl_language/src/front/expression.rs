@@ -213,8 +213,6 @@ impl<'a> CompileItemContext<'a, '_> {
         let diags = refs.diags;
 
         let key = key.into();
-        let key_span = key.span();
-
         let found = scope.find(refs, key)?;
 
         let result = match found.value {
@@ -228,7 +226,10 @@ impl<'a> CompileItemContext<'a, '_> {
                 let CapturedValue { span_capture, value } = value;
                 match value {
                     Ok(value) => NamedOrValue::Value(Value::from(Arc::unwrap_or_clone(value))),
-                    Err(e) => return Err(e.to_diag_error(found.span_decl, span_capture, key_span).report(diags)),
+                    Err(e) => {
+                        let e = e.to_diag_error(&refs.shared.interner, key, found.span_decl, span_capture);
+                        return Err(e.report(diags));
+                    }
                 }
             }
             ScopedEntry::Value(value) => NamedOrValue::Value(value),

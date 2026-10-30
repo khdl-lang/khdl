@@ -628,17 +628,36 @@ fn error_not_found(
 }
 
 impl CaptureFailed {
-    pub fn to_diag_error(self, span_decl: Span, span_capture: Span, span_use: Span) -> DiagnosticError {
+    pub fn to_diag_error(
+        self,
+        interner: &Interner,
+        key: ScopeKey<Spanned<Id>, Span>,
+        span_decl: Span,
+        span_capture: Span,
+    ) -> DiagnosticError {
         let reason = match self {
             CaptureFailed::NotCompile => "is not a compile-time value",
             CaptureFailed::NotFullyInitialized => "was not fully initialized",
         };
+        let (label, info) = match key {
+            ScopeKey::Id(id) => {
+                let name = id.inner.str(interner);
+                (
+                    format!("trying to access captured value `{name}` here"),
+                    format!("value `{name}` declared here"),
+                )
+            }
+            ScopeKey::Slf(_) => (
+                "trying to access captured self here".to_owned(),
+                "self declared here".to_owned(),
+            ),
+        };
         DiagnosticError::new(
             format!("cannot access captured value because it {reason}"),
-            span_use,
-            "trying to access captured value here",
+            key.span(),
+            label,
         )
-        .add_info(span_decl, "value declared here")
+        .add_info(span_decl, info)
         .add_info(span_capture, "value captured here")
     }
 }

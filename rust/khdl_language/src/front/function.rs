@@ -268,20 +268,27 @@ impl CallArgs<'_, '_, '_> {
 
     /// Check that all args have been used.
     pub fn finish(self, ctx: &mut CompileItemContext, flow: &mut impl Flow, span_params: Span) -> DiagResult {
-        let span_leftover = match self {
-            CallArgs::Ast(mut args) => args.cursor.next(ctx, flow)?.map(|arg| arg.item().span),
-            CallArgs::Evaluated(mut args) => args.inner.next().map(|arg| arg.span),
+        let leftover = match self {
+            CallArgs::Ast(mut args) => {
+                let id = args.peek_id(ctx, flow)?.flatten();
+                args.cursor.next(ctx, flow)?.map(|arg| (arg.item().span, id))
+            }
+            CallArgs::Evaluated(mut args) => args.inner.next().map(|arg| (arg.span, arg.id)),
         };
 
-        match span_leftover {
+        match leftover {
             None => Ok(()),
-            Some(span_leftover) => Err(DiagnosticError::new(
-                "argument does not match any parameter",
-                span_leftover,
-                "argument passed here",
-            )
-            .add_info(span_params, "parameters declared here")
-            .report(ctx.refs.diags)),
+            Some((span_leftover, id_leftover)) => {
+                let label = match id_leftover {
+                    None => "argument passed here".to_owned(),
+                    Some(id) => format!("argument `{}` passed here", id.inner.str(&ctx.refs.shared.interner)),
+                };
+                Err(
+                    DiagnosticError::new("argument does not match any parameter", span_leftover, label)
+                        .add_info(span_params, "parameters declared here")
+                        .report(ctx.refs.diags),
+                )
+            }
         }
     }
 }

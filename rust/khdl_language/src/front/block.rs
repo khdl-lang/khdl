@@ -559,12 +559,13 @@ impl CompileItemContext<'_, '_> {
                         // warning if declaring register with same name as signal
                         // TODO improve, only warn if the entry is actually a signal?
                         if let Ok(Some(prev_span)) = scope.try_find_for_diagnostic(id.inner) {
+                            let id_str = id.inner.str(&self.refs.shared.interner);
                             DiagnosticWarning::new(
                                 "declaring new register with name matching an existing scope entry",
                                 stmt_span,
-                                "declaring register here",
+                                format!("declaring register `{id_str}` here"),
                             )
-                            .add_info(prev_span, "existing entry declared here")
+                            .add_info(prev_span, format!("existing entry `{id_str}` declared here"))
                             .add_footer_hint("to mark an existing signal as a register, use `reg wire`/`port` instead")
                             .report(diags);
                         }

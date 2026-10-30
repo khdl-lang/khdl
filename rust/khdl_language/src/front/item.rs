@@ -952,59 +952,69 @@ impl CompileItemContext<'_, '_> {
         let mut methods_self: IndexMap<Id, Arc<MethodInfo>> = IndexMap::new();
         let mut any_item_err = Ok(());
 
-        let mut err_member_duplicate = |prev_span, prev_kind, curr_span, curr_kind| {
-            let e = err_member_duplicate("struct", prev_span, prev_kind, curr_span, curr_kind).report(diags);
+        let interner = &self.refs.shared.interner;
+        let mut err_member_duplicate = |name: Id, prev_span, prev_kind, curr_span, curr_kind| {
+            let name_str = name.str(interner);
+            let e = err_member_duplicate("struct", name_str, prev_span, prev_kind, curr_span, curr_kind).report(diags);
             any_item_err = Err(e);
         };
 
-        let mut visit_item =
-            |s: &mut Self, scope: &mut ExtraScope, flow: &mut FlowCompile, item: &'a StructBodyItem| {
-                match item {
-                    StructBodyItem::Field(field) => {
-                        let &StructField { span: _, id, ty } = field;
+        let mut visit_item = |s: &mut Self,
+                              scope: &mut ExtraScope,
+                              flow: &mut FlowCompile,
+                              item: &'a StructBodyItem| {
+            match item {
+                StructBodyItem::Field(field) => {
+                    let &StructField { span: _, id, ty } = field;
 
-                        let id_eval = s.eval_id(scope.as_scope(), flow, id)?;
-                        let ty = s.eval_expression_as_ty(scope.as_scope(), flow, ty)?;
+                    let id_eval = s.eval_id(scope.as_scope(), flow, id)?;
+                    let ty = s.eval_expression_as_ty(scope.as_scope(), flow, ty)?;
 
-                        if let Some(&(prev_id, _)) = fields_eval.get(&id_eval.inner) {
-                            err_member_duplicate(prev_id.span(), "field", id_eval.span(), "field");
-                            return Ok(());
-                        }
-                        if let Some(prev_info) = methods_self.get(&id_eval.inner) {
-                            err_member_duplicate(prev_info.func_decl.id.span(), "method", id_eval.span(), "field");
-                            return Ok(());
-                        }
-
-                        fields_eval.insert(id_eval.inner, (id_eval, ty));
+                    if let Some(&(prev_id, _)) = fields_eval.get(&id_eval.inner) {
+                        err_member_duplicate(id_eval.inner, prev_id.span(), "field", id_eval.span(), "field");
+                        return Ok(());
                     }
-                    StructBodyItem::Method(method) => match method.params.slf.inner {
-                        ParameterSelfKind::Slf => {
-                            let id = match method.id {
-                                MaybeIdentifier::Dummy { .. } => return Ok(()),
-                                MaybeIdentifier::Identifier(id) => id,
-                            };
-                            let id_eval = s.eval_id(scope.as_scope(), flow, id)?.inner;
+                    if let Some(prev_info) = methods_self.get(&id_eval.inner) {
+                        err_member_duplicate(
+                            id_eval.inner,
+                            prev_info.func_decl.id.span(),
+                            "method",
+                            id_eval.span(),
+                            "field",
+                        );
+                        return Ok(());
+                    }
 
-                            if let Some(&(prev_id, _)) = fields_eval.get(&id_eval) {
-                                err_member_duplicate(prev_id.span(), "field", id.span(), "method");
-                                return Ok(());
-                            }
-                            if let Some(prev_info) = methods_self.get(&id_eval) {
-                                err_member_duplicate(prev_info.func_decl.id.span(), "method", id.span(), "method");
-                                return Ok(());
-                            }
-
-                            let info = MethodInfo {
-                                scope: Arc::clone(&scope_params_captured),
-                                name: id_eval,
-                                func_decl: method.clone(),
-                            };
-                            methods_self.insert(id_eval, Arc::new(info));
-                        }
-                    },
+                    fields_eval.insert(id_eval.inner, (id_eval, ty));
                 }
-                Ok(())
-            };
+                StructBodyItem::Method(method) => match method.params.slf.inner {
+                    ParameterSelfKind::Slf => {
+                        let id = match method.id {
+                            MaybeIdentifier::Dummy { .. } => return Ok(()),
+                            MaybeIdentifier::Identifier(id) => id,
+                        };
+                        let id_eval = s.eval_id(scope.as_scope(), flow, id)?.inner;
+
+                        if let Some(&(prev_id, _)) = fields_eval.get(&id_eval) {
+                            err_member_duplicate(id_eval, prev_id.span(), "field", id.span(), "method");
+                            return Ok(());
+                        }
+                        if let Some(prev_info) = methods_self.get(&id_eval) {
+                            err_member_duplicate(id_eval, prev_info.func_decl.id.span(), "method", id.span(), "method");
+                            return Ok(());
+                        }
+
+                        let info = MethodInfo {
+                            scope: Arc::clone(&scope_params_captured),
+                            name: id_eval,
+                            func_decl: method.clone(),
+                        };
+                        methods_self.insert(id_eval, Arc::new(info));
+                    }
+                },
+            }
+            Ok(())
+        };
 
         let mut scope = scope_params.new_child(span_body);
         self.elaborate_extra_list(&mut scope, flow, items, true, &mut visit_item)?;
@@ -1083,8 +1093,10 @@ impl CompileItemContext<'_, '_> {
         let mut methods_self: IndexMap<Id, Arc<MethodInfo>> = IndexMap::new();
         let mut any_item_err = Ok(());
 
-        let mut err_member_duplicate = |prev_span, prev_kind, curr_span, curr_kind| {
-            let e = err_member_duplicate("enum", prev_span, prev_kind, curr_span, curr_kind).report(diags);
+        let interner = &self.refs.shared.interner;
+        let mut err_member_duplicate = |name: Id, prev_span, prev_kind, curr_span, curr_kind| {
+            let name_str = name.str(interner);
+            let e = err_member_duplicate("enum", name_str, prev_span, prev_kind, curr_span, curr_kind).report(diags);
             any_item_err = Err(e);
         };
 
@@ -1105,11 +1117,11 @@ impl CompileItemContext<'_, '_> {
                     let variant_info = ElaboratedEnumVariantInfo { id, payload_ty };
 
                     if let Some(prev_info) = variants_eval.get(&id.inner) {
-                        err_member_duplicate(prev_info.id.span(), "variant", id.span(), "variant");
+                        err_member_duplicate(id.inner, prev_info.id.span(), "variant", id.span(), "variant");
                         return Ok(());
                     }
                     if let Some(prev_info) = methods_self.get(&id.inner) {
-                        err_member_duplicate(prev_info.func_decl.id.span(), "method", id.span(), "variant");
+                        err_member_duplicate(id.inner, prev_info.func_decl.id.span(), "method", id.span(), "variant");
                         return Ok(());
                     }
 
@@ -1123,11 +1135,11 @@ impl CompileItemContext<'_, '_> {
                     let id_eval = s.eval_id(scope.as_scope(), flow, id)?.inner;
 
                     if let Some(prev_info) = methods_self.get(&id_eval) {
-                        err_member_duplicate(prev_info.func_decl.id.span(), "method", id.span(), "method");
+                        err_member_duplicate(id_eval, prev_info.func_decl.id.span(), "method", id.span(), "method");
                         return Ok(());
                     }
                     if let Some(prev_info) = variants_eval.get(&id_eval) {
-                        err_member_duplicate(prev_info.id.span(), "variant", id.span(), "method");
+                        err_member_duplicate(id_eval, prev_info.id.span(), "variant", id.span(), "method");
                         return Ok(());
                     }
 
@@ -1200,7 +1212,7 @@ fn collect_static_members_from_body(
                     )
                     .report(diags))
                 } else if let Some((prev_span, prev_kind)) = prev_span_kind(name) {
-                    Err(err_member_duplicate(ty_kind, prev_span, prev_kind, span, "member").report(diags))
+                    Err(err_member_duplicate(ty_kind, name_str, prev_span, prev_kind, span, "member").report(diags))
                 } else {
                     match value {
                         ScopedEntry::Named(value) => match value {
@@ -1229,6 +1241,7 @@ fn collect_static_members_from_body(
 
 fn err_member_duplicate(
     ty_kind: &str,
+    name: &str,
     prev_span: Span,
     prev_kind: &str,
     curr_span: Span,
@@ -1237,9 +1250,9 @@ fn err_member_duplicate(
     DiagnosticError::new(
         format!("conflicting definitions of {ty_kind} member"),
         curr_span,
-        format!("{curr_kind} declared here"),
+        format!("{curr_kind} `{name}` declared here"),
     )
-    .add_info(prev_span, format!("{prev_kind} previously declared here"))
+    .add_info(prev_span, format!("{prev_kind} `{name}` previously declared here"))
 }
 
 pub fn debug_info_name_including_params(
