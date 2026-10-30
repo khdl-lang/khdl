@@ -59,7 +59,7 @@ impl CompileItemContext<'_, '_> {
             Ok((id, named))
         })?;
         let Some((id, named)) = id_name else {
-            return Err(error_missing_argument(refs, args.span, param));
+            return Err(error_missing_argument(refs, args.span(), param));
         };
 
         // finish args

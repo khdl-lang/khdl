@@ -116,13 +116,14 @@ pub enum CallArgs<'a, 's, 'p> {
 }
 
 pub struct AstArgs<'a, 's, 'p> {
-    pub span: Span,
-    pub cursor: ExtraCursor<'a, 's, 'p, Arg>,
+    span: Span,
+    cursor: ExtraCursor<'a, 's, 'p, Arg>,
+    peeked_id: Option<Option<Spanned<Id>>>,
 }
 
 pub struct EvaluatedArgs {
     pub span: Span,
-    pub inner: std::vec::IntoIter<EvaluatedArg>,
+    pub inner: std::iter::Peekable<std::vec::IntoIter<EvaluatedArg>>,
 }
 
 pub type EvaluatedArg = Arg<Option<Spanned<Id>>, Spanned<ValueWithImplications>>;
@@ -137,6 +138,18 @@ impl Param {
 }
 
 impl<'a, 's, 'p> AstArgs<'a, 's, 'p> {
+    pub fn new(span: Span, cursor: ExtraCursor<'a, 's, 'p, Arg>) -> Self {
+        Self {
+            span,
+            cursor,
+            peeked_id: None,
+        }
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
+
     /// Pop the next argument if any, and check that it matches `param`.
     pub fn next_arg<F: Flow, R>(
         &mut self,
@@ -145,6 +158,7 @@ impl<'a, 's, 'p> AstArgs<'a, 's, 'p> {
         param: Param,
         f: impl FnOnce(&mut CompileItemContext, &Scope, &mut F, Expression) -> DiagResult<R>,
     ) -> DiagResult<Option<R>> {
+        let peeked_id = self.peeked_id.take();
         let Some(mut arg) = self.cursor.next(ctx, flow)? else {
             return Ok(None);
         };
@@ -153,12 +167,32 @@ impl<'a, 's, 'p> AstArgs<'a, 's, 'p> {
             let &Arg { span, id, value } = arg;
 
             let scope = scope.as_scope();
-            let id = id.map(|id| ctx.eval_id(scope, flow, id)).transpose()?;
+            let id = match peeked_id {
+                Some(id) => id,
+                None => id.map(|id| ctx.eval_id(scope, flow, id)).transpose()?,
+            };
             check_arg_name(ctx.refs, param, span, id)?;
 
             f(ctx, scope, flow, value)
         })
         .map(Some)
+    }
+
+    /// Evaluate the id of the next argument if any, without popping it.
+    pub fn peek_id(
+        &mut self,
+        ctx: &mut CompileItemContext,
+        flow: &mut impl Flow,
+    ) -> DiagResult<Option<Option<Spanned<Id>>>> {
+        if self.peeked_id.is_none() {
+            let Some(mut arg) = self.cursor.peek(ctx, flow)? else {
+                return Ok(None);
+            };
+            let id =
+                arg.with_scope(|scope, arg| arg.id.map(|id| ctx.eval_id(scope.as_scope(), flow, id)).transpose())?;
+            self.peeked_id = Some(id);
+        }
+        Ok(self.peeked_id)
     }
 }
 
@@ -170,7 +204,19 @@ impl CallArgs<'_, '_, '_> {
         }
     }
 
-    /// Pop and evaluate the next argument, and heck that it matches `param` and `ty`.
+    /// Get the id of the next argument if any, without popping it.
+    pub fn peek_id(
+        &mut self,
+        ctx: &mut CompileItemContext,
+        flow: &mut impl Flow,
+    ) -> DiagResult<Option<Option<Spanned<Id>>>> {
+        match self {
+            CallArgs::Ast(args) => args.peek_id(ctx, flow),
+            CallArgs::Evaluated(args) => Ok(args.inner.peek().map(|arg| arg.id)),
+        }
+    }
+
+    /// Pop and evaluate the next argument, and check that it matches `param` and `ty`.
     pub fn next_value(
         &mut self,
         ctx: &mut CompileItemContext,
@@ -270,9 +316,9 @@ fn check_arg_name(refs: CompileRefs, param: Param, span_arg: Span, arg_id: Optio
                 Err(DiagnosticError::new(
                     "argument name does not match the parameter at this position",
                     arg_id.span,
-                    format!("argument `{arg_str}` passed here, expected `{param_str}`"),
+                    format!("argument `{arg_str}` passed here"),
                 )
-                .add_info(param_id.span, "parameter declared here")
+                .add_info(param_id.span, format!("parameter `{param_str}` declared here"))
                 .add_footer_hint("arguments must be passed in parameter order")
                 .report(diags))
             }
@@ -601,14 +647,17 @@ impl CompileItemContext<'_, '_> {
                 Ok((param_id, param_ty))
             })?;
 
-            // eval arg
-            let param_match = Param::PositionalOrNamed(param_id);
-            let arg_value = args.next_value(self, flow, param_match, param_ty.as_ref())?;
+            // check whether the next arg matches this param,
+            //   if not we'll skip this arg and use the default value if any instead
+            let arg_matches = match args.peek_id(self, flow)? {
+                None => false,
+                Some(arg_id) => arg_id.is_none_or(|arg_id| arg_id.inner == param_id.inner),
+            };
 
-            // use arg or fallback to param default
-            let value = match (arg_value, param_default) {
-                (Some(arg_value), _) => arg_value,
-                (None, Some(param_default)) => {
+            // eval arg or fallback to param default,
+            //   if there is no default we still try to eval the arg to get the right error message
+            let value = match (arg_matches, param_default) {
+                (false, Some(param_default)) => {
                     let value = param_leaf.with_scope(|scope, _| {
                         self.eval_expression_with_implications(scope.as_scope(), flow, &param_ty.inner, param_default)
                     })?;
@@ -620,7 +669,10 @@ impl CompileItemContext<'_, '_> {
 
                     value
                 }
-                (None, None) => return Err(error_missing_argument(self.refs, args.span(), param_match)),
+                (true, _) | (false, None) => {
+                    let param_match = Param::PositionalOrNamed(param_id);
+                    args.require_value(self, flow, param_match, param_ty.as_ref())?
+                }
             };
 
             // check compile

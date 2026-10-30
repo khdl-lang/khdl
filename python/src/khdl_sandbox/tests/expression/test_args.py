@@ -25,16 +25,46 @@ def test_args_order():
     assert c.resolve("top.ok_1")() == 145
     assert c.resolve("top.ok_2")() == 145
     assert c.resolve("top.ok_3")() == 145
+    assert c.resolve("top.skip_default")() == 124
 
-    for name in ["skip_default", "out_of_order_default", "out_of_order_missing", "duplicate", "unknown"]:
-        with diag_error(
-            "argument name does not match the parameter at this position", has_info="parameter declared here"
-        ):
-            c.resolve(f"top.{name}")()
+    with diag_error("argument name does not match the parameter at this position", has_info="parameter `a` declared here"):
+        c.resolve("top.out_of_order_missing")()
     with diag_error("missing argument for parameter `a`", has_info="parameter declared here"):
         c.resolve("top.missing")()
-    with diag_error("argument does not match any parameter", has_info="parameters declared here"):
-        c.resolve("top.leftover")()
+    leftover_messages = {
+        "out_of_order_default": "argument `b` passed here",
+        "duplicate": "argument `a` passed here",
+        "unknown": "argument `d` passed here",
+        "leftover": "argument passed here",
+    }
+    for name, message in leftover_messages.items():
+        with diag_error(
+            "argument does not match any parameter", has_message=message, has_info="parameters declared here"
+        ):
+            c.resolve(f"top.{name}")()
+
+
+def test_args_skip_default():
+    src = """
+    fn f(a: int = 1, b: int = a + 1, c: int = 3, d: int) -> int { return a * 1000 + b * 100 + c * 10 + d; }
+    fn skip_first() -> int { return f(b=4, d=5); }
+    fn skip_multiple() -> int { return f(d=5); }
+    fn skip_uses_earlier() -> int { return f(a=2, c=4, d=5); }
+    fn skip_then_positional() -> int { return f(c=4, 5); }
+    fn skip_required() -> int { return f(a=2, c=4); }
+    """
+    c = compile_custom(src)
+
+    assert c.resolve("top.skip_first")() == 1435
+    assert c.resolve("top.skip_multiple")() == 1235
+    assert c.resolve("top.skip_uses_earlier")() == 2345
+    assert c.resolve("top.skip_then_positional")() == 1245
+    with diag_error("missing argument for parameter `d`"):
+        c.resolve("top.skip_required")()
+
+    f = c.resolve("top.f")
+    assert f(c=4, d=5) == 1245
+    assert f(b=4, d=5) == 1435
 
 
 def test_args_order_struct():
@@ -49,7 +79,7 @@ def test_args_order_struct():
     c = compile_custom(src)
 
     c.resolve("top.ok")()
-    with diag_error("argument name does not match the parameter at this position", has_info="parameter declared here"):
+    with diag_error("argument name does not match the parameter at this position", has_info="parameter `x` declared here"):
         c.resolve("top.out_of_order")()
     with diag_error("positional arguments are not allowed for this call target"):
         c.resolve("top.positional")()
@@ -87,6 +117,21 @@ def test_args_positional_only():
         c.resolve("top.int_named")()
     with diag_error("named arguments are not allowed for this call target"):
         c.resolve("top.tuple_named")()
+
+
+def test_args_skip_default_name_evaluated_once():
+    src = """
+    fn name(s: str) -> str {
+        print(s);
+        return s;
+    }
+    fn f(a: int = 1, b: int = 2, c: int = 3) -> int { return a * 100 + b * 10 + c; }
+    fn g() -> int { return f(ident(name("c"))=4); }
+    """
+    c = compile_custom(src)
+    with c.capture_prints() as capture:
+        assert c.resolve("top.g")() == 124
+    assert capture.prints == ["c\n"]
 
 
 def test_args_expected_type_from_param():

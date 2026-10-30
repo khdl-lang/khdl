@@ -892,10 +892,7 @@ impl<'a> CompileItemContext<'a, '_> {
                 let mut args_scope = scope.new_child(span_args);
                 let args_scope = ExtraScope::new(None, &mut args_scope);
                 let args_cursor = ExtraCursor::new(args_scope, items_args, false);
-                let args = CallArgs::Ast(AstArgs {
-                    span: span_args,
-                    cursor: args_cursor,
-                });
+                let args = CallArgs::Ast(AstArgs::new(span_args, args_cursor));
 
                 // eval call
                 let result = self.eval_call(flow, expected_ty, expr.span, target.as_ref(), args)?;

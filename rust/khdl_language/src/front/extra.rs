@@ -99,6 +99,7 @@ pub struct ExtraCursor<'a, 's, 'p, T> {
     common_decl_in_root_scope: bool,
     stack_frames: Vec<Frame<'a, T>>,
     stack_scopes: Vec<Option<ScopeContent>>,
+    peeked: Option<&'a T>,
 }
 
 /// An item returned by [ExtraCursor].
@@ -150,6 +151,7 @@ impl<'a, 's, 'p, T> ExtraCursor<'a, 's, 'p, T> {
             common_decl_in_root_scope,
             stack_frames: vec![frame],
             stack_scopes: vec![],
+            peeked: None,
         }
     }
 
@@ -162,6 +164,23 @@ impl<'a, 's, 'p, T> ExtraCursor<'a, 's, 'p, T> {
         ctx: &mut CompileItemContext,
         flow: &mut impl Flow,
     ) -> DiagResult<Option<ExtraLeaf<'_, 'a, 's, 'p, T>>> {
+        let item = self.peek(ctx, flow)?.map(|leaf| leaf.item);
+        self.peeked = None;
+        Ok(item.map(|item| ExtraLeaf { cursor: self, item }))
+    }
+
+    pub fn peek(
+        &mut self,
+        ctx: &mut CompileItemContext,
+        flow: &mut impl Flow,
+    ) -> DiagResult<Option<ExtraLeaf<'_, 'a, 's, 'p, T>>> {
+        if self.peeked.is_none() {
+            self.peeked = self.advance(ctx, flow)?;
+        }
+        Ok(self.peeked.map(|item| ExtraLeaf { cursor: self, item }))
+    }
+
+    fn advance(&mut self, ctx: &mut CompileItemContext, flow: &mut impl Flow) -> DiagResult<Option<&'a T>> {
         let refs = ctx.refs;
 
         loop {
@@ -186,7 +205,7 @@ impl<'a, 's, 'p, T> ExtraCursor<'a, 's, 'p, T> {
 
                     // leafs are immediately returned, skipping scope construction
                     if let ExtraListItem::Leaf(item) = item {
-                        return Ok(Some(ExtraLeaf { cursor: self, item }));
+                        return Ok(Some(item));
                     }
 
                     // handle item

@@ -192,6 +192,6 @@ pub fn convert_python_args_and_kwargs_to_args(
 
     Ok(EvaluatedArgs {
         span: dummy_span,
-        inner: args_inner.into_iter(),
+        inner: args_inner.into_iter().peekable(),
     })
 }
