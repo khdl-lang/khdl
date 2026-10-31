@@ -27,8 +27,9 @@ use khdl_language::front::value::{
 };
 use khdl_language::mid::ir::{IrDatabase, IrModule, IrPort, IrPortDeclared, IrPortInfo};
 use khdl_language::syntax::collect::{
-    add_source_files_to_tree, add_std_sources, collect_source_files_from_tree, collect_source_from_manifest,
+    CollectionKind, ManifestCollected, add_std_sources, add_tree, collect_from_manifest,
 };
+use khdl_language::syntax::data_inputs::DataInputs;
 use khdl_language::syntax::format::{FormatError, FormatSettings, format_file as rust_format_file};
 use khdl_language::syntax::hierarchy::SourceHierarchy;
 use khdl_language::syntax::manifest::Manifest;
@@ -42,7 +43,7 @@ use khdl_language::util::range::{NonEmptyRange, Range as RustRange, RangeOpen};
 use khdl_language::util::range_multi::{AnyMultiRange, ClosedMultiRange, MultiRange as RustMultiRange};
 use khdl_language::util::{NON_ZERO_USIZE_ONE, get_num_cpus};
 use khdl_util::constants::{DUMMY_FILE_PYTHON, DUMMY_FILE_PYTHON_CONTENT};
-use khdl_util::io::{IoAction, IoErrorExt, IoErrorWithPath};
+use khdl_util::io::{IoAction, IoErrorExt, IoErrorWithPath, read_file_to_string};
 use pyo3::exceptions::{PyAttributeError, PyException, PyIOError, PyIndexError, PyTypeError, PyValueError};
 use pyo3::types::{
     PyAnyMethods, PyDict, PyIterator, PyList, PyModule, PyModuleMethods, PySlice, PySliceIndices, PySliceMethods,
@@ -62,9 +63,9 @@ mod convert;
 
 #[pyclass(module = "khdl")]
 struct Source {
-    data: khdl_language::syntax::data::DataInputs,
     source: RustSourceDatabase,
     hierarchy: SourceHierarchy,
+    data_inputs: DataInputs,
     dummy_span: Span,
 }
 
@@ -344,6 +345,7 @@ impl Source {
     fn new(py: Python) -> PyResult<Self> {
         let mut source = RustSourceDatabase::new();
         let mut hierarchy = SourceHierarchy::new();
+        let data_inputs = DataInputs::new();
 
         // add dummy file so we have a span to point to for errors caused by the python caller
         let dummy_file = source.add_file(DUMMY_FILE_PYTHON.to_owned(), DUMMY_FILE_PYTHON_CONTENT.to_owned());
@@ -355,9 +357,9 @@ impl Source {
         map_diag_error(py, &diags, &source, r)?;
 
         Ok(Source {
-            data: khdl_language::syntax::data::DataInputs::new(),
             source,
             hierarchy,
+            data_inputs,
             dummy_span,
         })
     }
@@ -379,46 +381,26 @@ impl Source {
         // parse manifest
         let manifest = Manifest::parse_toml(&diags, &source, manifest_file);
         let manifest = map_diag_error(py, &diags, &source, manifest)?;
-        let Manifest {
-            source: manifest_source,
-            data: manifest_data,
-        } = manifest;
 
-        // collect hierarchy
-        let hierarchy = collect_source_from_manifest(&diags, &mut source, manifest_parent, &manifest_source);
-        let (hierarchy, _) = map_diag_error(py, &diags, &source, hierarchy)?;
+        // collect
+        let collected = collect_from_manifest(&diags, &mut source, manifest_parent, &manifest, read_file_to_string);
+        let ManifestCollected {
+            hierarchy,
+            data_inputs,
+            source_paths: _,
+            data_paths: _,
+        } = map_diag_error(py, &diags, &source, collected)?;
 
-        let data = khdl_language::syntax::data::collect_data_from_manifest(
-            &diags,
-            &mut source,
-            manifest_parent,
-            &manifest_data,
-            |path| std::fs::read_to_string(path).map_err(|e| e.with_context(IoAction::Read, path).to_string()),
-        );
-        let (data, _) = map_diag_error(py, &diags, &source, data)?;
         let manifest_span = source.full_span(manifest_file);
         Ok(Source {
-            data,
             source,
             hierarchy,
+            data_inputs,
             dummy_span: manifest_span,
         })
     }
 
-    fn add_data_content(&mut self, py: Python, name: &str, debug_info_path: String, content: String) -> PyResult<()> {
-        let diags = Diagnostics::new();
-        let file = self.source.add_file(debug_info_path, content);
-        let result = self.data.add(
-            &diags,
-            &self.source,
-            name.split('.').map(str::to_owned).collect(),
-            file,
-            self.dummy_span,
-        );
-        map_diag_error(py, &diags, &self.source, result)
-    }
-
-    fn add_file_content(
+    fn add_source_content(
         &mut self,
         py: Python,
         steps: Vec<String>,
@@ -434,29 +416,64 @@ impl Source {
         map_diag_error(py, &diags, &self.source, result)
     }
 
-    fn add_tree(&mut self, py: Python, steps: Vec<String>, path: &str) -> PyResult<()> {
+    fn add_data_content(
+        &mut self,
+        py: Python,
+        steps: Vec<String>,
+        debug_info_path: String,
+        content: String,
+    ) -> PyResult<()> {
         let diags = Diagnostics::new();
+        let file = self.source.add_file(debug_info_path, content);
+        let result = self
+            .data_inputs
+            .add_file(&diags, &self.source, self.dummy_span, &steps, file);
+        map_diag_error(py, &diags, &self.source, result)
+    }
 
-        let files = collect_source_files_from_tree(&diags, self.dummy_span, PathBuf::from(path));
-        let files = map_diag_error(py, &diags, &self.source, files)?;
-
-        let result = add_source_files_to_tree(
+    fn add_source_tree(&mut self, py: Python, steps: Vec<String>, path: &str) -> PyResult<()> {
+        let diags = Diagnostics::new();
+        let mut target = CollectionKind::Source(&mut self.hierarchy);
+        let result = add_tree(
             &diags,
             &mut self.source,
-            &mut self.hierarchy,
+            &mut target,
             self.dummy_span,
-            steps,
-            &files,
-            |path| std::fs::read_to_string(path).map_err(|e| e.with_context(IoAction::Read, path).to_string()),
+            &steps,
+            PathBuf::from(path),
+            read_file_to_string,
         );
         map_diag_error(py, &diags, &self.source, result)?;
+        Ok(())
+    }
 
+    fn add_data_tree(&mut self, py: Python, steps: Vec<String>, path: &str) -> PyResult<()> {
+        let diags = Diagnostics::new();
+        let mut target = CollectionKind::Data(&mut self.data_inputs);
+        let result = add_tree(
+            &diags,
+            &mut self.source,
+            &mut target,
+            self.dummy_span,
+            &steps,
+            PathBuf::from(path),
+            read_file_to_string,
+        );
+        map_diag_error(py, &diags, &self.source, result)?;
         Ok(())
     }
 
     #[getter]
-    fn files(&self) -> Vec<String> {
+    fn source_files(&self) -> Vec<String> {
         self.hierarchy
+            .files()
+            .map(|id| self.source[id].debug_info_path.clone())
+            .collect()
+    }
+
+    #[getter]
+    fn data_files(&self) -> Vec<String> {
+        self.data_inputs
             .files()
             .map(|id| self.source[id].debug_info_path.clone())
             .collect()
@@ -491,11 +508,11 @@ impl Parsed {
             let parsed = slf.borrow(py);
             let source = parsed.source.borrow(py);
             let fixed = CompileFixed {
-                data: &source.data,
                 settings: &COMPILE_SETTINGS,
                 source: &source.source,
                 hierarchy: &source.hierarchy,
                 parsed: &parsed.parsed,
+                data_inputs: &source.data_inputs,
             };
 
             // TODO add parameter for queue_all_items, default to true and then set to false for specific tests
@@ -592,17 +609,18 @@ impl Compile {
         let source_ref = parsed_ref.source.borrow(py);
         let source = &source_ref.source;
         let hierarchy = &source_ref.hierarchy;
+        let data_inputs = &source_ref.data_inputs;
         let dummy_span = source_ref.dummy_span;
 
         let diags = Diagnostics::new();
         let print_handler = slf_ref.start_collect_prints();
         let refs = CompileRefs {
             fixed: CompileFixed {
-                data: &source_ref.data,
                 settings: &COMPILE_SETTINGS,
                 source,
                 hierarchy,
                 parsed,
+                data_inputs,
             },
             shared,
             diags: &diags,
@@ -750,11 +768,11 @@ impl Value {
         let diags = Diagnostics::new();
         let refs = CompileRefs {
             fixed: CompileFixed {
-                data: &source_ref.data,
                 settings: &COMPILE_SETTINGS,
                 source,
                 hierarchy,
                 parsed,
+                data_inputs: &source_ref.data_inputs,
             },
             shared,
             diags: &diags,
@@ -814,6 +832,7 @@ impl Value {
         let source_ref = parsed_ref.source.borrow(py);
         let source = &source_ref.source;
         let hierarchy = &source_ref.hierarchy;
+        let data_inputs = &source_ref.data_inputs;
         let dummy_span = source_ref.dummy_span;
 
         // build context
@@ -821,11 +840,11 @@ impl Value {
         let print_handler = compile.start_collect_prints();
         let refs = CompileRefs {
             fixed: CompileFixed {
-                data: &source_ref.data,
                 settings: &COMPILE_SETTINGS,
                 source,
                 hierarchy,
                 parsed,
+                data_inputs,
             },
             shared,
             diags: &diags,
@@ -1743,11 +1762,11 @@ fn set_port_value(instance: &Py<VerilatedInstance>, port: IrPort, value: &Bound<
     let print_handler = compile.start_collect_prints();
     let refs = CompileRefs {
         fixed: CompileFixed {
-            data: &source.data,
             settings: &COMPILE_SETTINGS,
             source: &source.source,
             hierarchy: &source.hierarchy,
             parsed: &parsed.parsed,
+            data_inputs: &source.data_inputs,
         },
         shared: &compile.shared,
         diags: &diags,

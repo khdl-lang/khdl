@@ -3,24 +3,22 @@ use crate::server::state::{RequestError, ServerState};
 use crate::server::vfs::{Vfs, VfsError, VfsResult};
 use crate::util::encode::span_to_lsp;
 use crate::util::sender::SendErrorOr;
-use crate::util::uri::{
-    NormalizeError, abs_path_to_uri, build_watcher_any_file_with_name, path_join_normalized, uri_to_path,
-};
+use crate::util::uri::{abs_path_to_uri, build_watcher_any_file_with_name, path_join_normalized, uri_to_path};
 use indexmap::{IndexMap, IndexSet};
-use itertools::{Itertools, enumerate, zip_eq};
+use itertools::{Itertools, chain, enumerate};
 use khdl_language::front::compile::{CompileFixed, CompileRefs, CompileSettings, CompileShared, QueueItems};
 use khdl_language::front::diagnostic::{
     DiagResult, Diagnostic, DiagnosticContent, DiagnosticLevel, Diagnostics, FooterKind,
 };
 use khdl_language::front::print::IgnorePrintHandler;
-use khdl_language::syntax::collect::{add_source_files_to_tree, add_std_sources, collect_source_files_from_tree};
+use khdl_language::syntax::collect::collect_from_manifest;
+use khdl_language::syntax::data_inputs::DataInputs;
 use khdl_language::syntax::hierarchy::SourceHierarchy;
-use khdl_language::syntax::manifest::{Manifest, SourceEntry};
+use khdl_language::syntax::manifest::Manifest;
 use khdl_language::syntax::parsed::ParsedDatabase;
 use khdl_language::syntax::source::{FileId, SourceDatabase};
-use khdl_language::try_inner;
 use khdl_language::util::NON_ZERO_USIZE_ONE;
-use khdl_util::constants::{KHDL_FILE_EXTENSION, KHDL_LSP_NAME, KHDL_MANIFEST_FILE_NAME};
+use khdl_util::constants::{KHDL_DATA_FILE_EXTENSION, KHDL_FILE_EXTENSION, KHDL_LSP_NAME, KHDL_MANIFEST_FILE_NAME};
 use khdl_util::io::recurse_for_each_file;
 use khdl_util::swrite;
 use lsp_types::{
@@ -51,10 +49,10 @@ struct ManifestCollected {
 }
 
 struct ManifestCollectedInner {
-    data: khdl_language::syntax::data::DataInputs,
     #[allow(dead_code)]
     parsed: Manifest,
     hierarchy: SourceHierarchy,
+    data_inputs: DataInputs,
 }
 
 impl ServerState {
@@ -90,8 +88,7 @@ impl ServerState {
             let parsed = parsed.clone();
 
             let inner = match parsed {
-                Ok(parsed) => collect_manifest_sources(&mut self.vfs, &mut common, parsed)
-                    .map_err(|e| SendErrorOr::Other(RequestError::Vfs(VfsError::FailedNormalization(e))))?,
+                Ok(parsed) => collect_manifest_sources(&mut self.vfs, &mut common, parsed),
                 Err(e) => Err(e),
             };
 
@@ -124,11 +121,11 @@ impl ServerState {
                     do_ir_cleanup: false,
                 };
                 let fixed = CompileFixed {
-                    data: &inner.data,
                     settings: &settings,
                     source,
                     hierarchy,
                     parsed: &parsed,
+                    data_inputs: &inner.data_inputs,
                 };
 
                 let thread_count = self.pool.as_ref().map_or(NON_ZERO_USIZE_ONE, |p| p.thread_count());
@@ -229,51 +226,18 @@ impl ServerState {
             let parsed = Manifest::parse_toml(&diags, &source, manifest_file);
 
             if let Ok(manifest) = &parsed {
-                for entry in manifest.source.entries() {
-                    let SourceEntry {
-                        span_path: _,
-                        steps: _,
-                        path_relative,
-                    } = entry;
-
-                    let entry_path = path_join_normalized(&manifest_folder, Path::new(path_relative))
+                let entries = chain(
+                    manifest.source.entries().iter().map(|e| (e, KHDL_FILE_EXTENSION)),
+                    manifest.data.entries().iter().map(|e| (e, KHDL_DATA_FILE_EXTENSION)),
+                );
+                for (entry, extension) in entries {
+                    let entry_path = path_join_normalized(&manifest_folder, Path::new(&entry.path_relative))
                         .map_err(|e| SendErrorOr::Other(RequestError::Vfs(VfsError::FailedNormalization(e))))?;
 
                     watchers.push(build_watcher_any_file_with_name(
                         abs_path_to_uri(&entry_path).map_err(|e| SendErrorOr::Other(RequestError::Vfs(e)))?,
-                        &format!("*.{KHDL_FILE_EXTENSION}"),
+                        &format!("*.{extension}"),
                     ));
-                }
-                for entry in manifest.data.entries() {
-                    let entry_path = path_join_normalized(&manifest_folder, Path::new(&entry.path_relative))
-                        .map_err(|e| SendErrorOr::Other(RequestError::Vfs(VfsError::FailedNormalization(e))))?;
-                    if entry_path.is_dir() {
-                        watchers.push(build_watcher_any_file_with_name(
-                            abs_path_to_uri(&entry_path).map_err(|e| SendErrorOr::Other(RequestError::Vfs(e)))?,
-                            "*.json",
-                        ));
-                    } else if let (Some(parent), Some(name)) = (entry_path.parent(), entry_path.file_name()) {
-                        let pattern: String = name
-                            .to_string_lossy()
-                            .chars()
-                            .map(|c| {
-                                if "*?[]{}".contains(c) {
-                                    format!("[{c}]")
-                                } else {
-                                    c.to_string()
-                                }
-                            })
-                            .collect();
-                        watchers.push(lsp_types::FileSystemWatcher {
-                            glob_pattern: lsp_types::GlobPattern::Relative(lsp_types::RelativePattern {
-                                base_uri: lsp_types::OneOf::Right(
-                                    abs_path_to_uri(parent).map_err(|e| SendErrorOr::Other(RequestError::Vfs(e)))?,
-                                ),
-                                pattern,
-                            }),
-                            kind: None,
-                        });
-                    }
                 }
             }
 
@@ -338,63 +302,27 @@ fn collect_manifest_sources(
     vfs: &mut Vfs,
     common: &mut ManifestCommon,
     parsed: Manifest,
-) -> Result<DiagResult<ManifestCollectedInner>, NormalizeError> {
-    let diags = &common.diags;
-    let source = &mut common.source;
-    let mut hierarchy = SourceHierarchy::new();
-
-    try_inner!(add_std_sources(diags, source, &mut hierarchy));
-
-    for entry in parsed.source.entries() {
-        let &SourceEntry {
-            span_path,
-            ref steps,
-            ref path_relative,
-        } = entry;
-
-        let entry_path = path_join_normalized(&common.manifest_folder, Path::new(path_relative))?;
-
-        // TODO don't early exit, visit all entries before returning error
-        // TODO insert extra files from Vfs that don't yet exist on disk
-        let files = try_inner!(collect_source_files_from_tree(diags, span_path, entry_path));
-
-        let file_paths = files.iter().map(|(_, p)| p.to_owned()).collect_vec();
-
-        let file_ids = add_source_files_to_tree(
-            diags,
-            source,
-            &mut hierarchy,
-            span_path,
-            steps.clone(),
-            &files,
-            |file_path| match vfs.read_str_maybe_from_disk(file_path) {
-                Ok(s) => Ok(s.to_owned()),
-                Err(e) => Err(format!("{e:?}")),
-            },
-        );
-        let file_ids = try_inner!(file_ids);
-
-        for (file_id, file_path) in zip_eq(file_ids, file_paths) {
-            common.file_to_path.insert(file_id, file_path);
-        }
-    }
-
-    let (data, paths) = try_inner!(khdl_language::syntax::data::collect_data_from_manifest(
-        diags,
-        source,
+) -> DiagResult<ManifestCollectedInner> {
+    // TODO don't early exit, visit all entries before returning error
+    // TODO insert extra files from Vfs that don't yet exist on disk
+    let collected = collect_from_manifest(
+        &common.diags,
+        &mut common.source,
         &common.manifest_folder,
-        &parsed.data,
-        |path| vfs
-            .read_str_maybe_from_disk(path)
-            .map(str::to_owned)
-            .map_err(|e| format!("{e:?}")),
-    ));
-    common.file_to_path.extend(paths);
-    Ok(Ok(ManifestCollectedInner {
-        data,
+        &parsed,
+        |path| match vfs.read_str_maybe_from_disk(path) {
+            Ok(s) => Ok(s.to_owned()),
+            Err(e) => Err(format!("{e:?}")),
+        },
+    )?;
+
+    common.file_to_path.extend(collected.source_paths);
+    common.file_to_path.extend(collected.data_paths);
+    Ok(ManifestCollectedInner {
         parsed,
-        hierarchy,
-    }))
+        hierarchy: collected.hierarchy,
+        data_inputs: collected.data_inputs,
+    })
 }
 
 fn add_grouped_diagnostic_to_lsp(
@@ -533,76 +461,5 @@ fn footer_kind_to_string(kind: FooterKind) -> &'static str {
     match kind {
         FooterKind::Info => "info",
         FooterKind::Hint => "hint",
-    }
-}
-
-#[cfg(test)]
-mod data_tests {
-    use super::*;
-
-    #[test]
-    fn data_collection_uses_editor_overlay_and_reenumerates_trees() {
-        struct Project(PathBuf);
-        impl Drop for Project {
-            fn drop(&mut self) {
-                std::fs::remove_dir_all(&self.0).unwrap();
-            }
-        }
-        let project = Project(std::env::temp_dir().join(
-            format!("khdl-lsp-data-{}-{}",
-            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()),
-        ));
-        std::fs::create_dir_all(project.0.join("data")).unwrap();
-        std::fs::write(project.0.join("top.kh"), "").unwrap();
-        let a = project.0.join("data/a.json");
-        std::fs::write(&a, "1").unwrap();
-        let mut vfs = Vfs::new();
-        vfs.create_or_update(a.clone(), b"2".to_vec());
-
-        let collect = |vfs: &mut Vfs| {
-            let mut source = SourceDatabase::new();
-            let file = source.add_file(
-                "khdl.toml".into(),
-                "[source]\ntop = 'top.kh'\n[data]\ntables = 'data'\n".into(),
-            );
-            let diags = Diagnostics::new();
-            let parsed = Manifest::parse_toml(&diags, &source, file).unwrap();
-            let mut common = ManifestCommon {
-                manifest_folder: project.0.clone(),
-                diags,
-                source,
-                file_to_path: IndexMap::new(),
-            };
-            let collected = collect_manifest_sources(vfs, &mut common, parsed).unwrap().unwrap();
-            assert_eq!(common.diags.len(), 0);
-            assert!(
-                collected
-                    .hierarchy
-                    .files()
-                    .all(|id| !common.source[id].debug_info_path.ends_with(".json"))
-            );
-            (common, collected)
-        };
-        let (first, collected) = collect(&mut vfs);
-        let file = collected.data.find("tables.a").unwrap();
-        assert_eq!(first.source[file].content, "2");
-        assert_eq!(first.file_to_path[&file], a);
-
-        vfs.clear_changed();
-        vfs.create_or_update(a.clone(), b"unsaved invalid JSON".to_vec());
-        std::fs::write(project.0.join("data/b.json"), "4").unwrap();
-        assert!(vfs.any_changed());
-        let (second, collected) = collect(&mut vfs);
-        assert_eq!(
-            second.source[collected.data.find("tables.a").unwrap()].content,
-            "unsaved invalid JSON"
-        );
-        assert!(collected.data.find("tables.b").is_some());
-
-        std::fs::remove_file(&a).unwrap();
-        vfs.delete_if_exists(&a);
-        let (_, collected) = collect(&mut vfs);
-        assert!(collected.data.find("tables.a").is_none());
-        assert!(collected.data.find("tables.b").is_some());
     }
 }

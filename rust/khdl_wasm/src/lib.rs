@@ -11,6 +11,7 @@ use khdl_language::front::value::{CompileValue, SimpleCompileValue};
 use khdl_language::mid::ir::IrModule;
 use khdl_language::syntax::ast;
 use khdl_language::syntax::collect::add_std_sources;
+use khdl_language::syntax::data_inputs::DataInputs;
 use khdl_language::syntax::format::{FormatError, FormatSettings, format_file};
 use khdl_language::syntax::hierarchy::SourceHierarchy;
 use khdl_language::syntax::parsed::{AstRefItem, ParsedDatabase};
@@ -54,44 +55,10 @@ const TIMEOUT: Duration = Duration::from_millis(500);
 
 #[wasm_bindgen]
 pub fn run_all(top_src: String, include_format: bool, include_ir: bool) -> RunAllResult {
-    run_with_data(top_src, include_format, include_ir, Vec::new(), Vec::new())
-}
-
-/// In-memory data inputs; names use the same logical aliases as manifest entries.
-#[wasm_bindgen]
-pub fn run_with_data(
-    top_src: String,
-    include_format: bool,
-    include_ir: bool,
-    names: Vec<String>,
-    contents: Vec<String>,
-) -> RunAllResult {
     let diags = Diagnostics::new();
     let settings = CompileSettings { do_ir_cleanup: true };
     let mut source = SourceDatabase::new();
     let hierarchy_file = build_source(&diags, &mut source, top_src);
-    let mut data = khdl_language::syntax::data::DataInputs::new();
-    if let Ok((_, top_file)) = &hierarchy_file {
-        let span = source.full_span(*top_file);
-        if names.len() != contents.len() {
-            let _ = diags.report_error_simple(
-                "data names and contents must have equal length",
-                span,
-                "invalid data inputs",
-            );
-        } else {
-            for (name, content) in names.into_iter().zip(contents) {
-                let file = source.add_file(format!("{name}.json"), content);
-                let _ = data.add(
-                    &diags,
-                    &source,
-                    name.split('.').map(str::to_owned).collect(),
-                    file,
-                    span,
-                );
-            }
-        }
-    }
 
     // compile
     let print_handler = CollectPrintHandler::new();
@@ -104,11 +71,11 @@ pub fn run_with_data(
         let dummy_span = source.full_span(top_file);
 
         let fixed = CompileFixed {
-            data: &data,
             settings: &settings,
             source: &source,
             hierarchy,
             parsed: &parsed,
+            data_inputs: &DataInputs::new(),
         };
         let shared = CompileShared::new(&diags, fixed, QueueItems::All, NON_ZERO_USIZE_ONE);
         let mut refs = CompileRefs {

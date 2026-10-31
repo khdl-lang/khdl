@@ -6,7 +6,7 @@ import khdl
 def compile_custom(top: str) -> khdl.Compile:
     # TODO compile/elaborate everything by default?
     source = khdl.Source()
-    source.add_file_content(["top"], "python.kh", top)
+    source.add_source_content(["top"], "python.kh", top)
     return source.compile()
 
 
@@ -14,7 +14,7 @@ def compile_custom_files(files: dict[str, str]) -> khdl.Compile:
     """Compile multiple files, keyed by their dotted package path, eg. `{"a.b": "..."}`."""
     source = khdl.Source()
     for path, content in files.items():
-        source.add_file_content(path.split("."), path.replace(".", "/") + ".kh", content)
+        source.add_source_content(path.split("."), path.replace(".", "/") + ".kh", content)
     return source.compile()
 
 

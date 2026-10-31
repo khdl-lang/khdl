@@ -23,7 +23,7 @@ def test_imported_interface_field_indexed_assignment():
     """
 
     source = khdl.Source()
-    source.add_file_content(["types"], "types.kh", types_src)
-    source.add_file_content(["top"], "top.kh", top_src)
+    source.add_source_content(["types"], "types.kh", types_src)
+    source.add_source_content(["top"], "top.kh", top_src)
     top: khdl.Module = source.compile().resolve("top.top")
     assert top is not None

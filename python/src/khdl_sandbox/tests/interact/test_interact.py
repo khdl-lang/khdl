@@ -58,7 +58,9 @@ def test_compile_manifest():
     manifest_path = Path(__file__).parent / "project/khdl.toml"
     s = khdl.Source.new_from_manifest_path(str(manifest_path))
     c = s.compile()
+
     assert isinstance(c.resolve("top.top"), khdl.Module)
+    assert c.resolve("top.data") == [1, 2, 3]
 
 
 def test_format():

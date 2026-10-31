@@ -1,91 +1,150 @@
 use crate::front::diagnostic::{DiagResult, Diagnostics};
+use crate::syntax::data_inputs::DataInputs;
 use crate::syntax::hierarchy::SourceHierarchy;
-use crate::syntax::manifest::{ManifestSource, SourceEntry};
+use crate::syntax::manifest::{FileEntry, Manifest, ManifestFiles};
 use crate::syntax::pos::Span;
 use crate::syntax::source::{FileId, SourceDatabase};
 use indexmap::IndexMap;
-use itertools::{Itertools, chain, zip_eq};
+use itertools::{Itertools, chain};
 use khdl_std::{STD_SOURCE_FILES, StdSourceFile};
-use khdl_util::constants::KHDL_FILE_EXTENSION;
+use khdl_util::constants::{KHDL_DATA_FILE_EXTENSION, KHDL_FILE_EXTENSION};
 use khdl_util::io::{IoAction, IoErrorExt, IoErrorWithPath, recurse_for_each_file};
 use path_clean::PathClean;
 use std::ffi::{OsStr, OsString};
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
-pub fn collect_source_from_manifest(
+pub struct ManifestCollected {
+    pub hierarchy: SourceHierarchy,
+    pub data_inputs: DataInputs,
+    pub source_paths: IndexMap<FileId, PathBuf>,
+    pub data_paths: IndexMap<FileId, PathBuf>,
+}
+
+pub enum CollectionKind<'a> {
+    Source(&'a mut SourceHierarchy),
+    Data(&'a mut DataInputs),
+}
+
+impl CollectionKind<'_> {
+    pub fn extension(&self) -> &'static str {
+        match self {
+            CollectionKind::Source(_) => KHDL_FILE_EXTENSION,
+            CollectionKind::Data(_) => KHDL_DATA_FILE_EXTENSION,
+        }
+    }
+
+    fn add_file(
+        &mut self,
+        diags: &Diagnostics,
+        source: &SourceDatabase,
+        span: Span,
+        steps: &[String],
+        file: FileId,
+    ) -> DiagResult {
+        match self {
+            CollectionKind::Source(hierarchy) => hierarchy.add_file(diags, source, span, steps, file).map(|_| ()),
+            CollectionKind::Data(data_inputs) => data_inputs.add_file(diags, source, span, steps, file),
+        }
+    }
+}
+
+pub type FilesWithSteps = Vec<(Vec<String>, PathBuf)>;
+
+pub fn collect_from_manifest<E: Display>(
     diags: &Diagnostics,
     source: &mut SourceDatabase,
     manifest_path: &Path,
-    manifest: &ManifestSource,
-) -> DiagResult<(SourceHierarchy, IndexMap<FileId, PathBuf>)> {
-    let mut hierarchy = SourceHierarchy::new();
-    let mut file_map = IndexMap::new();
+    manifest: &Manifest,
+    mut read: impl FnMut(&Path) -> Result<String, E>,
+) -> DiagResult<ManifestCollected> {
+    let Manifest {
+        source: manifest_source,
+        data: manifest_data,
+    } = manifest;
 
-    // add std
+    let mut hierarchy = SourceHierarchy::new();
+    let mut data_inputs = DataInputs::new();
+
     add_std_sources(diags, source, &mut hierarchy)?;
 
-    // add manifest entries
+    let source_paths = collect_manifest_files(
+        diags,
+        source,
+        manifest_path,
+        manifest_source,
+        &mut CollectionKind::Source(&mut hierarchy),
+        &mut read,
+    )?;
+    let data_paths = collect_manifest_files(
+        diags,
+        source,
+        manifest_path,
+        manifest_data,
+        &mut CollectionKind::Data(&mut data_inputs),
+        &mut read,
+    )?;
+
+    Ok(ManifestCollected {
+        hierarchy,
+        data_inputs,
+        source_paths,
+        data_paths,
+    })
+}
+
+pub fn collect_manifest_files<E: Display>(
+    diags: &Diagnostics,
+    source: &mut SourceDatabase,
+    manifest_path: &Path,
+    manifest: &ManifestFiles,
+    kind: &mut CollectionKind,
+    mut read: impl FnMut(&Path) -> Result<String, E>,
+) -> DiagResult<IndexMap<FileId, PathBuf>> {
+    let mut file_map = IndexMap::new();
+
     for entry in manifest.entries() {
-        let &SourceEntry {
+        let &FileEntry {
             span_path,
             ref steps,
             ref path_relative,
         } = entry;
         let entry_path = manifest_path.join(path_relative).clean();
 
-        let file_steps_and_paths = collect_source_files_from_tree(diags, span_path, entry_path)?;
-
-        let files = add_source_files_to_tree(
-            diags,
-            source,
-            &mut hierarchy,
-            span_path,
-            steps.clone(),
-            &file_steps_and_paths,
-            |path| std::fs::read_to_string(path).map_err(|e| e.with_context(IoAction::Read, path).to_string()),
-        )?;
-
-        for (file, (_, path)) in zip_eq(files, file_steps_and_paths) {
-            file_map.insert(file, path);
-        }
+        let paths = add_tree(diags, source, kind, span_path, steps, entry_path, &mut read)?;
+        file_map.extend(paths);
     }
 
-    Ok((hierarchy, file_map))
+    Ok(file_map)
 }
 
-pub fn add_source_files_to_tree(
+pub fn add_tree<E: Display>(
     diags: &Diagnostics,
     source: &mut SourceDatabase,
-    hierarchy: &mut SourceHierarchy,
+    kind: &mut CollectionKind,
     span: Span,
-    steps: Vec<String>,
-    files: &Vec<(Vec<String>, PathBuf)>,
-    mut read: impl FnMut(&Path) -> Result<String, String>,
-) -> DiagResult<Vec<FileId>> {
-    let mut file_ids = vec![];
+    steps: &[String],
+    entry_path: PathBuf,
+    mut read: impl FnMut(&Path) -> Result<String, E>,
+) -> DiagResult<IndexMap<FileId, PathBuf>> {
+    let files = collect_files_from_tree(diags, span, entry_path, kind.extension())?;
+
+    let mut file_map = IndexMap::new();
 
     // TODO maybe allow storing errors for non-UTF8 files into source?
     for (relative_steps, path) in files {
-        let mut all_steps = steps.clone();
-        all_steps.extend(relative_steps.iter().cloned());
+        let all_steps = chain(steps, &relative_steps).cloned().collect_vec();
 
-        let content = read(path).map_err(|e| diags.report_error_simple(e, span, "while reading files here"))?;
+        let content =
+            read(&path).map_err(|e| diags.report_error_simple(e.to_string(), span, "while reading files here"))?;
 
         let file = source.add_file(path.to_string_lossy().into_owned(), content);
-        hierarchy.add_file(diags, source, span, &all_steps, file)?;
+        kind.add_file(diags, source, span, &all_steps, file)?;
 
-        file_ids.push(file);
+        file_map.insert(file, path);
     }
 
-    Ok(file_ids)
-}
-
-pub fn collect_source_files_from_tree(
-    diags: &Diagnostics,
-    span: Span,
-    entry_path: PathBuf,
-) -> DiagResult<Vec<(Vec<String>, PathBuf)>> {
-    collect_files_from_tree(diags, span, entry_path, KHDL_FILE_EXTENSION)
+    Ok(file_map)
 }
 
 pub fn collect_files_from_tree(
@@ -93,7 +152,7 @@ pub fn collect_files_from_tree(
     span: Span,
     entry_path: PathBuf,
     extension: &str,
-) -> DiagResult<Vec<(Vec<String>, PathBuf)>> {
+) -> DiagResult<FilesWithSteps> {
     let report_error = |m: String| diags.report_error_simple(m, span, "while collecting files here");
 
     let meta = std::fs::metadata(&entry_path)
@@ -145,7 +204,10 @@ pub fn collect_files_from_tree(
     .map_err(|e: IoErrorWithPath| report_error(e.to_string()))?;
 
     step_err?;
+
+    // sort by steps to keep order platform independant
     files.sort_by(|a, b| a.0.cmp(&b.0));
+
     Ok(files)
 }
 

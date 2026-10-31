@@ -3,6 +3,7 @@
 use khdl_language::front::compile::{CompileFixed, CompileRefs, CompileSettings, CompileShared, QueueItems};
 use khdl_language::front::diagnostic::Diagnostics;
 use khdl_language::front::print::IgnorePrintHandler;
+use khdl_language::syntax::data_inputs::DataInputs;
 use khdl_language::syntax::hierarchy::SourceHierarchy;
 use khdl_language::syntax::parsed::ParsedDatabase;
 use khdl_language::syntax::source::SourceDatabase;
@@ -27,13 +28,12 @@ fn target(data: String) {
     let parsed = ParsedDatabase::new(&diags, &source, &hierarchy);
 
     let settings = CompileSettings { do_ir_cleanup: true };
-    let data = khdl_language::syntax::data::DataInputs::new();
     let fixed = CompileFixed {
-        data: &data,
         settings: &settings,
         source: &source,
         hierarchy: &hierarchy,
         parsed: &parsed,
+        data_inputs: &DataInputs::new(),
     };
 
     let shared = CompileShared::new(&diags, fixed, QueueItems::All, NON_ZERO_USIZE_ONE);

@@ -10,6 +10,7 @@ macro_rules! khdl_manifest_file_name_macro {
 pub const KHDL_LANGUAGE_NAME: &str = "KHDL";
 pub const KHDL_BINARY_NAME: &str = "khdl";
 pub const KHDL_FILE_EXTENSION: &str = "kh";
+pub const KHDL_DATA_FILE_EXTENSION: &str = "json";
 pub const KHDL_MANIFEST_FILE_NAME: &str = khdl_manifest_file_name_macro!();
 pub const KHDL_LSP_NAME: &str = "KHDL-LSP";
 pub const KHDL_VERSION: &str = env!("CARGO_PKG_VERSION");

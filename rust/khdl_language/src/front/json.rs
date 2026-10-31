@@ -1,281 +1,354 @@
-//! Pure, typed JSON conversion. Inputs are collected before elaboration; this module does no IO.
-use crate::front::compile::{CompileItemContext, CompileRefs, ImportValue, StackEntry};
-use crate::front::diagnostic::{DiagResult, DiagnosticError};
+use crate::front::compile::{CompileItemContext, CompileRefs, ImportValue};
+use crate::front::diagnostic::{DiagError, DiagResult, DiagnosticError, Diagnostics};
 use crate::front::function::{FunctionBody, FunctionValue};
 use crate::front::item::{ElaboratedEnum, ElaboratedStruct, FunctionItemBody, UniqueDeclaration};
-use crate::front::types::{Type, Typed};
+use crate::front::types::Type;
 use crate::front::value::{CompileCompoundValue, CompileValue, EnumValue, SimpleCompileValue, StructValue};
 use crate::syntax::pos::{Span, Spanned};
 use crate::syntax::source::FileId;
-use crate::syntax::token::str_is_valid_identifier;
 use crate::util::big_int::{BigInt, BigUint};
+use crate::util::iter::IterExt;
+use crate::util::range_multi::{AnyMultiRange, MultiRange};
+use itertools::{Itertools, zip_eq};
 use json_syntax::{JsonCodeMap, JsonParse, JsonValue};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 struct Schema {
-    name: String,
-    // Only declaration spans are reusable across cached calls; primitive root targets have none.
-    span: Option<Span>,
+    ty: Spanned<Type>,
     kind: SchemaKind,
 }
 
 enum SchemaKind {
     Bool,
     String,
-    Int(Type),
+    Int(MultiRange<BigInt>),
     Array(Box<Schema>, Option<BigUint>),
     Tuple(Vec<Schema>),
-    Struct(ElaboratedStruct, Vec<(String, Schema)>),
-    Enum(ElaboratedEnum, Vec<(String, Option<Schema>)>),
+    Struct(ElaboratedStruct, Vec<Schema>),
+    Enum(ElaboratedEnum, Vec<Option<Schema>>),
     Option(ElaboratedEnum, usize, usize, Box<Schema>),
 }
 
+#[derive(Copy, Clone)]
+struct SchemaCtx<'a, 's> {
+    refs: CompileRefs<'a, 's>,
+    span_caller: Span,
+    option: UniqueDeclaration,
+}
+
 impl Schema {
-    fn prepare(
-        refs: CompileRefs,
-        ty: &Type,
-        option: UniqueDeclaration,
-        mut span: Option<Span>,
-        caller: Span,
-    ) -> Result<Self, DiagnosticError> {
-        let name = ty.value_string(refs);
-        let arenas = &refs.shared.elaboration_arenas;
+    fn from_ty(ctx: SchemaCtx, span_ty: Span, ty: &Type) -> Result<Self, DiagError> {
+        let refs = ctx.refs;
+        let diags = refs.diags;
+        let elab = &refs.shared.elaboration_arenas;
+
         let kind = match ty {
             Type::Bool => SchemaKind::Bool,
             Type::String => SchemaKind::String,
-            Type::Int(_) => SchemaKind::Int(ty.clone()),
-            Type::Array(inner, len) => {
-                SchemaKind::Array(Box::new(Self::prepare(refs, inner, option, span, caller)?), len.clone())
-            }
+            Type::Int(range) => SchemaKind::Int(range.clone()),
+            Type::Array(inner, len) => SchemaKind::Array(Box::new(Schema::from_ty(ctx, span_ty, inner)?), len.clone()),
             Type::Tuple(Some(types)) => SchemaKind::Tuple(
                 types
                     .iter()
-                    .map(|t| Self::prepare(refs, t, option, span, caller))
-                    .collect::<Result<_, _>>()?,
+                    .map(|t| Schema::from_ty(ctx, span_ty, t))
+                    .try_collect_all_vec()?,
             ),
-            &Type::Struct(elab) => {
-                let info = arenas.struct_info(elab);
-                span.get_or_insert(info.span_body);
+            &Type::Struct(elab_struct) => {
+                let info = elab.struct_info(elab_struct);
                 let fields = info
                     .fields
-                    .iter()
-                    .map(|(id, (_, ty))| {
-                        Ok((
-                            id.str(&refs.shared.interner).to_owned(),
-                            Self::prepare(refs, &ty.inner, option, Some(ty.span), caller)?,
-                        ))
-                    })
-                    .collect::<Result<_, DiagnosticError>>()?;
-                SchemaKind::Struct(elab, fields)
+                    .values()
+                    .map(|(_, ty)| Schema::from_ty(ctx, ty.span, &ty.inner))
+                    .try_collect_all_vec()?;
+                SchemaKind::Struct(elab_struct, fields)
             }
-            &Type::Enum(elab) => {
-                let info = arenas.enum_info(elab);
-                span.get_or_insert(info.span_body);
-                if info.unique == option {
-                    let none = info
+            &Type::Enum(elab_enum) => {
+                let info = elab.enum_info(elab_enum);
+
+                if info.unique == ctx.option {
+                    let index_none = info
                         .variants
                         .keys()
                         .position(|id| id.str(&refs.shared.interner) == "None")
                         .unwrap();
-                    let some = info
+                    let index_some = info
                         .variants
                         .keys()
                         .position(|id| id.str(&refs.shared.interner) == "Some")
                         .unwrap();
-                    let payload = info.variants.get_index(some).unwrap().1.payload_ty.as_ref().unwrap();
-                    let inner = Self::prepare(refs, &payload.inner, option, Some(payload.span), caller)?;
-                    if inner.accepts_json_null() {
-                        return Err(DiagnosticError::new(
-                            "ambiguous JSON option schema",
-                            caller,
-                            "an option payload must not itself accept JSON null",
+
+                    let payload_ty = info
+                        .variants
+                        .get_index(index_some)
+                        .unwrap()
+                        .1
+                        .payload_ty
+                        .as_ref()
+                        .unwrap();
+
+                    let payload_schema = Schema::from_ty(ctx, payload_ty.span, &payload_ty.inner)?;
+                    if payload_schema.accepts_null() {
+                        let ty_str = ty.value_string(refs);
+                        let payload_ty_str = payload_ty.inner.value_string(refs);
+                        let e = DiagnosticError::new(
+                            "JSON: ambiguous option type",
+                            ctx.span_caller,
+                            "during json loading here",
                         )
-                        .add_info(span.unwrap_or(caller), "option schema defined here")
-                        .add_info(
-                            inner.span.unwrap_or(caller),
-                            "null cannot distinguish None from Some(None)",
-                        ));
+                        .add_info(span_ty, format!("type set to `{ty_str}`"))
+                        .add_info(payload_ty.span, format!("payload type set to `{payload_ty_str}`"))
+                        .add_footer_info("json `null` is ambiguous between `None` and `Some(None)`")
+                        .report(diags);
+                        return Err(e);
                     }
-                    SchemaKind::Option(elab, none, some, Box::new(inner))
+                    SchemaKind::Option(elab_enum, index_none, index_some, Box::new(payload_schema))
                 } else {
                     let variants = info
                         .variants
-                        .iter()
-                        .map(|(id, v)| {
-                            Ok((
-                                id.str(&refs.shared.interner).to_owned(),
-                                v.payload_ty
-                                    .as_ref()
-                                    .map(|ty| Self::prepare(refs, &ty.inner, option, Some(ty.span), caller))
-                                    .transpose()?,
-                            ))
+                        .values()
+                        .map(|v| {
+                            v.payload_ty
+                                .as_ref()
+                                .map(|payload_ty| Schema::from_ty(ctx, payload_ty.span, &payload_ty.inner))
+                                .transpose()
                         })
-                        .collect::<Result<_, DiagnosticError>>()?;
-                    SchemaKind::Enum(elab, variants)
+                        .try_collect_all_vec()?;
+                    SchemaKind::Enum(elab_enum, variants)
                 }
             }
             _ => {
-                return Err(DiagnosticError::new(
-                    "unsupported JSON destination type",
-                    caller,
-                    format!("JSON conversion to `{name}` is not supported yet"),
+                let ty_str = ty.value_string(refs);
+                let e = DiagnosticError::new(
+                    format!("JSON: unsupported destination type `{ty_str}`"),
+                    ctx.span_caller,
+                    "JSON conversion here",
                 )
-                .add_info(span.unwrap_or(caller), "unsupported schema member defined here"));
+                .add_info(span_ty, "type set here")
+                .report(diags);
+                return Err(e);
             }
         };
-        Ok(Self { name, span, kind })
+        Ok(Schema {
+            ty: Spanned::new(span_ty, ty.clone()),
+            kind,
+        })
     }
 
-    fn annotate(&self, error: DiagnosticError) -> DiagnosticError {
-        let expected = format!("expected `{}`", self.name);
-        match self.span {
-            Some(span) => error.add_info(span, expected),
-            None => error.add_footer_info(expected),
-        }
-    }
-
-    fn accepts_json_null(&self) -> bool {
-        // Extend this predicate when arbitrary `any` conversion gains a null representation.
+    fn accepts_null(&self) -> bool {
+        // Extend this predicate when we implement arbitrary `any` conversion, which is also ambiguous.
         matches!(self.kind, SchemaKind::Option(..))
     }
 
     fn decode(
         &self,
-        value: &JsonValue,
-        offset: usize,
+        refs: CompileRefs,
+        span_caller: Span,
         doc: &Document,
         path: &str,
-    ) -> Result<CompileValue, DiagnosticError> {
-        let span = doc.span(offset);
-        let error = |message: String| {
-            let error = DiagnosticError::new(
-                "JSON value does not match destination type",
-                span,
-                format!("{path}: {message}"),
-            );
-            self.annotate(error)
+        offset: usize,
+        value: &JsonValue,
+    ) -> Result<CompileValue, DiagError> {
+        let diags = refs.diags;
+        let elab = &refs.shared.elaboration_arenas;
+        let interner = &refs.shared.interner;
+
+        let value_span = doc.span(offset);
+
+        let error = |title: &str| {
+            let title = format!("JSON: {title}");
+            DiagnosticError::new(title, value_span, "here")
+                .add_info(
+                    self.ty.span,
+                    format!("type `{}` set here", self.ty.inner.value_string(refs)),
+                )
+                .add_info(span_caller, "during json loading here")
+                .add_footer_info(format!("while parsing `{path}`"))
         };
-        let compound = |v| CompileValue::Compound(v);
+
+        let decode_int = |range: &MultiRange<BigInt>, text: &str| {
+            let (negative, magnitude) = match text.strip_prefix('-') {
+                None => (false, text),
+                Some(magnitude) => (true, magnitude),
+            };
+            let magnitude =
+                BigUint::from_str_radix(magnitude, 10).map_err(|_| error("invalid integer literal").report(diags))?;
+            let value = if negative { -magnitude } else { magnitude.into() };
+
+            if !range.contains(&value) {
+                return Err(error("integer value out of range").report(diags));
+            }
+            Ok(CompileValue::new_int(value))
+        };
+
         match (&self.kind, value) {
-            (SchemaKind::Option(ty, none, some, inner), _) => {
-                let (variant, payload) = if matches!(value, JsonValue::Null) {
-                    (*none, None)
-                } else {
-                    (*some, Some(Box::new(inner.decode(value, offset, doc, path)?)))
-                };
-                Ok(compound(CompileCompoundValue::Enum(EnumValue {
-                    ty: *ty,
-                    variant,
-                    payload,
-                })))
+            // trivial cases
+            (SchemaKind::Bool, &JsonValue::Boolean(v)) => Ok(CompileValue::new_bool(v)),
+            (SchemaKind::String, JsonValue::String(v)) => Ok(CompileValue::Compound(CompileCompoundValue::String(
+                Arc::new(v.to_string()),
+            ))),
+
+            // int: accept both number and string
+            (SchemaKind::Int(range), JsonValue::Number(_)) => {
+                // re-parse to preserve full precision
+                let text = &doc.content[value_span.start_byte..value_span.end_byte];
+                decode_int(range, text)
             }
-            (SchemaKind::Bool, JsonValue::Boolean(v)) => Ok(CompileValue::new_bool(*v)),
-            (SchemaKind::String, JsonValue::String(v)) => {
-                Ok(compound(CompileCompoundValue::String(Arc::new(v.to_string()))))
+            (SchemaKind::Int(range), JsonValue::String(s)) => {
+                // also accept string to help languages that cannot write full-precision json numbers
+                decode_int(range, s.as_str())
             }
-            (SchemaKind::Int(ty), JsonValue::Number(_)) => {
-                let text = &doc.text[span.start_byte..span.end_byte];
-                if text.contains(['.', 'e', 'E']) {
-                    return Err(error("fractional and exponent notation are not supported".into()));
-                }
-                let magnitude = BigUint::from_str_radix(text.trim_start_matches('-'), 10)
-                    .map_err(|_| error("invalid integer".into()))?;
-                let integer = BigInt::from(magnitude);
-                let v = CompileValue::new_int(if text.starts_with('-') { -integer } else { integer });
-                if !ty.contains_type(&v.ty()) {
-                    return Err(error("integer is outside the destination range".into()));
-                }
-                Ok(v)
-            }
+
+            // compound values
             (SchemaKind::Array(inner, length), JsonValue::Array(values)) => {
-                if length.as_ref().is_some_and(|n| n != &BigUint::from(values.len())) {
-                    return Err(error(format!("wrong array length: got {}", values.len())));
+                if let Some(length) = length
+                    && length != &BigUint::from(values.len())
+                {
+                    let title = format!("array length mismatch: expected {length}, got {}", values.len());
+                    return Err(error(&title).report(diags));
                 }
+
                 let mut child = offset + 1;
                 let mut result = Vec::with_capacity(values.len());
                 for (i, v) in values.iter().enumerate() {
-                    result.push(inner.decode(v, child, doc, &format!("{path}[{i}]"))?);
+                    let child_path = format!("{path}[{i}]");
+                    result.push(inner.decode(refs, span_caller, doc, &child_path, child, v)?);
                     child += doc.map[child].volume;
                 }
+
                 Ok(CompileValue::Simple(SimpleCompileValue::Array(Arc::new(result))))
             }
             (SchemaKind::Tuple(types), JsonValue::Array(values)) => {
                 if types.len() != values.len() {
-                    return Err(error(format!("wrong tuple length: got {}", values.len())));
+                    return Err(error("tuple length mismatch").report(diags));
                 }
+
                 let mut child = offset + 1;
                 let mut result = Vec::with_capacity(values.len());
                 for (i, (schema, v)) in types.iter().zip(values.iter()).enumerate() {
-                    result.push(schema.decode(v, child, doc, &format!("{path}[{i}]"))?);
+                    let child_path = format!("{path}[{i}]");
+                    result.push(schema.decode(refs, span_caller, doc, &child_path, child, v)?);
                     child += doc.map[child].volume;
                 }
-                Ok(compound(CompileCompoundValue::Tuple(result)))
+
+                Ok(CompileValue::Compound(CompileCompoundValue::Tuple(result)))
             }
-            (SchemaKind::Struct(ty, fields), JsonValue::Object(object)) => {
-                let mut entries = object_entries(object, offset, doc);
-                for (name, (_, _, key_span)) in &entries {
-                    if !fields.iter().any(|(field, _)| field == name) {
-                        return Err(self.annotate(DiagnosticError::new(
-                            "unknown JSON field",
-                            *key_span,
-                            format!("{path}: unexpected field `{name}`"),
-                        )));
-                    }
-                }
+            (&SchemaKind::Struct(ty, ref fields), JsonValue::Object(object)) => {
+                let info = elab.struct_info(ty);
+
+                let mut entries = object_entries(diags, object, offset, doc)?;
                 let mut result = Vec::with_capacity(fields.len());
-                for (name, schema) in fields {
-                    // Future language-defined field defaults belong at this missing-field boundary.
-                    let (v, child, _) = entries
-                        .shift_remove(name.as_str())
-                        .ok_or_else(|| error(format!("missing field `{name}`")))?;
-                    result.push(schema.decode(v, child, doc, &format!("{path}[{name:?}]"))?);
+                for ((_, (field_id, _)), field_schema) in zip_eq(&info.fields, fields) {
+                    let field_id_str = field_id.inner.str(interner);
+                    let (field_value, child, _) = entries.shift_remove(field_id_str).ok_or_else(|| {
+                        // TODO fallback to default field value once those exist?
+                        error(&format!("missing struct field `{field_id_str}`"))
+                            .add_info(field_id.span, "struct field declared here")
+                            .report(diags)
+                    })?;
+
+                    let child_path = format!("{path}[{field_id_str:?}]");
+                    let field_value = field_schema.decode(refs, span_caller, doc, &child_path, child, field_value)?;
+
+                    result.push(field_value);
                 }
-                Ok(compound(CompileCompoundValue::Struct(StructValue {
-                    ty: *ty,
-                    fields: result,
-                })))
+
+                if !entries.is_empty() {
+                    let fields = if entries.len() > 1 { "fields" } else { "field" };
+                    let ids = entries.keys().map(|k| format!("`{k}`")).join(", ");
+                    let e = error(&format!("leftover struct {fields}: {ids}"))
+                        .add_info(info.span_body, "struct fields declared here")
+                        .report(diags);
+                    return Err(e);
+                }
+
+                let result = StructValue { ty, fields: result };
+                Ok(CompileValue::Compound(CompileCompoundValue::Struct(result)))
             }
-            (SchemaKind::Enum(ty, variants), _) => {
-                let (name, payload, tag_span) = match value {
-                    JsonValue::String(name) => (name.as_str(), None, span),
+            (&SchemaKind::Enum(ty, ref variant_schemas), _) => {
+                let info = elab.enum_info(ty);
+
+                let (variant_str, payload_value, tag_span) = match value {
+                    JsonValue::String(name) => (name.as_str(), None, value_span),
                     JsonValue::Object(object) if object.len() == 1 => {
-                        let entries = object_entries(object, offset, doc);
+                        let entries = object_entries(diags, object, offset, doc)?;
                         let (name, (value, child, key)) = entries.into_iter().next().unwrap();
                         (name, Some((value, child)), key)
                     }
-                    _ => return Err(error("expected a variant name or single-entry tagged object".into())),
-                };
-                let variant = variants.iter().position(|(n, _)| n == name).ok_or_else(|| {
-                    self.annotate(DiagnosticError::new(
-                        "unknown JSON enum variant",
-                        tag_span,
-                        format!("{path}: unknown variant `{name}`"),
-                    ))
-                })?;
-                let payload = match (&variants[variant].1, payload) {
-                    (None, None) => None,
-                    (Some(schema), Some((v, child))) => {
-                        Some(Box::new(schema.decode(v, child, doc, &format!("{path}[{name:?}]"))?))
+                    _ => {
+                        let e = error("failed to parse as enum")
+                            .add_footer_info("enums should be encoded as  `\"variant\"` or `{ \"variant\": payload }`")
+                            .report(diags);
+                        return Err(e);
                     }
-                    _ => return Err(error("variant payload does not match its declaration".into())),
                 };
-                Ok(compound(CompileCompoundValue::Enum(EnumValue {
-                    ty: *ty,
+
+                let variant_id = interner.push(variant_str);
+                let (variant_index, _, variant_info) = info.variants.get_full(&variant_id).ok_or_else(|| {
+                    error(&format!("unknown enum variant `{variant_str}`"))
+                        .add_info(tag_span, "variant set here")
+                        .add_info(info.span_body, "enum variants declared here")
+                        .report(diags)
+                })?;
+
+                let payload = match (&variant_schemas[variant_index], payload_value) {
+                    (None, None) => None,
+                    (Some(payload_schema), Some((v, child))) => {
+                        let child_path = format!("{path}[{variant_str:?}]");
+                        let payload_value = payload_schema.decode(refs, span_caller, doc, &child_path, child, v)?;
+                        Some(Box::new(payload_value))
+                    }
+                    _ => {
+                        let (decl_span, with) = match &variant_info.payload_ty {
+                            Some(payload_ty) => (payload_ty.span, "with"),
+                            None => (variant_info.id.span, "without"),
+                        };
+                        let e = error("enum payload mismatch")
+                            .add_info(decl_span, format!("variant declared {with} payload here"))
+                            .report(diags);
+                        return Err(e);
+                    }
+                };
+
+                let result = EnumValue {
+                    ty,
+                    variant: variant_index,
+                    payload,
+                };
+                Ok(CompileValue::Compound(CompileCompoundValue::Enum(result)))
+            }
+
+            // option special case
+            (&SchemaKind::Option(elab, none, some, ref inner), _) => {
+                let (variant, payload) = match value {
+                    JsonValue::Null => (none, None),
+                    _ => {
+                        let inner = inner.decode(refs, span_caller, doc, path, offset, value)?;
+                        (some, Some(Box::new(inner)))
+                    }
+                };
+                let result = EnumValue {
+                    ty: elab,
                     variant,
                     payload,
-                })))
+                };
+                Ok(CompileValue::Compound(CompileCompoundValue::Enum(result)))
             }
-            _ => Err(error("wrong JSON value kind".into())),
+
+            // mismatch
+            _ => {
+                let value_kind = value.kind();
+                Err(error(&format!("type mismatch, got value kind {value_kind}")).report(diags))
+            }
         }
     }
 }
 
 struct Document<'a> {
     file: FileId,
-    text: &'a str,
+    content: &'a str,
     map: JsonCodeMap,
 }
+
 impl Document<'_> {
     fn span(&self, offset: usize) -> Span {
         let span = self.map[offset].span;
@@ -284,167 +357,89 @@ impl Document<'_> {
 }
 
 fn object_entries<'a>(
+    diags: &Diagnostics,
     object: &'a json_syntax::JsonObject,
     offset: usize,
     doc: &Document,
-) -> indexmap::IndexMap<&'a str, (&'a JsonValue, usize, Span)> {
+) -> Result<indexmap::IndexMap<&'a str, (&'a JsonValue, usize, Span)>, DiagError> {
     let mut entries = indexmap::IndexMap::new();
     let mut child = offset + 1;
     for (name, value) in object.entries() {
-        entries.insert(name.as_str(), (value, child + 2, doc.span(child + 1)));
+        let span = doc.span(child + 1);
+        if let Some(&(_, _, previous)) = entries.get(name.as_str()) {
+            let e = DiagnosticError::new(
+                "JSON: duplicate object field",
+                span,
+                format!("duplicate field `{name}`"),
+            )
+            .add_info(previous, "first occurrence here")
+            .report(diags);
+            return Err(e);
+        }
+        entries.insert(name.as_str(), (value, child + 2, span));
         child += doc.map[child].volume;
     }
-    entries
-}
-
-// Check the complete document, including payloads whose schema conversion may fail earlier.
-fn check_duplicates(value: &JsonValue, offset: usize, doc: &Document) -> Result<(), DiagnosticError> {
-    let mut child = offset + 1;
-    match value {
-        JsonValue::Object(object) => {
-            let mut seen = HashMap::new();
-            for (name, value) in object.entries() {
-                let span = doc.span(child + 1);
-                if let Some(previous) = seen.insert(name.as_str(), span) {
-                    return Err(DiagnosticError::new(
-                        "duplicate JSON field",
-                        span,
-                        format!("duplicate field `{name}`"),
-                    )
-                    .add_info(previous, "first occurrence here"));
-                }
-                check_duplicates(value, child + 2, doc)?;
-                child += doc.map[child].volume;
-            }
-        }
-        JsonValue::Array(values) => {
-            for value in values.iter() {
-                check_duplicates(value, child, doc)?;
-                child += doc.map[child].volume;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
+    Ok(entries)
 }
 
 impl CompileItemContext<'_, '_> {
-    pub fn load_json(
-        &mut self,
-        name: Spanned<&str>,
-        ty: Spanned<Type>,
-        builtin_span: Span,
-    ) -> DiagResult<CompileValue> {
+    pub fn load_json(&mut self, path: Spanned<&str>, ty: Spanned<Type>, span: Span) -> DiagResult<CompileValue> {
         let refs = self.refs;
-        let caller = self
-            .call_stack
-            .iter()
-            .rev()
-            .find_map(|entry| match entry {
-                StackEntry::FunctionCall(span) => Some(*span),
-                _ => None,
-            })
-            .unwrap_or(builtin_span);
-        let report = |error: DiagnosticError| error.add_info(caller, "JSON loaded here").report(refs.diags);
-        refs.check_should_stop(caller)?;
-        if name.inner.split('.').any(|s| !str_is_valid_identifier(s)) {
-            return Err(report(DiagnosticError::new(
-                "invalid data alias",
-                caller,
-                "expected a dot-separated path of identifiers, not a filesystem path",
-            )));
-        }
-        let file = refs.fixed.data.find(name.inner).ok_or_else(|| {
-            report(DiagnosticError::new(
-                format!("unknown data alias `{}`", name.inner),
-                caller,
-                "data inputs must be declared in the manifest",
-            ))
-        })?;
-        let item = match refs.resolve_path(Spanned::new(builtin_span, "std.types.Option"), false)? {
+        let diags = refs.diags;
+
+        // find std option type
+        let item = match refs.resolve_path(Spanned::new(span, "std.types.Option"), false)? {
             ImportValue::Item(item) => item,
-            _ => unreachable!(),
+            _ => return Err(diags.report_error_internal(span, "failed to find option")),
         };
         let option = match refs.eval_item(item)? {
             CompileValue::Simple(SimpleCompileValue::Function(FunctionValue::User(function))) => {
                 match &function.body.inner {
-                    FunctionBody::ItemBody(FunctionItemBody::Enum(unique, _)) => *unique,
-                    _ => unreachable!(),
+                    &FunctionBody::ItemBody(FunctionItemBody::Enum(unique, _)) => unique,
+                    _ => return Err(diags.report_error_internal(span, "unexpected option kind")),
                 }
             }
-            _ => unreachable!(),
+            _ => return Err(diags.report_error_internal(span, "unexpected option kind")),
         };
-        // Prepare before OnceLock initialization: no user elaboration occurs inside the cache computation.
-        let schema = Schema::prepare(refs, &ty.inner, option, None, caller).map_err(report)?;
-        let result = refs
-            .shared
-            .elaboration_arenas
-            .json_values
-            .get_or_compute((file, ty.inner), |_| {
-                let text = &refs.fixed.source[file].content;
-                let (value, map) = JsonValue::parse_str(text).map_err(|error| {
-                    let range = error.span();
-                    let end = if range.start == range.end {
-                        text[range.start..]
-                            .chars()
-                            .next()
-                            .map_or(range.end, |c| range.start + c.len_utf8())
-                    } else {
-                        range.end
-                    };
-                    DiagnosticError::new("invalid JSON", file.span(range.start..end), error.to_string())
-                })?;
-                let doc = Document { file, text, map };
-                check_duplicates(&value, 0, &doc)?;
-                schema.decode(&value, 0, &doc, "$")
-            });
-        result.clone().map_err(report)
-    }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::front::diagnostic::Diagnostics;
-    use crate::syntax::source::SourceDatabase;
-    use crate::util::range_multi::MultiRange;
+        // prepare schema
+        let schema_ctx = SchemaCtx {
+            refs,
+            span_caller: span,
+            option,
+        };
+        let schema = Schema::from_ty(schema_ctx, ty.span, &ty.inner)?;
 
-    #[test]
-    fn duplicate_keys_keep_both_original_byte_ranges() {
-        let text = " {\"é\":1,\"\\u00e9\":2}";
-        let mut source = SourceDatabase::new();
-        let file = source.add_file("input.json".into(), text.into());
-        let (value, map) = JsonValue::parse_str(text).unwrap();
-        let doc = Document { file, text, map };
-        let diags = Diagnostics::new();
-        let _ = check_duplicates(&value, 0, &doc).unwrap_err().report(&diags);
-        let diagnostics = diags.finish();
-        let content = &diagnostics[0].content;
-        assert_eq!(
-            source.span_str(content.messages.iter().next().unwrap().0),
-            "\"\\u00e9\""
-        );
-        assert_eq!(source.span_str(content.infos[0].0), "\"é\"");
-    }
+        // find data
+        let file = refs.fixed.data_inputs.find(path.inner).ok_or_else(|| {
+            DiagnosticError::new(
+                format!("could not find data path `{}`", path.inner),
+                span,
+                "during json loading here",
+            )
+            .add_footer_info("data inputs must be declared in the manifest")
+            .report(diags)
+        })?;
+        let content = &refs.fixed.source[file].content;
 
-    #[test]
-    fn integer_roots_at_eof_preserve_precision_and_full_spans() {
-        for text in ["1", "-12", "1234567890123456789012345678901234567890"] {
-            let mut source = SourceDatabase::new();
-            let file = source.add_file("input.json".into(), text.into());
-            let (value, map) = JsonValue::parse_str(text).unwrap();
-            let doc = Document { file, text, map };
-            assert_eq!(source.span_str(doc.span(0)), text);
-            let schema = Schema {
-                name: "int".into(),
-                span: Some(doc.span(0)),
-                kind: SchemaKind::Int(Type::Int(MultiRange::open())),
+        // parse string to json
+        let (value, map) = JsonValue::parse_str(content).map_err(|e| {
+            let range = e.span();
+            let end = if range.start == range.end {
+                content[range.start..]
+                    .chars()
+                    .next()
+                    .map_or(range.end, |c| range.start + c.len_utf8())
+            } else {
+                range.end
             };
-            let CompileValue::Simple(SimpleCompileValue::Int(result)) = schema.decode(&value, 0, &doc, "$").unwrap()
-            else {
-                panic!()
-            };
-            assert_eq!(result.to_string(), text);
-        }
+            DiagnosticError::new("invalid JSON", file.span(range.start..end), e.to_string()).report(diags)
+        })?;
+
+        // convert json to value
+        let doc = Document { file, content, map };
+        let result = schema.decode(refs, span, &doc, path.inner, 0, &value)?;
+
+        Ok(result)
     }
 }

@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::{fs, io};
 
 // TODO make this only accept strings, nothing else will accept non-utf8 paths anyway
 pub fn recurse_for_each_file<E: From<IoErrorWithPath>>(
@@ -17,7 +17,7 @@ fn recurse_for_each_file_impl<E: From<IoErrorWithPath>>(
     stack: &mut Vec<OsString>,
     f: &mut impl FnMut(&[OsString], &Path) -> Result<(), E>,
 ) -> Result<(), E> {
-    let read_dir = fs::read_dir(root).map_err(|e| e.with_context(IoAction::ReadDir, root))?;
+    let read_dir = std::fs::read_dir(root).map_err(|e| e.with_context(IoAction::ReadDir, root))?;
     for entry in read_dir {
         let entry = entry.map_err(|e| e.with_context(IoAction::ReadDir, root))?;
         let next = entry.path();
@@ -82,4 +82,8 @@ impl IoErrorExt for io::Error {
             error: self,
         }
     }
+}
+
+pub fn read_file_to_string(path: &Path) -> Result<String, IoErrorWithPath> {
+    std::fs::read_to_string(path).map_err(|e| e.with_context(IoAction::Read, path))
 }

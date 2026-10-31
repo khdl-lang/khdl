@@ -1,6 +1,6 @@
 pub mod ast;
 pub mod collect;
-pub mod data;
+pub mod data_inputs;
 pub mod external;
 pub mod format;
 pub mod hierarchy;

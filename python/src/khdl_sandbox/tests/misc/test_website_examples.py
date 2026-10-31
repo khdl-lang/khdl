@@ -32,7 +32,7 @@ def test_website_example(path: Path):
     assert len(tops) > 0, "example should contain at least one non-generic public module"
 
     source = khdl.Source()
-    source.add_file_content(["example"], path.name, content)
+    source.add_source_content(["example"], path.name, content)
     try:
         compiled = source.compile()
         for top in tops:
@@ -62,7 +62,7 @@ def test_website_example(path: Path):
 def test_website_example_add_five(tmp_dir: Path, p_valid: float, p_ready: float):
     # simulate the ready/valid example with random stalls on both sides, like the animation on the website
     source = khdl.Source()
-    source.add_file_content(["example"], "add_five.kh", (EXAMPLES_DIR / "add_five.kh").read_text())
+    source.add_source_content(["example"], "add_five.kh", (EXAMPLES_DIR / "add_five.kh").read_text())
     inst = source.compile().resolve_module("example.AddFive").as_verilated(tmp_dir).instance()
     ports = inst.ports
 

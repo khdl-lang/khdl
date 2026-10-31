@@ -9,7 +9,7 @@ print("Loading, parsing, compiling")
 compiled = khdl.Source.new_from_manifest_path(
     str(Path(__file__).parent / "../../../../design/project/khdl.toml")).compile()
 print("  parsed files:")
-for file in compiled.parsed.source.files:
+for file in compiled.parsed.source.source_files:
     print(f"    {file}")
 
 print("Resolving")

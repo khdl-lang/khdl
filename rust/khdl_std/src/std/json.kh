@@ -1,5 +1,0 @@
-// Decode a manifest-declared data input during elaboration.
-// `name` is a logical alias, never a filesystem path. Both arguments must be compile-time values.
-pub fn load(name: str, T: type) -> T {
-    return __builtin("fn", "json_load", name, T);
-}

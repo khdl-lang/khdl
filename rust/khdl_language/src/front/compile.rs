@@ -14,6 +14,7 @@ use crate::mid::ir::{IrDatabase, IrLargeArena, IrModule, IrModuleInfo, IrModules
 use crate::syntax::ast::{
     self, Expression, ExpressionKind, Identifier, ImportFinalKind, MaybeIdentifier, SimpleIdentifier, Visibility,
 };
+use crate::syntax::data_inputs::DataInputs;
 use crate::syntax::hierarchy::{HierarchyNode, SourceHierarchy};
 use crate::syntax::parsed::{AstRefItem, AstRefModuleInternal, ParsedDatabase};
 use crate::syntax::pos::{Span, Spanned};
@@ -195,11 +196,11 @@ impl<'a, 's> CompileRefs<'a, 's> {
 /// globally shared, constant state
 #[derive(Copy, Clone)]
 pub struct CompileFixed<'a> {
-    pub data: &'a crate::syntax::data::DataInputs,
     pub settings: &'a CompileSettings,
     pub source: &'a SourceDatabase,
     pub hierarchy: &'a SourceHierarchy,
     pub parsed: &'a ParsedDatabase,
+    pub data_inputs: &'a DataInputs,
 }
 
 #[derive(Debug, Clone)]
@@ -447,11 +448,11 @@ pub enum CompileStackEntry {
 
 fn populate_file_scopes(diags: &Diagnostics, fixed: CompileFixed, interner: &Interner) -> FileScopes<Arc<FrozenScope>> {
     let CompileFixed {
-        data: _,
         settings: _,
         source,
         hierarchy,
         parsed,
+        data_inputs: _,
     } = fixed;
 
     // pass 0: add all declared items to the file scope

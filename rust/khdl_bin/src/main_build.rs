@@ -11,9 +11,8 @@ use khdl_language::front::diagnostic::{DiagError, Diagnostics};
 use khdl_language::front::item::ElaboratedModule;
 use khdl_language::front::print::StdoutPrintHandler;
 use khdl_language::front::value::{CompileValue, SimpleCompileValue};
-use khdl_language::syntax::collect::collect_source_from_manifest;
+use khdl_language::syntax::collect::{ManifestCollected, collect_from_manifest};
 use khdl_language::syntax::hierarchy::{HierarchyNode, SourceHierarchy};
-use khdl_language::syntax::manifest::Manifest;
 use khdl_language::syntax::parsed::ParsedDatabase;
 use khdl_language::syntax::pos::Spanned;
 use khdl_language::syntax::source::SourceDatabase;
@@ -21,7 +20,7 @@ use khdl_language::syntax::token::Tokenizer;
 use khdl_language::util::arena::IndexType;
 use khdl_language::util::pool::ThreadPool;
 use khdl_language::util::{NON_ZERO_USIZE_ONE, get_num_cpus};
-use khdl_util::io::{IoAction, IoErrorExt};
+use khdl_util::io::{IoAction, IoErrorExt, read_file_to_string};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -72,29 +71,22 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
         Ok(m) => m,
         Err(ErrorExit) => return ExitCode::FAILURE,
     };
-    let Manifest {
-        source: manifest_source,
-        data: manifest_data,
-    } = manifest.parsed;
 
-    // collect source
+    // collect source and data
     let diags = Diagnostics::new();
-    let (hierarchy, _) =
-        match collect_source_from_manifest(&diags, &mut source, &manifest.path_parent, &manifest_source) {
-            Ok(s) => s,
-            Err(_) => {
-                print_diagnostics(&source, diags);
-                return ExitCode::FAILURE;
-            }
-        };
-    let (data, _) = match khdl_language::syntax::data::collect_data_from_manifest(
+    let ManifestCollected {
+        hierarchy,
+        data_inputs,
+        source_paths: _,
+        data_paths: _,
+    } = match collect_from_manifest(
         &diags,
         &mut source,
         &manifest.path_parent,
-        &manifest_data,
-        |path| std::fs::read_to_string(path).map_err(|e| e.with_context(IoAction::Read, path).to_string()),
+        &manifest.parsed,
+        read_file_to_string,
     ) {
-        Ok(data) => data,
+        Ok(c) => c,
         Err(_) => {
             print_diagnostics(&source, diags);
             return ExitCode::FAILURE;
@@ -120,6 +112,11 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
             }
         }
         print_node(&hierarchy, "  ", hierarchy.root_node());
+        eprintln!("Collected data:");
+        for file in data_inputs.files() {
+            let file_info = &source[file];
+            eprintln!("  [{}]: {:?}", file.inner().index(), file_info.debug_info_path);
+        }
     }
 
     // parse source
@@ -135,11 +132,11 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
         ctrlc::set_handler(move || should_stop.store(true, Ordering::Relaxed)).expect("Failed to set Ctrl+C handler");
     }
     let fixed = CompileFixed {
-        data: &data,
         settings: &settings,
         source: &source,
         hierarchy: &hierarchy,
         parsed: &parsed,
+        data_inputs: &data_inputs,
     };
     let shared = CompileShared::new(&diags, fixed, queue_items, thread_count.unwrap_or(NON_ZERO_USIZE_ONE));
     let refs = CompileRefs {
@@ -278,17 +275,15 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
         }
         let time_tokenize = start_tokenize.elapsed();
 
+        let source_lines = hierarchy
+            .files()
+            .map(|file| source[file].offsets.line_count() as u64)
+            .sum::<u64>();
         eprintln!();
         eprintln!("profiling info:");
         eprintln!("-----------------------------------------------");
         eprintln!("source files:     {}", hierarchy.files().count());
-        eprintln!(
-            "source lines:     {}",
-            hierarchy
-                .files()
-                .map(|file| source[file].offsets.line_count() as u64)
-                .sum::<u64>()
-        );
+        eprintln!("source lines:     {}", source_lines);
         eprintln!("input tokens:     {total_tokens}");
         eprintln!("----------------------------------------");
         eprintln!("read source:      {time_source:?}");

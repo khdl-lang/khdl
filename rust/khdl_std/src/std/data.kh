@@ -1,0 +1,5 @@
+// Load a data file as json with the given type.
+pub fn load_json(path: str, T: type) -> T {
+    const path = path;
+    return __builtin("fn", "json_load", path, T);
+}
