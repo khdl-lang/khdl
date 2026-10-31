@@ -3,12 +3,13 @@ use crate::util::{ErrorExit, manifest_find_read_parse, print_diagnostics};
 use indexmap::IndexMap;
 use itertools::{Itertools, zip_eq};
 use khdl_language::front::diagnostic::Diagnostics;
-use khdl_language::syntax::collect::collect_source_from_manifest;
+use khdl_language::syntax::collect::{CollectionKind, collect_manifest_files};
 use khdl_language::syntax::format::{FormatError, FormatSettings, format_file};
+use khdl_language::syntax::hierarchy::SourceHierarchy;
 use khdl_language::syntax::source::SourceDatabase;
 use khdl_language::util::data::IndexMapExt;
 use khdl_util::constants::KHDL_FILE_EXTENSION;
-use khdl_util::io::{IoAction, IoErrorExt, IoErrorWithPath, recurse_for_each_file};
+use khdl_util::io::{IoAction, IoErrorExt, IoErrorWithPath, read_file_to_string, recurse_for_each_file};
 use khdl_util::{swrite, swriteln};
 use std::ffi::OsStr;
 use std::io;
@@ -37,17 +38,21 @@ pub fn main_fmt(args: ArgsFormat) -> ExitCode {
                 Ok(m) => m,
                 Err(ErrorExit) => return ExitCode::FAILURE,
             };
-            let (_, files) =
-                match collect_source_from_manifest(&diags, &mut source, &manifest.path_parent, &manifest.parsed.source)
-                {
-                    Ok(s) => s,
-                    Err(_) => {
-                        print_diagnostics(&source, diags);
-                        return ExitCode::FAILURE;
-                    }
-                };
-
-            files
+            let mut hierarchy = SourceHierarchy::new();
+            match collect_manifest_files(
+                &diags,
+                &mut source,
+                &manifest.path_parent,
+                &manifest.parsed.source,
+                &mut CollectionKind::Source(&mut hierarchy),
+                read_file_to_string,
+            ) {
+                Ok(paths) => paths,
+                Err(_) => {
+                    print_diagnostics(&source, diags);
+                    return ExitCode::FAILURE;
+                }
+            }
         }
         Some(path) => {
             let mut files = IndexMap::new();

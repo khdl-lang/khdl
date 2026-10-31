@@ -5,7 +5,7 @@ import khdl
 # TODO add this to CI
 source = khdl.Source.new_from_manifest_path(str(Path(__file__).parent / "../../../../design/project/khdl.toml"))
 print("Parsed files:")
-for f in source.files:
+for f in source.source_files:
     print(f"  {f}")
 
 parsed = source.parse()

@@ -37,17 +37,6 @@ impl SourceDatabase {
         self.files.keys()
     }
 
-    pub fn file_count(&self) -> usize {
-        self.files.len()
-    }
-
-    pub fn total_lines_of_code(&self) -> u64 {
-        self.files
-            .values()
-            .map(|file_info| file_info.offsets.line_count() as u64)
-            .sum()
-    }
-
     pub fn expand_pos(&self, pos: Pos) -> PosFull {
         self[pos.file].offsets.expand_pos(pos)
     }

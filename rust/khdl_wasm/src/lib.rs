@@ -11,6 +11,7 @@ use khdl_language::front::value::{CompileValue, SimpleCompileValue};
 use khdl_language::mid::ir::IrModule;
 use khdl_language::syntax::ast;
 use khdl_language::syntax::collect::add_std_sources;
+use khdl_language::syntax::data_inputs::DataInputs;
 use khdl_language::syntax::format::{FormatError, FormatSettings, format_file};
 use khdl_language::syntax::hierarchy::SourceHierarchy;
 use khdl_language::syntax::parsed::{AstRefItem, ParsedDatabase};
@@ -74,6 +75,7 @@ pub fn run_all(top_src: String, include_format: bool, include_ir: bool) -> RunAl
             source: &source,
             hierarchy,
             parsed: &parsed,
+            data_inputs: &DataInputs::new(),
         };
         let shared = CompileShared::new(&diags, fixed, QueueItems::All, NON_ZERO_USIZE_ONE);
         let mut refs = CompileRefs {

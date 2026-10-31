@@ -25,6 +25,7 @@ dlopen2 = { workspace = true, optional = true }
 fnv.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
+json-syntax.workspace = true
 lalrpop-util.workspace = true
 lazy_static.workspace = true
 num-bigint.workspace = true

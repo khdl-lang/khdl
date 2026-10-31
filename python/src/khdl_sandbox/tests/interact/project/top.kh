@@ -1,5 +1,12 @@
-module top ports(x: in async bool, y: out async bool) {
+import std.data.load_json;
+
+module top ports(
+    x: in async bool,
+    y: out async bool,
+) {
     comb {
         y = x;
     }
 }
+
+const data = load_json("data", [3]int);

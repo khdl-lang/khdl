@@ -14,6 +14,7 @@ use crate::mid::ir::{IrDatabase, IrLargeArena, IrModule, IrModuleInfo, IrModules
 use crate::syntax::ast::{
     self, Expression, ExpressionKind, Identifier, ImportFinalKind, MaybeIdentifier, SimpleIdentifier, Visibility,
 };
+use crate::syntax::data_inputs::DataInputs;
 use crate::syntax::hierarchy::{HierarchyNode, SourceHierarchy};
 use crate::syntax::parsed::{AstRefItem, AstRefModuleInternal, ParsedDatabase};
 use crate::syntax::pos::{Span, Spanned};
@@ -199,6 +200,7 @@ pub struct CompileFixed<'a> {
     pub source: &'a SourceDatabase,
     pub hierarchy: &'a SourceHierarchy,
     pub parsed: &'a ParsedDatabase,
+    pub data_inputs: &'a DataInputs,
 }
 
 #[derive(Debug, Clone)]
@@ -450,6 +452,7 @@ fn populate_file_scopes(diags: &Diagnostics, fixed: CompileFixed, interner: &Int
         source,
         hierarchy,
         parsed,
+        data_inputs: _,
     } = fixed;
 
     // pass 0: add all declared items to the file scope

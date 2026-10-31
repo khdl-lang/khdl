@@ -14,6 +14,7 @@ pub mod function;
 pub mod implication;
 pub mod interface;
 pub mod item;
+pub mod json;
 pub mod module_body;
 pub mod module_header;
 pub mod print;

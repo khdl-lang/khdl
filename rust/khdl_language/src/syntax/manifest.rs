@@ -12,12 +12,13 @@ use toml::de::{DeTable, DeValue};
 // TODO allow marking certain files as "external", meaning that eg. format should not format them
 #[derive(Debug, Clone)]
 pub struct Manifest {
-    pub source: ManifestSource,
+    pub source: ManifestFiles,
+    pub data: ManifestFiles,
 }
 
-#[derive(Debug, Clone)]
-pub struct ManifestSource {
-    entries: Vec<SourceEntry>,
+#[derive(Debug, Clone, Default)]
+pub struct ManifestFiles {
+    entries: Vec<FileEntry>,
 }
 
 impl Manifest {
@@ -39,13 +40,11 @@ impl Manifest {
         })?;
 
         let mut manifest_source = None;
+        let mut manifest_data = None;
         for (key, value) in root.get_ref() {
             match key.get_ref().as_ref() {
-                "source" => {
-                    let mut entries = vec![];
-                    collect_source_entries(diags, file, &mut vec![], value, &mut entries)?;
-                    manifest_source = Some(ManifestSource { entries });
-                }
+                "source" => manifest_source = Some(collect_manifest_files(diags, file, value)?),
+                "data" => manifest_data = Some(collect_manifest_files(diags, file, value)?),
                 other => {
                     return Err(diags.report_error_simple(
                         format!("unknown manifest field `{other}`"),
@@ -63,20 +62,27 @@ impl Manifest {
                 "expected `source` field in this manifest",
             )
         })?;
-        Ok(Manifest { source })
+        let data = manifest_data.unwrap_or_default();
+        Ok(Manifest { source, data })
     }
 }
 
-fn collect_source_entries(
+fn collect_manifest_files(diags: &Diagnostics, file: FileId, node: &Spanned<DeValue>) -> DiagResult<ManifestFiles> {
+    let mut entries = vec![];
+    collect_manifest_files_impl(diags, file, &mut vec![], node, &mut entries)?;
+    Ok(ManifestFiles { entries })
+}
+
+fn collect_manifest_files_impl(
     diags: &Diagnostics,
     file: FileId,
     steps: &mut Vec<String>,
     node: &Spanned<DeValue>,
-    entries: &mut Vec<SourceEntry>,
+    entries: &mut Vec<FileEntry>,
 ) -> DiagResult {
     match node.get_ref() {
         DeValue::String(path) => {
-            entries.push(SourceEntry {
+            entries.push(FileEntry {
                 span_path: file.span(node.span()),
                 steps: steps.clone(),
                 path_relative: path.to_string(),
@@ -87,7 +93,7 @@ fn collect_source_entries(
             for (key, value) in table {
                 let key_str = key.get_ref().as_ref();
                 if key_str == "_" {
-                    collect_source_entries(diags, file, steps, value, entries)?;
+                    collect_manifest_files_impl(diags, file, steps, value, entries)?;
                 } else {
                     if !str_is_valid_identifier(key_str) {
                         return Err(diags.report_error_simple(
@@ -97,14 +103,14 @@ fn collect_source_entries(
                         ));
                     }
                     steps.with_pushed(key_str.to_owned(), |steps| {
-                        collect_source_entries(diags, file, steps, value, entries)
+                        collect_manifest_files_impl(diags, file, steps, value, entries)
                     })?;
                 }
             }
             Ok(())
         }
         _ => Err(diags.report_error_simple(
-            "invalid manifest source entry",
+            "invalid manifest file entry",
             file.span(node.span()),
             "expected a path string or a table of entries",
         )),
@@ -112,15 +118,15 @@ fn collect_source_entries(
 }
 
 #[derive(Debug, Clone)]
-pub struct SourceEntry {
+pub struct FileEntry {
     pub span_path: Span,
 
     pub steps: Vec<String>,
     pub path_relative: String,
 }
 
-impl ManifestSource {
-    pub fn entries(&self) -> &[SourceEntry] {
+impl ManifestFiles {
+    pub fn entries(&self) -> &[FileEntry] {
         &self.entries
     }
 }

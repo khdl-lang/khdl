@@ -3,24 +3,22 @@ use crate::server::state::{RequestError, ServerState};
 use crate::server::vfs::{Vfs, VfsError, VfsResult};
 use crate::util::encode::span_to_lsp;
 use crate::util::sender::SendErrorOr;
-use crate::util::uri::{
-    NormalizeError, abs_path_to_uri, build_watcher_any_file_with_name, path_join_normalized, uri_to_path,
-};
+use crate::util::uri::{abs_path_to_uri, build_watcher_any_file_with_name, path_join_normalized, uri_to_path};
 use indexmap::{IndexMap, IndexSet};
-use itertools::{Itertools, enumerate, zip_eq};
+use itertools::{Itertools, chain, enumerate};
 use khdl_language::front::compile::{CompileFixed, CompileRefs, CompileSettings, CompileShared, QueueItems};
 use khdl_language::front::diagnostic::{
     DiagResult, Diagnostic, DiagnosticContent, DiagnosticLevel, Diagnostics, FooterKind,
 };
 use khdl_language::front::print::IgnorePrintHandler;
-use khdl_language::syntax::collect::{add_source_files_to_tree, add_std_sources, collect_source_files_from_tree};
+use khdl_language::syntax::collect::collect_from_manifest;
+use khdl_language::syntax::data_inputs::DataInputs;
 use khdl_language::syntax::hierarchy::SourceHierarchy;
-use khdl_language::syntax::manifest::{Manifest, SourceEntry};
+use khdl_language::syntax::manifest::Manifest;
 use khdl_language::syntax::parsed::ParsedDatabase;
 use khdl_language::syntax::source::{FileId, SourceDatabase};
-use khdl_language::try_inner;
 use khdl_language::util::NON_ZERO_USIZE_ONE;
-use khdl_util::constants::{KHDL_FILE_EXTENSION, KHDL_LSP_NAME, KHDL_MANIFEST_FILE_NAME};
+use khdl_util::constants::{KHDL_DATA_FILE_EXTENSION, KHDL_FILE_EXTENSION, KHDL_LSP_NAME, KHDL_MANIFEST_FILE_NAME};
 use khdl_util::io::recurse_for_each_file;
 use khdl_util::swrite;
 use lsp_types::{
@@ -54,6 +52,7 @@ struct ManifestCollectedInner {
     #[allow(dead_code)]
     parsed: Manifest,
     hierarchy: SourceHierarchy,
+    data_inputs: DataInputs,
 }
 
 impl ServerState {
@@ -89,8 +88,7 @@ impl ServerState {
             let parsed = parsed.clone();
 
             let inner = match parsed {
-                Ok(parsed) => collect_manifest_sources(&mut self.vfs, &mut common, parsed)
-                    .map_err(|e| SendErrorOr::Other(RequestError::Vfs(VfsError::FailedNormalization(e))))?,
+                Ok(parsed) => collect_manifest_sources(&mut self.vfs, &mut common, parsed),
                 Err(e) => Err(e),
             };
 
@@ -127,6 +125,7 @@ impl ServerState {
                     source,
                     hierarchy,
                     parsed: &parsed,
+                    data_inputs: &inner.data_inputs,
                 };
 
                 let thread_count = self.pool.as_ref().map_or(NON_ZERO_USIZE_ONE, |p| p.thread_count());
@@ -227,19 +226,17 @@ impl ServerState {
             let parsed = Manifest::parse_toml(&diags, &source, manifest_file);
 
             if let Ok(manifest) = &parsed {
-                for entry in manifest.source.entries() {
-                    let SourceEntry {
-                        span_path: _,
-                        steps: _,
-                        path_relative,
-                    } = entry;
-
-                    let entry_path = path_join_normalized(&manifest_folder, Path::new(path_relative))
+                let entries = chain(
+                    manifest.source.entries().iter().map(|e| (e, KHDL_FILE_EXTENSION)),
+                    manifest.data.entries().iter().map(|e| (e, KHDL_DATA_FILE_EXTENSION)),
+                );
+                for (entry, extension) in entries {
+                    let entry_path = path_join_normalized(&manifest_folder, Path::new(&entry.path_relative))
                         .map_err(|e| SendErrorOr::Other(RequestError::Vfs(VfsError::FailedNormalization(e))))?;
 
                     watchers.push(build_watcher_any_file_with_name(
                         abs_path_to_uri(&entry_path).map_err(|e| SendErrorOr::Other(RequestError::Vfs(e)))?,
-                        &format!("*.{KHDL_FILE_EXTENSION}"),
+                        &format!("*.{extension}"),
                     ));
                 }
             }
@@ -305,48 +302,27 @@ fn collect_manifest_sources(
     vfs: &mut Vfs,
     common: &mut ManifestCommon,
     parsed: Manifest,
-) -> Result<DiagResult<ManifestCollectedInner>, NormalizeError> {
-    let diags = &common.diags;
-    let source = &mut common.source;
-    let mut hierarchy = SourceHierarchy::new();
+) -> DiagResult<ManifestCollectedInner> {
+    // TODO don't early exit, visit all entries before returning error
+    // TODO insert extra files from Vfs that don't yet exist on disk
+    let collected = collect_from_manifest(
+        &common.diags,
+        &mut common.source,
+        &common.manifest_folder,
+        &parsed,
+        |path| match vfs.read_str_maybe_from_disk(path) {
+            Ok(s) => Ok(s.to_owned()),
+            Err(e) => Err(format!("{e:?}")),
+        },
+    )?;
 
-    try_inner!(add_std_sources(diags, source, &mut hierarchy));
-
-    for entry in parsed.source.entries() {
-        let &SourceEntry {
-            span_path,
-            ref steps,
-            ref path_relative,
-        } = entry;
-
-        let entry_path = path_join_normalized(&common.manifest_folder, Path::new(path_relative))?;
-
-        // TODO don't early exit, visit all entries before returning error
-        // TODO insert extra files from Vfs that don't yet exist on disk
-        let files = try_inner!(collect_source_files_from_tree(diags, span_path, entry_path));
-
-        let file_paths = files.iter().map(|(_, p)| p.to_owned()).collect_vec();
-
-        let file_ids = add_source_files_to_tree(
-            diags,
-            source,
-            &mut hierarchy,
-            span_path,
-            steps.clone(),
-            &files,
-            |file_path| match vfs.read_str_maybe_from_disk(file_path) {
-                Ok(s) => Ok(s.to_owned()),
-                Err(e) => Err(format!("{e:?}")),
-            },
-        );
-        let file_ids = try_inner!(file_ids);
-
-        for (file_id, file_path) in zip_eq(file_ids, file_paths) {
-            common.file_to_path.insert(file_id, file_path);
-        }
-    }
-
-    Ok(Ok(ManifestCollectedInner { parsed, hierarchy }))
+    common.file_to_path.extend(collected.source_paths);
+    common.file_to_path.extend(collected.data_paths);
+    Ok(ManifestCollectedInner {
+        parsed,
+        hierarchy: collected.hierarchy,
+        data_inputs: collected.data_inputs,
+    })
 }
 
 fn add_grouped_diagnostic_to_lsp(
