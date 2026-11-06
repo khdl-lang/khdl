@@ -3,7 +3,9 @@
 #include <memory>
 
 #include "verilated.h"
+#if VM_TRACE
 #include "verilated_vcd_c.h"
+#endif
 #include "/*[TEMPLATE_TOP_CLASS_NAME]*/.h"
 
 typedef uint8_t Result;
@@ -101,19 +103,25 @@ class Wrapper {
    public:
     VerilatedContext *context;
     /*[TEMPLATE_TOP_CLASS_NAME]*/ *top;
-    VerilatedVcdC *trace;
+#if VM_TRACE
+    VerilatedVcdC *trace = nullptr;
+#endif
 
-    Wrapper(char *trace_path) : context(new VerilatedContext()), top(new /*[TEMPLATE_TOP_CLASS_NAME]*/(context)), trace(nullptr) {
+    Wrapper(char *trace_path) : context(new VerilatedContext()), top(new /*[TEMPLATE_TOP_CLASS_NAME]*/(context)) {
+#if VM_TRACE
         if (trace_path) {
             context->traceEverOn(true);
             trace = new VerilatedVcdC();
             top->trace(trace, 1024);
             trace->open(trace_path);
         }
+#endif
     }
 
     ~Wrapper() {
+#if VM_TRACE
         delete trace;
+#endif
         delete top;
         delete context;
     }
@@ -125,6 +133,10 @@ class Wrapper {
 extern "C" {
     uint64_t check_hash() {
         return /*[TEMPLATE_CHECK_HASH]*/;
+    }
+
+    bool trace_supported() {
+        return VM_TRACE;
     }
 
     Wrapper *create_instance(char *trace_path) {
@@ -147,19 +159,23 @@ extern "C" {
         wrapper->context->timeInc(increment_time);
         wrapper->top->eval();
 
+#if VM_TRACE
         if (wrapper->trace) {
             wrapper->trace->dump(wrapper->context->time());
         }
+#endif
 
         return SUCCESS;
     }
 
     void save_trace(Wrapper *wrapper) {
+#if VM_TRACE
         if (wrapper->trace) {
             wrapper->trace->close();
             delete wrapper->trace;
             wrapper->trace = nullptr;
         }
+#endif
     }
 
     Result get_port(Wrapper *wrapper, uint32_t port_index, size_t data_len, uint8_t *data) {

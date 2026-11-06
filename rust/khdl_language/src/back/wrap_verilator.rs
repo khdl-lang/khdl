@@ -28,6 +28,7 @@ pub enum VerilatorError {
     FromBitsInvalidValue(Vec<bool>, String),
     SetOutputPort(String),
     PathContainsZeroByte,
+    TraceNotSupported,
 }
 
 impl Display for VerilatorError {
@@ -41,6 +42,7 @@ impl Display for VerilatorError {
             VerilatorError::FromBitsInvalidValue(bits, ty) => write!(f, "Invalid bit pattern for type {ty}: {bits:?}"),
             VerilatorError::SetOutputPort(port) => write!(f, "Cannot set output port `{port}`"),
             VerilatorError::PathContainsZeroByte => write!(f, "Path cannot contain a zero byte"),
+            VerilatorError::TraceNotSupported => write!(f, "Cannot trace a simulator that was built without tracing"),
         }
     }
 }
@@ -54,6 +56,7 @@ impl From<dlopen2::Error> for VerilatorError {
 #[derive(WrapperApi)]
 struct VerilatedApi {
     check_hash: unsafe extern "C" fn() -> u64,
+    trace_supported: unsafe extern "C" fn() -> bool,
     create_instance: unsafe extern "C" fn(trace_path: *const c_char) -> *mut c_void,
     destroy_instance: unsafe extern "C" fn(instance: *mut c_void),
     save_trace: unsafe extern "C" fn(instance: *mut c_void),
@@ -118,6 +121,14 @@ impl VerilatedLib {
     }
 
     pub fn instance(&self, trace_path: Option<&Path>) -> Result<VerilatedInstance, VerilatorError> {
+        // check that tracing is supported
+        if trace_path.is_some() {
+            let trace_supported = unsafe { self.lib.trace_supported() };
+            if !trace_supported {
+                return Err(VerilatorError::TraceNotSupported);
+            }
+        }
+
         // convert path to C string pointer
         let trace_path_slot;
         let trace_path_ptr = match trace_path {

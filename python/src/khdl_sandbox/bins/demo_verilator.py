@@ -26,7 +26,7 @@ print(top.as_verilog())
 print("Verilating")
 build_dir = "../../../build"
 os.makedirs(build_dir, exist_ok=True)
-top_verilated = top.as_verilated(build_dir=build_dir)
+top_verilated = top.as_verilated(build_dir=build_dir, trace=True)
 print(top_verilated)
 
 print("Creating simulator")

@@ -1065,7 +1065,8 @@ impl Module {
     }
 
     #[allow(clippy::wrong_self_convention)]
-    #[pyo3(signature=(build_dir, *, extra_verilog_files=None, optimization=None, compiler=None, jobs=None))]
+    #[pyo3(signature=(build_dir, *, extra_verilog_files=None, optimization=None, compiler=None, jobs=None, trace=false))]
+    #[allow(clippy::too_many_arguments)]
     fn as_verilated(
         slf: Py<Self>,
         py: Python,
@@ -1074,6 +1075,7 @@ impl Module {
         optimization: Option<u8>,
         compiler: Option<String>,
         jobs: Option<NonZeroUsize>,
+        trace: bool,
     ) -> PyResult<ModuleVerilated> {
         // handle args
         let extra_verilog_files = extra_verilog_files.unwrap_or_default();
@@ -1127,8 +1129,9 @@ impl Module {
 
         py.detach::<PyResult<()>, _>(|| {
             // TODO get everything properly incremental
-            // TODO make tracing optional
             // TODO move this compilation process to somewhere else, not in the python crate
+            check_verilator_version()?;
+
             run_command(
                 Command::new("verilator")
                     // C++ compiler settings
@@ -1147,7 +1150,7 @@ impl Module {
                     .arg("-Werror-IMPLICIT")
                     .arg("-Werror-PINMISSING")
                     // misc settings
-                    .arg("--trace")
+                    .args(trace.then_some("--trace"))
                     .args(["--top-module", verilog_name])
                     .args(["--prefix", &top_class_name])
                     // source files
@@ -1210,6 +1213,33 @@ fn io_error(e: IoErrorWithPath) -> PyErr {
 
 fn write_file(path: &Path, content: &str) -> PyResult<()> {
     std::fs::write(path, content).map_err(|e| io_error(e.with_context(IoAction::Write, path)))
+}
+
+/// Check that the verilator version is high enough to support the generated verilog.
+/// Older versions can silently miscompile signed operations, see https://github.com/verilator/verilator/issues/8815.
+fn check_verilator_version() -> PyResult<()> {
+    const MIN_VERSION: (u32, u32) = (5, 54);
+
+    let output = Command::new("verilator")
+        .arg("--version")
+        .output()
+        .map_err(|e| VerilationException::new_err(format!("`verilator` failed to launch: error={e:?}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version_str = stdout.split_whitespace().nth(1).unwrap_or_default();
+
+    let Some(version) = parse_verilator_version(version_str) else {
+        let msg = format!("failed to parse `verilator --version` output: {:?}", stdout.trim());
+        return Err(VerilationException::new_err(msg));
+    };
+    if version < MIN_VERSION {
+        return Err(VerilationException::new_err(format!("verilator {version_str} too old")));
+    }
+    Ok(())
+}
+
+fn parse_verilator_version(version: &str) -> Option<(u32, u32)> {
+    let (major, minor) = version.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
 fn run_command(command: &mut Command, dir: &Path, name: &str) -> PyResult<()> {
