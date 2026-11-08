@@ -622,12 +622,19 @@ impl CompileItemContext<'_, '_> {
         let params_scope_span = params.span.join(body.span);
         let mut params_scope = scope_captured.new_child(params_scope_span);
 
-        // declare self
+        // declare self, stored in a variable like the other parameters so its expression is not repeated for every use
         if let Some(arg_self) = arg_self {
+            let self_id = Spanned::new(arg_self.span, self.refs.shared.interner.push("self"));
+            let self_var = flow.var_new_immutable_init(
+                self.refs,
+                MaybeIdentifier::Identifier(self_id),
+                arg_self.span,
+                Ok(ValueWithImplications::simple(arg_self.inner)),
+            )?;
             params_scope.declare(
                 self.refs,
                 ScopeKey::Slf(arg_self.span),
-                Ok(ScopedEntry::Value(arg_self.inner)),
+                Ok(ScopedEntry::Named(NamedValue::Variable(self_var))),
             );
         };
 
@@ -918,11 +925,16 @@ impl CompileItemContext<'_, '_> {
                     }
                     MaybeCompile::Hardware(v) => {
                         let expr = self.large.push_expr(IrExpressionLarge::FromBits(ty_ir, v.expr));
-                        Value::Hardware(HardwareValue {
+                        let value = Value::Hardware(HardwareValue {
                             ty: ty_hw.clone(),
                             domain: v.domain,
                             expr,
-                        })
+                        });
+
+                        let value = Spanned::new(span_call, ValueWithImplications::simple(value));
+                        flow.var_new_immutable_init_value(refs, &mut self.large, "bits", value)?
+                            .inner
+                            .into_value()
                     }
                 };
                 Ok(result)

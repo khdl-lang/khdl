@@ -169,6 +169,7 @@ impl CompileItemContext<'_, '_> {
 
         // eval target
         let target = self.eval_expression_with_implications(scope, flow, &Type::Any, target)?;
+        let target = flow.var_new_immutable_init_value(self.refs, &mut self.large, "target", target)?;
         let target_ty = target.inner.ty();
 
         // eval branches

@@ -563,6 +563,20 @@ pub trait Flow: FlowPrivate {
         Ok(var)
     }
 
+    fn var_new_immutable_init_value(
+        &mut self,
+        refs: CompileRefs,
+        large: &mut IrLargeArena,
+        id: &str,
+        value: Spanned<ValueWithImplications>,
+    ) -> DiagResult<Spanned<ValueWithImplications>> {
+        let span = value.span;
+        let id = MaybeIdentifier::Identifier(Spanned::new(span, refs.shared.interner.push(id)));
+        let var = self.var_new_immutable_init(refs, id, span, Ok(value.inner))?;
+        let stored = self.var_eval(refs, large, Spanned::new(span, var))?;
+        Ok(Spanned::new(span, stored))
+    }
+
     fn var_capture(&self, var: Spanned<Variable>) -> DiagResult<Result<CompileValue, CaptureFailed>> {
         match self.var_get_content(var)? {
             VariableContent::Assigned(value) => match CompileValue::try_from(&value.inner) {

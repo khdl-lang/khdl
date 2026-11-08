@@ -479,8 +479,25 @@ impl<'a> CompileItemContext<'a, '_> {
                         RangeValue::from_range(Range { start, end: Some(end) })
                     }
                     RangeLiteral::Length { op_span, start, length } => {
-                        let start = eval_bound(start, op_span);
+                        // eval start
+                        let start = {
+                            let start_span = start.span;
+                            let start = self.eval_expression_with_implications(
+                                scope,
+                                flow,
+                                &Type::Int(MultiRange::open()),
+                                start,
+                            )?;
+                            let start = flow
+                                .var_new_immutable_init_value(refs, &mut self.large, "start", start)?
+                                .map_inner(ValueWithImplications::into_value);
 
+                            let reason = TypeContainsReason::Operator(op_span);
+                            let start_inner = check_type_is_int(refs, reason, start)?;
+                            Spanned::new(start_span, start_inner)
+                        };
+
+                        // eval length
                         let range_uint = MultiRange::from(Range {
                             start: Some(BigInt::ZERO),
                             end: None,
@@ -490,11 +507,9 @@ impl<'a> CompileItemContext<'a, '_> {
                             .and_then(|length| {
                                 let reason = TypeContainsReason::Operator(op_span);
                                 check_type_is_uint(refs, reason, length)
-                            });
+                            })?;
 
-                        let start = start?;
-                        let length = length?;
-
+                        // create range
                         match (start.inner, length) {
                             (MaybeCompile::Hardware(start), MaybeCompile::Compile(length)) => {
                                 // preserve full information to allow for hardware slicing
@@ -1307,7 +1322,10 @@ impl<'a> CompileItemContext<'a, '_> {
         let refs = self.refs;
         let diags = self.refs.diags;
 
-        let index = self.eval_expression(scope, flow, &Type::Any, index)?;
+        let index = self.eval_expression_with_implications(scope, flow, &Type::Any, index)?;
+        let index = flow
+            .var_new_immutable_init_value(refs, &mut self.large, "index", index)?
+            .map_inner(ValueWithImplications::into_value);
         let index_span = index.span;
 
         let index_ty = index.inner.ty();
@@ -1642,7 +1660,10 @@ impl<'a> CompileItemContext<'a, '_> {
         let refs = self.refs;
         let diags = self.refs.diags;
 
-        let iter = self.eval_expression(scope, flow, &Type::Any, iter)?;
+        let iter = self.eval_expression_with_implications(scope, flow, &Type::Any, iter)?;
+        let iter = flow
+            .var_new_immutable_init_value(refs, &mut self.large, "iter", iter)?
+            .map_inner(ValueWithImplications::into_value);
         let iter_span = iter.span;
 
         let result = match iter.inner {
