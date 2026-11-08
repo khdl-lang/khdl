@@ -183,3 +183,21 @@ def test_match_remaining_range_expr_val(tmp_dir: Path):
     for a0 in range(5):
         for a1 in range(4):
             c.eval_assert([a0, a1], max(4, a0 + a1))
+
+
+def test_match_exhaustive_comb_driver(tmp_dir: Path):
+    src = """
+    module top ports(x: in async uint(0..2), y: out async uint(3)) {
+        comb {
+            match (x) {
+                0 => { y = 1; }
+                1 => { y = 2; }
+            }
+        }
+    }
+    """
+    inst = compile_custom(src).resolve("top.top").as_verilated(tmp_dir).instance()
+    for x in range(2):
+        inst.ports.x = x
+        inst.step(1)
+        assert inst.ports.y == x + 1

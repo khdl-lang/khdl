@@ -833,6 +833,12 @@ impl CompileItemContext<'_, '_> {
             return Err(diag.report(diags));
         }
 
+        // remove the last condition:
+        //   we've already checked that the match is exhaustive, and want to let the IR know too
+        if let Some(last_cond) = all_conditions.last_mut() {
+            *last_cond = None;
+        }
+
         // join things
         let all_blocks = flow_parent.join_child_branches(self.refs, &mut self.large, span_keyword, all_contents)?;
         let joined_end = join_block_ends_branches(&all_ends);
