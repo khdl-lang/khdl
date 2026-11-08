@@ -21,6 +21,7 @@ use crate::try_inner;
 use crate::util::arena::RandomCheck;
 use crate::util::big_int::BigInt;
 use crate::util::data::IndexMapExt;
+use crate::util::debug::DebugOnly;
 use crate::util::intern::{Id, MaybeId};
 use crate::util::iter::IterExt;
 use crate::util::range::RangeEmpty;
@@ -285,8 +286,7 @@ enum Implied {
 /// These are fully unique within a given flow hierarchy.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct ValueVersion {
-    // TODO make debug mode only, this is only used for assertions here (elsewhere in flow it's used more generally)
-    id: FlowRootId,
+    id: DebugOnly<FlowRootId>,
     kind: ValueVersionKind,
 }
 
@@ -377,7 +377,7 @@ pub trait Flow: FlowPrivate {
                             implications,
                         } = value;
                         if let Some(version) = version {
-                            assert_eq!(version.id, self.root_id());
+                            assert_eq!(version.id, DebugOnly::new(|| self.root_id()));
                         }
 
                         let var_info = self.var_info(Spanned::new(assignment_span, var))?;
@@ -776,14 +776,14 @@ impl<'d> FlowRoot<'d> {
         let index = self.next_version_index.get();
         self.next_version_index.set(index.checked_add(1).expect("overflow"));
         ValueVersion {
-            id: self.id,
+            id: DebugOnly::new(|| self.id),
             kind: ValueVersionKind::Index(index),
         }
     }
 
     fn initial_signal_version(&self, signal: Signal) -> ValueVersion {
         ValueVersion {
-            id: self.id,
+            id: DebugOnly::new(|| self.id),
             kind: ValueVersionKind::SignalInitial(signal),
         }
     }

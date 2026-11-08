@@ -1,3 +1,4 @@
+use crate::util::debug::DebugOnly;
 use crate::util::{Never, ResultNeverExt};
 use indexmap::map::IndexMap;
 use itertools::Itertools;
@@ -5,7 +6,6 @@ use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
-
 // TODO use refcell for all of these data structures?
 //   that would allow users to push new values without worrying about mutability
 //   the trickier functions (that actually allow mutating existing values) would still be behind &mut.
@@ -66,18 +66,9 @@ pub struct Idx {
 }
 
 /// A sentinel value to protect against accidentally mixing keys from different [Arena]s or similar datastructures.
-///
-/// When debug assertions are enabled, this type contains a random value each time it is constructed.
-/// Values can then be asserted to match.
-///
-/// Without debug assertions, this type becomes zero-sized to avoid any performance impact.
+/// This only does something when debug assertions are enabled.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub struct RandomCheck(RandomCheckInner);
-
-#[cfg(debug_assertions)]
-type RandomCheckInner = u16;
-#[cfg(not(debug_assertions))]
-type RandomCheckInner = ();
+pub struct RandomCheck(DebugOnly<u16>);
 
 #[derive(Clone)]
 pub struct Arena<K: IndexType, T> {
@@ -358,8 +349,7 @@ impl Hash for Idx {
 
 impl RandomCheck {
     pub fn new() -> Self {
-        // TODO check if this is anywhere close to a bottleneck
-        Self(rand::random())
+        Self(DebugOnly::new(|| rand::random()))
     }
 }
 
