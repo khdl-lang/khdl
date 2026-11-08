@@ -507,3 +507,21 @@ def test_signal_remembers_implications():
     """
     c = compile_custom(src)
     _ = c.resolve("top.top")
+
+
+def test_implication_through_alias():
+    src = """
+    module top ports(x: in async uint(0..8), y: out async uint(0..4)) {
+        comb {
+            val v = x;
+            y = 0;
+            if (x < 4) {
+                y = v;
+            }
+            if (v < 4) {
+                y = x;
+            }
+        }
+    }
+    """
+    compile_custom(src).resolve("top.top")

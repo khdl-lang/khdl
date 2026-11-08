@@ -713,7 +713,7 @@ impl CompileItemContext<'_, '_> {
                 // set flag
                 let entry = stack.return_info(diags, span_return)?;
                 if let ReturnEntryKind::Hardware(entry) = &mut entry.kind {
-                    entry.return_flag.set(flow, span_return)?;
+                    entry.return_flag.set(refs, flow, span_return)?;
                 }
 
                 // check type and store value
@@ -730,14 +730,14 @@ impl CompileItemContext<'_, '_> {
             &BlockStatementKind::Break { span } => {
                 let entry = stack.innermost_loop(diags, span, "break")?;
                 if let LoopEntry::Hardware(entry) = entry {
-                    entry.break_flag.set(flow, span)?;
+                    entry.break_flag.set(refs, flow, span)?;
                 }
                 BlockEnd::CompileExit(EarlyExitKind::Break)
             }
             &BlockStatementKind::Continue { span } => {
                 let entry = stack.innermost_loop(diags, span, "continue")?;
                 if let LoopEntry::Hardware(entry) = entry {
-                    entry.continue_flag.set(flow, span)?;
+                    entry.continue_flag.set(refs, flow, span)?;
                 }
                 BlockEnd::CompileExit(EarlyExitKind::Continue)
             }
@@ -970,18 +970,20 @@ impl CompileItemContext<'_, '_> {
         iter: impl Iterator<Item = T>,
         mut body: impl FnMut(&mut Self, &mut F, &mut ExitStack, T) -> DiagResult<BlockEnd>,
     ) -> DiagResult<BlockEnd> {
-        let entry = LoopEntry::new(self.refs, flow, span_keyword)?;
+        let refs = self.refs;
+
+        let entry = LoopEntry::new(refs, flow, span_keyword)?;
         stack.with_loop_entry(entry, |stack| {
             let mut end_joined = BlockEnd::Normal;
 
             for iter_item in iter {
-                self.refs.check_should_stop(span_keyword)?;
+                refs.check_should_stop(span_keyword)?;
 
                 // clear continue flag
                 if let FlowKind::Hardware(flow) = flow.kind_mut() {
                     let entry =
                         unwrap_match!(stack.innermost_loop_option().unwrap(), LoopEntry::Hardware(entry) => entry);
-                    entry.continue_flag.clear(flow, span_keyword)?;
+                    entry.continue_flag.clear(refs, flow, span_keyword)?;
                 }
 
                 // elaborate body
@@ -1015,10 +1017,11 @@ impl CompileItemContext<'_, '_> {
         cond: Spanned<HardwareValueWithImplications<TypeBool>>,
         mut f: impl FnMut(&mut Self, &mut FlowHardware, bool) -> DiagResult<BlockEnd>,
     ) -> DiagResult<BlockEnd> {
+        let refs = self.refs;
         let cond_domain = Spanned::new(cond.span, cond.inner.value.domain);
 
         // lower then
-        let then_flow_end = match flow.new_child_branch(self, span, cond_domain, cond.inner.implications.if_true)? {
+        let then_flow_end = match flow.new_child_branch(span, cond_domain, cond.inner.implications.if_true)? {
             Ok(mut then_flow) => {
                 let then_end = f(self, &mut then_flow.as_flow(), true)?;
                 let then_flow = then_flow.finish();
@@ -1028,7 +1031,7 @@ impl CompileItemContext<'_, '_> {
         };
 
         // lower else
-        let else_flow_end = match flow.new_child_branch(self, span, cond_domain, cond.inner.implications.if_false)? {
+        let else_flow_end = match flow.new_child_branch(span, cond_domain, cond.inner.implications.if_false)? {
             Ok(mut else_flow) => {
                 let else_end = f(self, &mut else_flow.as_flow(), false)?;
                 let else_flow = else_flow.finish();
@@ -1046,7 +1049,7 @@ impl CompileItemContext<'_, '_> {
 
                 // join flows
                 let (then_block, else_block) =
-                    flow.join_child_branches_pair(self.refs, &mut self.large, span, (then_flow, else_flow))?;
+                    flow.join_child_branches_pair(refs, &mut self.large, span, (then_flow, else_flow))?;
 
                 // build if
                 let ir_if = build_ir_if_statement(
@@ -1071,7 +1074,7 @@ impl CompileItemContext<'_, '_> {
                 let (case_flow, case_end) = flow_end;
 
                 let block = flow
-                    .join_child_branches(self.refs, &mut self.large, span, vec![case_flow])?
+                    .join_child_branches(refs, &mut self.large, span, vec![case_flow])?
                     .single()
                     .unwrap();
 

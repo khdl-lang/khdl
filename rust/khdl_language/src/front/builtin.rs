@@ -286,7 +286,7 @@ impl CompileItemContext<'_, '_> {
 
                 // add implications
                 for implication in cond.implications.if_true {
-                    match flow.add_implication(self, expr_span, implication)? {
+                    match flow.add_implication(expr_span, implication)? {
                         Ok(()) => {}
                         Err(ImplicationContradiction) => {
                             return Err(diags.report_error_simple(

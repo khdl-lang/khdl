@@ -25,7 +25,6 @@ use crate::util::{Never, ResultNeverExt};
 use itertools::{Itertools, zip_eq};
 use std::hash::Hash;
 use std::sync::Arc;
-use unwrap_match::unwrap_match;
 
 pub type CompileValue = Value<SimpleCompileValue, CompileCompoundValue, Never>;
 
@@ -199,20 +198,22 @@ impl ReferenceWrapper {
     }
 }
 
-// TODO allow storing versions and implications in the inner values?
+pub type MixedValue<E = IrExpression> =
+    Value<SimpleCompileValue, MixedCompoundValue<E>, HardwareValue<HardwareType, E>>;
+
 #[derive(Debug, Clone)]
-pub enum MixedCompoundValue {
-    String(Arc<MixedString>),
-    Range(RangeValue),
-    Tuple(Vec<Value>),
-    Struct(StructValue<Value>),
-    Enum(EnumValue<Box<Value>>),
-    BoundMethod(BoundMethod<Value>),
+pub enum MixedCompoundValue<E = IrExpression> {
+    String(Arc<MixedString<E>>),
+    Range(RangeValue<E>),
+    Tuple(Vec<MixedValue<E>>),
+    Struct(StructValue<MixedValue<E>>),
+    Enum(EnumValue<Box<MixedValue<E>>>),
+    BoundMethod(BoundMethod<MixedValue<E>>),
 }
 
 #[derive(Debug, Clone)]
-pub struct MixedString {
-    pub pieces: Vec<StringPiece<Arc<String>, HardwareValue>>,
+pub struct MixedString<E = IrExpression> {
+    pub pieces: Vec<StringPiece<Arc<String>, HardwareValue<HardwareType, E>>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -234,34 +235,34 @@ pub struct HardwareValue<T = HardwareType, E = IrExpression> {
     pub expr: E,
 }
 
-pub type HardwareInt = HardwareValue<ClosedNonEmptyMultiRange<BigInt>>;
-pub type HardwareUInt = HardwareValue<ClosedNonEmptyMultiRange<BigUint>>;
-pub type HardwareBool = HardwareValue<TypeBool>;
+pub type HardwareInt<E = IrExpression> = HardwareValue<ClosedNonEmptyMultiRange<BigInt>, E>;
+pub type HardwareUInt<E = IrExpression> = HardwareValue<ClosedNonEmptyMultiRange<BigUint>, E>;
+pub type HardwareBool<E = IrExpression> = HardwareValue<TypeBool, E>;
 
 #[derive(Debug, Clone)]
-pub enum RangeValue {
+pub enum RangeValue<E = IrExpression> {
     Compile(MultiRange<BigInt>),
-    HardwareBounds(HardwareBoundsRange),
+    HardwareBounds(HardwareBoundsRange<E>),
     // TODO allow hardware length, really only useful for "in" expressions
-    HardwareStartLength { start: HardwareInt, length: BigUint },
+    HardwareStartLength { start: HardwareInt<E>, length: BigUint },
 }
 
 /// Range where at least one of the bounds is a hardware value.
 /// Do not construct directly, use [RangeValue::from_range] instead.
 #[derive(Debug, Clone)]
-pub struct HardwareBoundsRange {
-    range: Range<MaybeCompile<BigInt, HardwareInt>>,
+pub struct HardwareBoundsRange<E = IrExpression> {
+    range: Range<MaybeCompile<BigInt, HardwareInt<E>>>,
 }
 
-impl HardwareBoundsRange {
-    pub fn range(&self) -> &Range<MaybeCompile<BigInt, HardwareInt>> {
+impl<E> HardwareBoundsRange<E> {
+    pub fn range(&self) -> &Range<MaybeCompile<BigInt, HardwareInt<E>>> {
         &self.range
     }
 }
 
-impl RangeValue {
-    pub fn from_range(range: Range<MaybeCompile<BigInt, HardwareInt>>) -> RangeValue {
-        fn as_compile(bound: &Option<MaybeCompile<BigInt, HardwareInt>>) -> Option<Option<&BigInt>> {
+impl<E> RangeValue<E> {
+    pub fn from_range(range: Range<MaybeCompile<BigInt, HardwareInt<E>>>) -> Self {
+        fn as_compile<H>(bound: &Option<MaybeCompile<BigInt, H>>) -> Option<Option<&BigInt>> {
             match bound {
                 None => Some(None),
                 Some(MaybeCompile::Compile(bound)) => Some(Some(bound)),
@@ -448,12 +449,12 @@ impl ValueCommon for SimpleCompileValue {
     }
 }
 
-impl ValueCommon for MixedCompoundValue {
+impl<E: Clone + Into<IrExpression>> ValueCommon for MixedCompoundValue<E> {
     fn domain(&self) -> ValueDomain {
         match self {
             MixedCompoundValue::String(v) => v.domain(),
             MixedCompoundValue::Range(v) => {
-                fn opt_domain<C, H>(x: Option<&MaybeCompile<C, HardwareValue<H>>>) -> ValueDomain {
+                fn opt_domain<C, H, E>(x: Option<&MaybeCompile<C, HardwareValue<H, E>>>) -> ValueDomain {
                     match x {
                         None => ValueDomain::CompileTime,
                         Some(start) => match start {
@@ -566,31 +567,30 @@ impl ValueCommon for MixedCompoundValue {
     }
 }
 
-impl MixedString {
+impl<E> MixedString<E> {
     pub fn try_as_compile(&self) -> Result<Arc<String>, NotCompile> {
         // TODO simplify this by banning consecutive literals?
         let MixedString { pieces } = self;
 
         // check all compile
+        let mut literals = Vec::with_capacity(pieces.len());
         for piece in pieces {
             match piece {
-                StringPiece::Literal(s) => {
-                    let _: &Arc<String> = s;
-                }
+                StringPiece::Literal(s) => literals.push(s),
                 StringPiece::Substitute(v) => {
-                    let _: &HardwareValue = v;
+                    let _: &HardwareValue<HardwareType, E> = v;
                     return Err(NotCompile);
                 }
             }
         }
 
         // convert to single string
-        if let Some(piece) = pieces.single_ref() {
-            Ok(unwrap_match!(piece, StringPiece::Literal(s) => s.clone()))
+        if let Some(&s) = literals.single_ref() {
+            Ok(Arc::clone(s))
         } else {
             let mut result = String::new();
-            for piece in pieces {
-                result.push_str(unwrap_match!(piece, StringPiece::Literal(s) => s.as_str()));
+            for s in literals {
+                result.push_str(s.as_str());
             }
             Ok(Arc::new(result))
         }
@@ -617,11 +617,11 @@ impl ValueCommon for CompileCompoundValue {
         span: Span,
         ty: &HardwareType,
     ) -> DiagResult<IrExpression> {
-        MixedCompoundValue::from(self.clone()).as_ir_expression_unchecked(refs, large, span, ty)
+        MixedCompoundValue::<IrExpression>::from(self.clone()).as_ir_expression_unchecked(refs, large, span, ty)
     }
 }
 
-impl ValueCommon for HardwareValue {
+impl<E: Clone + Into<IrExpression>> ValueCommon for HardwareValue<HardwareType, E> {
     fn domain(&self) -> ValueDomain {
         self.domain
     }
@@ -634,19 +634,17 @@ impl ValueCommon for HardwareValue {
         ty: &HardwareType,
     ) -> DiagResult<IrExpression> {
         let err_type = || internal_err_hw_type_mismatch(refs, span, self, ty).report(refs.diags);
+        let expr: IrExpression = self.expr.clone().into();
 
         if &self.ty == ty {
-            return Ok(self.expr.clone());
+            return Ok(expr.clone());
         }
 
         match (&self.ty, &ty) {
-            (HardwareType::Bool, HardwareType::Bool) => Ok(self.expr.clone()),
+            (HardwareType::Bool, HardwareType::Bool) => Ok(expr.clone()),
             (HardwareType::Int(ty_curr), HardwareType::Int(ty)) => {
                 if ty.contains_multi_range(ty_curr) {
-                    Ok(large.push_expr(IrExpressionLarge::ExpandIntRange(
-                        ty.enclosing().cloned(),
-                        self.expr.clone(),
-                    )))
+                    Ok(large.push_expr(IrExpressionLarge::ExpandIntRange(ty.enclosing().cloned(), expr.clone())))
                 } else {
                     Err(err_type())
                 }
@@ -672,7 +670,7 @@ impl ValueCommon for HardwareValue {
                     .map(|index| {
                         let step = IrTargetStepScalar::ArrayIndex(IrExpression::Int(index.into()));
                         let curr_elem_expr = large.push_expr(IrExpressionLarge::Steps {
-                            base: self.expr.clone(),
+                            base: expr.clone(),
                             steps: IrTargetSteps::single(step),
                         });
                         let curr_elem_hw = HardwareValue {
@@ -700,7 +698,7 @@ impl ValueCommon for HardwareValue {
                     .map(|i| {
                         let step = IrTargetStepScalar::TupleIndex(i);
                         let curr_elem_expr = large.push_expr(IrExpressionLarge::Steps {
-                            base: self.expr.clone(),
+                            base: expr.clone(),
                             steps: IrTargetSteps::single(step),
                         });
                         let curr_elem_hw = HardwareValue {
@@ -817,15 +815,19 @@ impl<T, E> HardwareValue<T, E> {
     }
 
     pub fn map_expression<U>(self, f: impl FnOnce(E) -> U) -> HardwareValue<T, U> {
-        HardwareValue {
+        self.try_map_expression::<U, Never>(|e| Ok(f(e))).remove_never()
+    }
+
+    pub fn try_map_expression<U, V>(self, f: impl FnOnce(E) -> Result<U, V>) -> Result<HardwareValue<T, U>, V> {
+        Ok(HardwareValue {
             ty: self.ty,
             domain: self.domain,
-            expr: f(self.expr),
-        }
+            expr: f(self.expr)?,
+        })
     }
 }
 
-impl<H> From<CompileValue> for Value<SimpleCompileValue, MixedCompoundValue, H> {
+impl<E, H> From<CompileValue> for Value<SimpleCompileValue, MixedCompoundValue<E>, H> {
     fn from(v: CompileValue) -> Self {
         match v {
             CompileValue::Simple(v) => Value::Simple(v),
@@ -834,7 +836,7 @@ impl<H> From<CompileValue> for Value<SimpleCompileValue, MixedCompoundValue, H> 
         }
     }
 }
-impl From<CompileCompoundValue> for MixedCompoundValue {
+impl<E> From<CompileCompoundValue> for MixedCompoundValue<E> {
     fn from(v: CompileCompoundValue) -> Self {
         match v {
             CompileCompoundValue::String(v) => {
@@ -872,42 +874,44 @@ impl From<CompileCompoundValue> for MixedCompoundValue {
     }
 }
 
-impl From<HardwareInt> for HardwareValue {
-    fn from(value: HardwareInt) -> Self {
+impl<E> From<HardwareInt<E>> for HardwareValue<HardwareType, E> {
+    fn from(value: HardwareInt<E>) -> Self {
         value.map_type(HardwareType::Int)
     }
 }
-impl From<HardwareUInt> for HardwareValue {
-    fn from(value: HardwareUInt) -> Self {
+impl<E> From<HardwareUInt<E>> for HardwareValue<HardwareType, E> {
+    fn from(value: HardwareUInt<E>) -> Self {
         value.map_type(|range| HardwareType::Int(range.map(BigInt::from)))
     }
 }
-impl From<HardwareBool> for HardwareValue {
-    fn from(value: HardwareBool) -> Self {
+impl<E> From<HardwareBool<E>> for HardwareValue<HardwareType, E> {
+    fn from(value: HardwareBool<E>) -> Self {
         value.map_type(|_: TypeBool| HardwareType::Bool)
     }
 }
 
-impl From<HardwareUInt> for HardwareInt {
-    fn from(value: HardwareUInt) -> Self {
+impl<E> From<HardwareUInt<E>> for HardwareInt<E> {
+    fn from(value: HardwareUInt<E>) -> Self {
         value.map_type(|range| range.map(BigInt::from))
     }
 }
-impl TryFrom<HardwareInt> for HardwareUInt {
-    type Error = HardwareInt;
+impl<E> TryFrom<HardwareInt<E>> for HardwareUInt<E> {
+    type Error = HardwareInt<E>;
 
-    fn try_from(value: HardwareInt) -> Result<Self, Self::Error> {
+    fn try_from(value: HardwareInt<E>) -> Result<Self, Self::Error> {
         if value.ty.enclosing().start.is_negative() {
             Err(value)
         } else {
-            let HardwareInt { ty, domain, expr } = value;
+            let HardwareValue { ty, domain, expr } = value;
             let ty = ty.map(|x| BigUint::try_from(x).expect("already checked start"));
-            Ok(HardwareUInt { ty, domain, expr })
+            Ok(HardwareValue { ty, domain, expr })
         }
     }
 }
 
-impl<C, H: Into<HardwareValue>> From<MaybeCompile<BigInt, H>> for Value<SimpleCompileValue, C, HardwareValue> {
+impl<C, E, H: Into<HardwareValue<HardwareType, E>>> From<MaybeCompile<BigInt, H>>
+    for Value<SimpleCompileValue, C, HardwareValue<HardwareType, E>>
+{
     fn from(value: MaybeCompile<BigInt, H>) -> Self {
         match value {
             MaybeCompile::Compile(v) => Value::Simple(SimpleCompileValue::Int(v)),
@@ -916,9 +920,9 @@ impl<C, H: Into<HardwareValue>> From<MaybeCompile<BigInt, H>> for Value<SimpleCo
     }
 }
 
-impl<H: Clone> TryFrom<&Value<SimpleCompileValue, MixedCompoundValue, H>> for CompileValue {
+impl<E, H> TryFrom<&Value<SimpleCompileValue, MixedCompoundValue<E>, H>> for CompileValue {
     type Error = NotCompile;
-    fn try_from(v: &Value<SimpleCompileValue, MixedCompoundValue, H>) -> Result<Self, Self::Error> {
+    fn try_from(v: &Value<SimpleCompileValue, MixedCompoundValue<E>, H>) -> Result<Self, Self::Error> {
         match v {
             Value::Simple(v) => Ok(CompileValue::Simple(v.clone())),
             Value::Compound(v) => Ok(CompileValue::Compound(CompileCompoundValue::try_from(v)?)),
@@ -926,9 +930,9 @@ impl<H: Clone> TryFrom<&Value<SimpleCompileValue, MixedCompoundValue, H>> for Co
         }
     }
 }
-impl TryFrom<&MixedCompoundValue> for CompileCompoundValue {
+impl<E> TryFrom<&MixedCompoundValue<E>> for CompileCompoundValue {
     type Error = NotCompile;
-    fn try_from(v: &MixedCompoundValue) -> Result<Self, Self::Error> {
+    fn try_from(v: &MixedCompoundValue<E>) -> Result<Self, Self::Error> {
         match v {
             MixedCompoundValue::String(v) => v.try_as_compile().map(CompileCompoundValue::String),
             MixedCompoundValue::Range(v) => match v {
@@ -970,36 +974,146 @@ impl TryFrom<&MixedCompoundValue> for CompileCompoundValue {
 }
 
 impl<S, C, H> Value<S, C, H> {
-    pub fn map_compile<U>(self, f: impl FnOnce(S) -> U) -> Value<U, C, H> {
-        self.try_map_compile::<U, Never>(|v| Ok(f(v))).remove_never()
-    }
-    pub fn map_mixed<U>(self, f: impl FnOnce(C) -> U) -> Value<S, U, H> {
-        self.try_map_mixed::<U, Never>(|v| Ok(f(v))).remove_never()
-    }
+    // TODO these should probably always be recursive?
     pub fn map_hardware<U>(self, f: impl FnOnce(H) -> U) -> Value<S, C, U> {
         self.try_map_hardware::<U, Never>(|v| Ok(f(v))).remove_never()
     }
 
-    pub fn try_map_compile<T, E>(self, f: impl FnOnce(S) -> Result<T, E>) -> Result<Value<T, C, H>, E> {
-        match self {
-            Value::Simple(v) => Ok(Value::Simple(f(v)?)),
-            Value::Compound(v) => Ok(Value::Compound(v)),
-            Value::Hardware(v) => Ok(Value::Hardware(v)),
-        }
-    }
-    pub fn try_map_mixed<T, E>(self, f: impl FnOnce(C) -> Result<T, E>) -> Result<Value<S, T, H>, E> {
-        match self {
-            Value::Simple(v) => Ok(Value::Simple(v)),
-            Value::Compound(v) => Ok(Value::Compound(f(v)?)),
-            Value::Hardware(v) => Ok(Value::Hardware(v)),
-        }
-    }
     pub fn try_map_hardware<T, E>(self, f: impl FnOnce(H) -> Result<T, E>) -> Result<Value<S, C, T>, E> {
         match self {
             Value::Simple(v) => Ok(Value::Simple(v)),
             Value::Compound(v) => Ok(Value::Compound(v)),
             Value::Hardware(v) => Ok(Value::Hardware(f(v)?)),
         }
+    }
+}
+
+impl<E: Clone> MixedValue<E> {
+    pub fn map_hardware_recursive<U>(&self, f: &mut impl FnMut(&HardwareValue<HardwareType, E>) -> U) -> MixedValue<U> {
+        self.try_map_hardware_recursive::<U, Never>(&mut |v| Ok(f(v)))
+            .remove_never()
+    }
+
+    pub fn try_map_hardware_recursive<U, V>(
+        &self,
+        f: &mut impl FnMut(&HardwareValue<HardwareType, E>) -> Result<U, V>,
+    ) -> Result<MixedValue<U>, V> {
+        match self {
+            Value::Simple(v) => Ok(Value::Simple(v.clone())),
+            Value::Compound(v) => Ok(Value::Compound(v.try_map_hardware_recursive(f)?)),
+            Value::Hardware(v) => Ok(Value::Hardware(HardwareValue {
+                ty: v.ty.clone(),
+                domain: v.domain,
+                expr: f(v)?,
+            })),
+        }
+    }
+}
+
+impl<E: Clone> MixedCompoundValue<E> {
+    pub fn map_hardware_recursive<U>(
+        &self,
+        f: &mut impl FnMut(&HardwareValue<HardwareType, E>) -> U,
+    ) -> MixedCompoundValue<U> {
+        self.try_map_hardware_recursive::<U, Never>(&mut |v| Ok(f(v)))
+            .remove_never()
+    }
+
+    pub fn try_map_hardware_recursive<U, V>(
+        &self,
+        f: &mut impl FnMut(&HardwareValue<HardwareType, E>) -> Result<U, V>,
+    ) -> Result<MixedCompoundValue<U>, V> {
+        fn map_hw<E: Clone, U, V>(
+            v: &HardwareValue<HardwareType, E>,
+            f: &mut impl FnMut(&HardwareValue<HardwareType, E>) -> Result<U, V>,
+        ) -> Result<HardwareValue<HardwareType, U>, V> {
+            Ok(HardwareValue {
+                ty: v.ty.clone(),
+                domain: v.domain,
+                expr: f(v)?,
+            })
+        }
+
+        fn map_int<E: Clone, U, V>(
+            v: &HardwareInt<E>,
+            f: &mut impl FnMut(&HardwareValue<HardwareType, E>) -> Result<U, V>,
+        ) -> Result<HardwareInt<U>, V> {
+            let v_hw: HardwareValue<HardwareType, E> = v.clone().into();
+            Ok(HardwareValue {
+                ty: v.ty.clone(),
+                domain: v.domain,
+                expr: f(&v_hw)?,
+            })
+        }
+
+        fn map_bound<E: Clone, U, V>(
+            bound: &Option<MaybeCompile<BigInt, HardwareInt<E>>>,
+            f: &mut impl FnMut(&HardwareValue<HardwareType, E>) -> Result<U, V>,
+        ) -> Result<Option<MaybeCompile<BigInt, HardwareInt<U>>>, V> {
+            Ok(match bound {
+                None => None,
+                Some(MaybeCompile::Compile(b)) => Some(MaybeCompile::Compile(b.clone())),
+                Some(MaybeCompile::Hardware(b)) => Some(MaybeCompile::Hardware(map_int(b, f)?)),
+            })
+        }
+
+        let result = match self {
+            MixedCompoundValue::String(s) => {
+                let pieces = s
+                    .pieces
+                    .iter()
+                    .map(|p| {
+                        Ok(match p {
+                            StringPiece::Literal(l) => StringPiece::Literal(l.clone()),
+                            StringPiece::Substitute(v) => StringPiece::Substitute(map_hw(v, f)?),
+                        })
+                    })
+                    .try_collect_vec()?;
+                MixedCompoundValue::String(Arc::new(MixedString { pieces }))
+            }
+            MixedCompoundValue::Range(r) => MixedCompoundValue::Range(match r {
+                RangeValue::Compile(r) => RangeValue::Compile(r.clone()),
+                // mapping expressions does not change which bounds are hardware, so the invariant is preserved
+                RangeValue::HardwareBounds(r) => RangeValue::HardwareBounds(HardwareBoundsRange {
+                    range: Range {
+                        start: map_bound(&r.range.start, f)?,
+                        end: map_bound(&r.range.end, f)?,
+                    },
+                }),
+                RangeValue::HardwareStartLength { start, length } => RangeValue::HardwareStartLength {
+                    start: map_int(start, f)?,
+                    length: length.clone(),
+                },
+            }),
+            MixedCompoundValue::Tuple(values) => MixedCompoundValue::Tuple(
+                values
+                    .iter()
+                    .map(|v| v.try_map_hardware_recursive(f))
+                    .try_collect_vec()?,
+            ),
+            MixedCompoundValue::Struct(v) => MixedCompoundValue::Struct(StructValue {
+                ty: v.ty,
+                fields: v
+                    .fields
+                    .iter()
+                    .map(|v| v.try_map_hardware_recursive(f))
+                    .try_collect_vec()?,
+            }),
+            MixedCompoundValue::Enum(v) => MixedCompoundValue::Enum(EnumValue {
+                ty: v.ty,
+                variant: v.variant,
+                payload: match &v.payload {
+                    None => None,
+                    Some(p) => Some(Box::new(p.try_map_hardware_recursive(f)?)),
+                },
+            }),
+            MixedCompoundValue::BoundMethod(m) => MixedCompoundValue::BoundMethod(BoundMethod {
+                self_type: m.self_type.clone(),
+                self_value: Box::new(m.self_value.try_map_hardware_recursive(f)?),
+                method: Arc::clone(&m.method),
+            }),
+        };
+        Ok(result)
     }
 }
 
@@ -1012,7 +1126,7 @@ impl<S: Typed, C: Typed, H: Typed> Typed for Value<S, C, H> {
         }
     }
 }
-impl Typed for MixedCompoundValue {
+impl<E> Typed for MixedCompoundValue<E> {
     fn ty(&self) -> Type {
         match self {
             MixedCompoundValue::String(_) => Type::String,
@@ -1067,7 +1181,7 @@ impl Typed for SimpleCompileValue {
     }
 }
 
-impl Typed for HardwareValue<HardwareType> {
+impl<E> Typed for HardwareValue<HardwareType, E> {
     fn ty(&self) -> Type {
         self.ty.as_type()
     }
@@ -1129,7 +1243,7 @@ impl<C, H> MaybeCompile<C, H> {
     }
 }
 
-impl MaybeCompile<BigInt, HardwareInt> {
+impl<E> MaybeCompile<BigInt, HardwareInt<E>> {
     pub fn range(&self) -> ClosedNonEmptyMultiRange<BigInt> {
         match self {
             MaybeCompile::Compile(value) => ClosedNonEmptyMultiRange::single(value.clone()),
@@ -1138,7 +1252,7 @@ impl MaybeCompile<BigInt, HardwareInt> {
     }
 }
 
-impl MaybeCompile<BigUint, HardwareUInt> {
+impl<E> MaybeCompile<BigUint, HardwareUInt<E>> {
     pub fn range(&self) -> ClosedNonEmptyMultiRange<BigUint> {
         match self {
             MaybeCompile::Compile(value) => ClosedNonEmptyMultiRange::single(value.clone()),

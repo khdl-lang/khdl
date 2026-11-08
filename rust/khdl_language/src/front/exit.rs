@@ -107,17 +107,17 @@ impl ExitFlag {
         let var = flow.var_new(info);
 
         // initialize to false
-        flow.var_set_compile(var, span, Ok(Value::new_bool(false)))?;
+        flow.var_set(refs, var, span, Ok(Value::new_bool(false)))?;
 
         Ok(Self { var })
     }
 
-    pub fn clear(&mut self, flow: &mut impl Flow, span: Span) -> DiagResult {
-        flow.var_set_compile(self.var, span, Ok(Value::new_bool(false)))
+    pub fn clear(&mut self, refs: CompileRefs, flow: &mut impl Flow, span: Span) -> DiagResult {
+        flow.var_set(refs, self.var, span, Ok(Value::new_bool(false)))
     }
 
-    pub fn set(&mut self, flow: &mut impl Flow, span: Span) -> DiagResult {
-        flow.var_set_compile(self.var, span, Ok(Value::new_bool(true)))
+    pub fn set(&mut self, refs: CompileRefs, flow: &mut impl Flow, span: Span) -> DiagResult {
+        flow.var_set(refs, self.var, span, Ok(Value::new_bool(true)))
     }
 
     pub fn get(

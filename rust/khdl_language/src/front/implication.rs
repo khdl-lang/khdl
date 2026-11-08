@@ -7,7 +7,7 @@ use crate::front::value::{HardwareValue, MaybeCompile, MixedCompoundValue, Simpl
 use crate::mid::ir::{IrExpression, IrLargeArena};
 use crate::syntax::pos::Span;
 use crate::util::big_int::BigInt;
-use crate::util::range_multi::MultiRange;
+use crate::util::range_multi::ClosedMultiRange;
 use std::fmt::Debug;
 
 #[derive(Debug, Clone)]
@@ -26,7 +26,7 @@ pub struct Implication<V = ValueVersion> {
 #[derive(Debug, Clone)]
 pub enum ImplicationKind {
     BoolEq(bool),
-    IntIn(MultiRange<BigInt>),
+    IntIn(ClosedMultiRange<BigInt>),
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -75,19 +75,6 @@ impl BoolImplications {
         self.if_false.push(Implication::new_bool(version, false));
     }
 
-    // TODO remove this
-    pub fn new(version: Option<ValueVersion>) -> Self {
-        let mut result = BoolImplications {
-            if_true: vec![],
-            if_false: vec![],
-        };
-        if let Some(version) = version {
-            result.if_true.push(Implication::new_bool(version, true));
-            result.if_false.push(Implication::new_bool(version, false));
-        }
-        result
-    }
-
     pub fn invert(self) -> Self {
         Self {
             if_true: self.if_false,
@@ -104,7 +91,7 @@ impl Implication {
         }
     }
 
-    pub fn new_int(value: ValueVersion, range: MultiRange<BigInt>) -> Self {
+    pub fn new_int(value: ValueVersion, range: ClosedMultiRange<BigInt>) -> Self {
         Self {
             version: value,
             kind: ImplicationKind::IntIn(range),
@@ -112,22 +99,18 @@ impl Implication {
     }
 }
 
-impl ValueWithVersion {
-    pub fn into_value(self) -> Value {
+impl<S, C, T, E> ValueWithVersion<S, C, T, E> {
+    pub fn into_value(self) -> Value<S, C, HardwareValue<T, E>> {
         self.map_hardware(|v| v.value)
     }
 }
 
-impl<S, C, T> ValueWithImplications<S, C, T> {
-    pub fn simple(value: Value<S, C, HardwareValue<T>>) -> Self {
+impl<S, C, T, E> ValueWithImplications<S, C, T, E> {
+    pub fn simple(value: Value<S, C, HardwareValue<T, E>>) -> Self {
         value.map_hardware(HardwareValueWithImplications::simple)
     }
 
-    pub fn simple_version(value: ValueWithVersion<S, C, T>) -> Self {
-        value.map_hardware(HardwareValueWithImplications::simple_version)
-    }
-
-    pub fn into_value(self) -> Value<S, C, HardwareValue<T>> {
+    pub fn into_value(self) -> Value<S, C, HardwareValue<T, E>> {
         self.map_hardware(|v| v.value)
     }
 }
@@ -138,15 +121,6 @@ impl<T, E> HardwareValueWithImplications<T, E> {
             value,
             version: None,
             implications: BoolImplications::NONE,
-        }
-    }
-
-    pub fn simple_version(value: HardwareValueWithVersion<ValueVersion, T, E>) -> Self {
-        // TODO do this when the type is actually bool?
-        Self {
-            value: value.value,
-            version: Some(value.version),
-            implications: BoolImplications::new(Some(value.version)),
         }
     }
 }
@@ -198,7 +172,7 @@ impl<E> Typed for HardwareValueWithImplications<HardwareType, E> {
     }
 }
 
-impl<V> ValueCommon for HardwareValueWithVersion<V, HardwareType, IrExpression> {
+impl<V, E: Clone + Into<IrExpression>> ValueCommon for HardwareValueWithVersion<V, HardwareType, E> {
     fn domain(&self) -> ValueDomain {
         self.value.domain()
     }
@@ -214,7 +188,7 @@ impl<V> ValueCommon for HardwareValueWithVersion<V, HardwareType, IrExpression> 
     }
 }
 
-impl ValueCommon for HardwareValueWithImplications<HardwareType, IrExpression> {
+impl<E: Clone + Into<IrExpression>> ValueCommon for HardwareValueWithImplications<HardwareType, E> {
     fn domain(&self) -> ValueDomain {
         self.value.domain()
     }

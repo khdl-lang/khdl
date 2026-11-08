@@ -54,7 +54,7 @@ use crate::util::intern::Id;
 use crate::util::iter::IterExt;
 use crate::util::nd_array::NdArray;
 use crate::util::range::{ClosedNonEmptyRange, NonEmptyRange, Range, RangeEmpty, RangeOpen};
-use crate::util::range_multi::{AnyMultiRange, ClosedNonEmptyMultiRange, MultiRange};
+use crate::util::range_multi::{AnyMultiRange, ClosedMultiRange, ClosedNonEmptyMultiRange, MultiRange};
 use itertools::{Either, zip_eq};
 use std::sync::Arc;
 use unwrap_match::unwrap_match;
@@ -2687,7 +2687,7 @@ pub fn eval_binary_bool_typed(
                     if_true: vec![],
                     if_false: vec_concat([left.implications.if_false, right.implications.if_false]),
                 },
-                IrBoolBinaryOp::Xor => BoolImplications::new(None),
+                IrBoolBinaryOp::Xor => BoolImplications::NONE,
             };
 
             MaybeCompile::Hardware(HardwareValueWithImplications {
@@ -3190,45 +3190,53 @@ fn implications_lt(
     let mut if_false = vec![];
 
     if let Some(left) = left {
-        if_true.push(implication_lt_is(true, eq, left, right_range));
-        if_false.push(implication_lt_is(false, eq, left, right_range));
+        if_true.push(implication_lt_is(true, eq, left, left_range, right_range));
+        if_false.push(implication_lt_is(false, eq, left, left_range, right_range));
     }
 
     #[allow(clippy::nonminimal_bool)]
     if let Some(right) = right {
         // flip left/right by inverting the eval and eq flags
-        if_true.push(implication_lt_is(!true, !eq, right, left_range));
-        if_false.push(implication_lt_is(!false, !eq, right, left_range));
+        if_true.push(implication_lt_is(!true, !eq, right, right_range, left_range));
+        if_false.push(implication_lt_is(!false, !eq, right, right_range, left_range));
     }
 
     BoolImplications { if_true, if_false }
 }
 
 /// Construct the implication for `left <(=) right == eval`. `eq` indicates whether the comparison is `<` or `<=`.
-fn implication_lt_is(eval: bool, eq: bool, left: ValueVersion, right: ClosedNonEmptyRange<&BigInt>) -> Implication {
+fn implication_lt_is(
+    eval: bool,
+    eq: bool,
+    left: ValueVersion,
+    left_range: ClosedNonEmptyRange<&BigInt>,
+    right_range: ClosedNonEmptyRange<&BigInt>,
+) -> Implication {
     let range = match (eval, eq) {
         // left <= right
         (true, true) => Range {
             start: None,
-            end: Some(right.end.clone()),
+            end: Some(right_range.end.clone()),
         },
         // left < right
         (true, false) => Range {
             start: None,
-            end: Some(right.end - 1),
+            end: Some(right_range.end - 1),
         },
         // left > right
         (false, true) => Range {
-            start: Some(right.start + 1),
+            start: Some(right_range.start + 1),
             end: None,
         },
         // left >= right
         (false, false) => Range {
-            start: Some(right.start.clone()),
+            start: Some(right_range.start.clone()),
             end: None,
         },
     };
-    Implication::new_int(left, MultiRange::from(range))
+
+    let range = ClosedMultiRange::from(left_range.cloned()).intersect(&MultiRange::from(range));
+    Implication::new_int(left, range)
 }
 
 fn implications_eq(
@@ -3241,30 +3249,20 @@ fn implications_eq(
     let mut if_false = vec![];
 
     if let Some(left) = left {
-        if_true.push(Implication::new_int(
-            left,
-            MultiRange::from(Range::from(right_range.cloned())),
-        ));
+        if_true.push(Implication::new_int(left, ClosedMultiRange::from(right_range.cloned())));
 
         if let Some(right_single) = right_range.as_single() {
-            if_false.push(Implication::new_int(
-                left,
-                MultiRange::from(Range::single(right_single.clone())).complement(),
-            ));
+            let range = ClosedMultiRange::from(left_range.cloned()).subtract(&MultiRange::single(right_single.clone()));
+            if_false.push(Implication::new_int(left, range));
         }
     }
 
     if let Some(right) = right {
-        if_true.push(Implication::new_int(
-            right,
-            MultiRange::from(Range::from(left_range.cloned())),
-        ));
+        if_true.push(Implication::new_int(right, ClosedMultiRange::from(left_range.cloned())));
 
         if let Some(left_single) = left_range.as_single() {
-            if_false.push(Implication::new_int(
-                right,
-                MultiRange::from(Range::single(left_single.clone())).complement(),
-            ));
+            let range = ClosedMultiRange::from(right_range.cloned()).subtract(&MultiRange::single(left_single.clone()));
+            if_false.push(Implication::new_int(right, range));
         }
     }
 
@@ -3385,9 +3383,14 @@ fn array_literal_combine_values(
 
         // store result in variable to prevent large duplicate expressions
         let flow = flow.require_hardware(expr_span, "array literal containing hardware values")?;
-        let result_value = flow.store_hardware_value_in_new_ir_variable(refs, expr_span, None, result_value);
+        let result_value_var =
+            flow.store_hardware_value_in_new_ir_variable(refs, expr_span, None, &result_value.ty, result_value.expr);
 
-        Ok(Value::Hardware(result_value.map_expression(IrExpression::Variable)))
+        Ok(Value::Hardware(HardwareValue {
+            ty: result_value.ty,
+            domain: result_value.domain,
+            expr: IrExpression::Variable(result_value_var),
+        }))
     } else {
         // all compile, create compile value
         let mut result = Vec::with_capacity(values.len());

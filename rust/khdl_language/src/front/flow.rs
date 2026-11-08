@@ -24,8 +24,8 @@ use crate::util::data::IndexMapExt;
 use crate::util::intern::{Id, MaybeId};
 use crate::util::iter::IterExt;
 use crate::util::range::RangeEmpty;
-use crate::util::range_multi::{ClosedMultiRange, ClosedNonEmptyMultiRange};
-use crate::util::{NON_ZERO_USIZE_ONE, NON_ZERO_USIZE_TWO, ResultExt};
+use crate::util::range_multi::{ClosedMultiRange, ClosedNonEmptyMultiRange, MultiRange};
+use crate::util::{NON_ZERO_USIZE_ONE, ResultExt};
 use indexmap::{IndexMap, IndexSet};
 use itertools::{Itertools, zip_eq};
 use std::cell::Cell;
@@ -52,7 +52,7 @@ pub struct FlowRoot<'d> {
     check: RandomCheck,
 
     next_var_index: Cell<NonZeroUsize>,
-    next_version: Cell<NonZeroUsize>,
+    next_version_index: Cell<NonZeroUsize>,
 }
 
 #[derive(Debug)]
@@ -244,13 +244,13 @@ enum VariableNotFullyAssigned {
     Undefined,
 }
 
-type VariableValue = Value<SimpleCompileValue, MixedCompoundValue, VariableValueHardware>;
+type VariableValue = Value<SimpleCompileValue, MixedCompoundValue<IrVariable>, VariableValueHardware>;
 
 #[derive(Debug, Clone)]
 struct VariableValueHardware {
-    /// The version assigned to the currently stored value. This increases on every assignment.
-    version_index: VersionIndex,
-    /// The way value stored. Its type does not have any implications applied yet.
+    /// The version of the currently stored value.
+    version: ValueVersion,
+    /// The stored value. Its type does not have any implications applied yet.
     value_raw: HardwareValue<HardwareType, IrVariable>,
     /// The implications that hold if this value is true/false.
     implications: BoolImplications,
@@ -259,6 +259,7 @@ struct VariableValueHardware {
 pub type VarSetValue =
     Value<SimpleCompileValue, MixedCompoundValue, HardwareValueWithImplications<HardwareType, IrVariable>>;
 
+#[derive(Debug, Clone)]
 enum SignalContent {
     Compile(CompileValue),
     Hardware(SignalContentHardware),
@@ -266,8 +267,8 @@ enum SignalContent {
 
 #[derive(Debug, Clone)]
 struct SignalContentHardware {
-    /// The version assigned to the currently stored value. This increases on every assignment.
-    version_index: VersionIndex,
+    /// The version of the currently stored value.
+    version: ValueVersion,
     /// The implications that hold if this value is true/false.
     implications: BoolImplications,
 }
@@ -278,14 +279,23 @@ enum Implied {
     IntRange(ClosedNonEmptyMultiRange<BigInt>),
 }
 
+/// The version of a value stored in a signal or variable.
+///
+/// Multiple values with the same version are guaranteed to actually be the same value.
+/// These are fully unique within a given flow hierarchy.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct ValueVersion {
-    signal: SignalOrVariable,
-    index: VersionIndex,
+    // TODO make debug mode only, this is only used for assertions here (elsewhere in flow it's used more generally)
+    id: FlowRootId,
+    kind: ValueVersionKind,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-struct VersionIndex(NonZeroUsize);
+enum ValueVersionKind {
+    // Dedicated version for initial signal versions, so we don't have to awkwardly pre-define them.
+    SignalInitial(Signal),
+    Index(NonZeroUsize),
+}
 
 trait FlowPrivate: Sized {
     fn root(&self) -> &FlowRoot<'_>;
@@ -294,7 +304,8 @@ trait FlowPrivate: Sized {
     fn var_set_content(&mut self, var: Variable, assignment_span: Span, content: VariableContent) -> DiagResult;
     fn var_get_content(&self, var: Spanned<Variable>) -> DiagResult<&VariableContent>;
 
-    fn signal_get_content(&self, signal: Signal) -> DiagResult<&SignalContent>;
+    // TODO avoid clone?
+    fn signal_get_content(&self, signal: Signal) -> SignalContent;
 
     fn get_implied(&self, version: ValueVersion) -> Option<&Implied>;
 }
@@ -340,70 +351,95 @@ pub trait Flow: FlowPrivate {
         assignment_span: Span,
         value: DiagResult<ValueWithImplications>,
     ) -> DiagResult {
-        // store value in IrVariable if it's a hardware value
-        let value = value.and_then(|value| {
-            value.try_map_hardware(|value| {
-                let var_info = self.var_info(Spanned::new(assignment_span, var))?;
-                let debug_info_id = var_info.id.str(&refs.shared.interner).map(str::to_owned);
-
-                let flow = self.require_hardware(assignment_span, "assigning hardware value")?;
-
-                let HardwareValueWithImplications {
-                    value,
-                    version,
-                    implications,
-                } = value;
-                let _ = version;
-
-                let value_var =
-                    flow.store_hardware_value_in_new_ir_variable(refs, assignment_span, debug_info_id, value);
-
-                Ok(HardwareValueWithImplications {
-                    value: value_var,
-                    version: None,
-                    implications,
-                })
-            })
-        });
-
-        self.var_set_without_copy(var, assignment_span, value)
-    }
-
-    /// More specific form of [var_set] that only works for compile-time value.
-    fn var_set_compile(&mut self, var: Variable, assignment_span: Span, value: DiagResult<CompileValue>) -> DiagResult {
-        self.var_set_without_copy(var, assignment_span, value.map(VarSetValue::from))
-    }
-
-    /// More specific form of [var_set] if the value is already in an IR variable,
-    /// and transferring the ownership of that variable to the flow is desired.
-    fn var_set_without_copy(
-        &mut self,
-        var: Variable,
-        assignment_span: Span,
-        value: DiagResult<VarSetValue>,
-    ) -> DiagResult {
-        // TODO stop accepting DiagError here, if something fails we should stop immediately,
-        //   there are too many much type inference and side effects that can cause secondary issues
-        // TODO double-check that we're not setting a hardware value in a compile context, that should be impossible
-        let assigned = match value {
+        let content = match value {
             Ok(value) => {
-                let value = value.map_hardware(|value| {
-                    let HardwareValueWithImplications {
-                        value,
-                        version: _,
-                        implications,
-                    } = value;
-                    VariableValueHardware {
-                        version_index: self.root().next_version(),
-                        value_raw: value,
-                        implications,
+                let value = match value {
+                    Value::Simple(value) => VariableValue::Simple(value),
+                    Value::Compound(value) => {
+                        let result = value.try_map_hardware_recursive(&mut |e| {
+                            // TODO add debug id, plus step indices?
+                            let flow = self.require_hardware(assignment_span, "assigning hardware value")?;
+                            let value = flow.store_hardware_value_in_new_ir_variable(
+                                refs,
+                                assignment_span,
+                                None,
+                                &e.ty,
+                                e.expr.clone(),
+                            );
+                            Ok(value)
+                        })?;
+                        VariableValue::Compound(result)
                     }
-                });
+                    Value::Hardware(value) => {
+                        let HardwareValueWithImplications {
+                            value,
+                            version,
+                            implications,
+                        } = value;
+                        if let Some(version) = version {
+                            assert_eq!(version.id, self.root_id());
+                        }
+
+                        let var_info = self.var_info(Spanned::new(assignment_span, var))?;
+                        let debug_info_id = var_info.id.str(&refs.shared.interner).map(str::to_owned);
+                        let flow = self.require_hardware(assignment_span, "assigning hardware value")?;
+                        let var_ir = flow.store_hardware_value_in_new_ir_variable(
+                            refs,
+                            assignment_span,
+                            debug_info_id,
+                            &value.ty,
+                            value.expr,
+                        );
+
+                        let version = version.unwrap_or_else(|| self.root().next_version());
+
+                        VariableValue::Hardware(VariableValueHardware {
+                            version,
+                            value_raw: HardwareValue {
+                                ty: value.ty,
+                                domain: value.domain,
+                                expr: var_ir,
+                            },
+                            implications,
+                        })
+                    }
+                };
+
                 VariableContent::Assigned(Spanned::new(assignment_span, value))
             }
             Err(e) => VariableContent::Error(e),
         };
-        self.var_set_content(var, assignment_span, assigned)
+
+        self.var_set_content(var, assignment_span, content)
+    }
+
+    /// More specific form of [var_set] if the value is already in an IR variable,
+    ///   and transferring the ownership of that variable can be transferred to the flow.
+    // TODO maybe just delete this once we IR passes that clean up redundant variables
+    fn var_set_to_ir_variable(
+        &mut self,
+        var: Variable,
+        assignment_span: Span,
+        value: HardwareValueWithImplications<HardwareType, IrVariable>,
+    ) -> DiagResult {
+        let HardwareValueWithImplications {
+            value,
+            version,
+            implications,
+        } = value;
+
+        // keep or pick version
+        let version = version.unwrap_or_else(|| self.root().next_version());
+
+        // wrap value
+        let value = VariableValueHardware {
+            version,
+            value_raw: value,
+            implications,
+        };
+        let content = VariableContent::Assigned(Spanned::new(assignment_span, VariableValue::Hardware(value)));
+
+        self.var_set_content(var, assignment_span, content)
     }
 
     fn var_set_undefined(&mut self, var: Variable, span: Span) -> DiagResult {
@@ -421,49 +457,19 @@ pub trait Flow: FlowPrivate {
         large: &mut IrLargeArena,
         var: Spanned<Variable>,
     ) -> DiagResult<ValueWithImplications> {
-        self.var_eval_without_copy(large, var)?
-            .try_map_hardware(|value_uncopied| {
-                // store into intermediate variable (copy-on-read)
-                let var_info = self.var_info(var)?;
-                let debug_info_id = var_info.id.str(&refs.shared.interner).map(str::to_owned);
-                let flow = self.require_hardware(var.span, VAR_EVAL_HW_REASON)?;
-
-                let HardwareValueWithImplications {
-                    value: value_uncopied,
-                    version,
-                    implications,
-                } = value_uncopied;
-
-                let value = flow.store_hardware_value_in_new_ir_variable(refs, var.span, debug_info_id, value_uncopied);
-
-                Ok(HardwareValueWithImplications {
-                    value: value.map_expression(IrExpression::Variable),
-                    version,
-                    implications,
-                })
-            })
-    }
-
-    /// Variant of [var_eval] that does not create a defensive copy of the hardware value.
-    fn var_eval_without_copy(
-        &mut self,
-        large: &mut IrLargeArena,
-        var: Spanned<Variable>,
-    ) -> DiagResult<ValueWithImplications> {
-        let diags = self.root().diags;
+        let diags = refs.diags;
 
         let value = match self.var_get_content(var)? {
             VariableContent::Assigned(value) => match &value.inner {
                 Value::Simple(v) => Value::Simple(v.clone()),
-                Value::Compound(v) => Value::Compound(v.clone()),
+                Value::Compound(v) => {
+                    Value::Compound(v.map_hardware_recursive(&mut |e| IrExpression::Variable(e.expr)))
+                }
                 Value::Hardware(v) => {
-                    let version = ValueVersion {
-                        signal: var.inner.into(),
-                        index: v.version_index,
-                    };
+                    let version = v.version;
                     let implied = self.get_implied(version);
 
-                    v.as_value_without_copy(large, var.inner, implied)
+                    v.as_value_without_copy(large, implied)
                 }
             },
             VariableContent::NotFullyAssigned(kind) => {
@@ -493,21 +499,15 @@ pub trait Flow: FlowPrivate {
     /// This takes into account any active implications.
     fn type_of(&self, ctx: &mut CompileItemContext, value: Spanned<SignalOrVariable>) -> DiagResult<Type> {
         match value.inner {
-            SignalOrVariable::Signal(signal) => match self.signal_get_content(signal)? {
-                SignalContent::Compile(value) => Ok(value.ty()),
-                SignalContent::Hardware(signal_hw) => {
-                    let version = ValueVersion {
-                        signal: signal.into(),
-                        index: signal_hw.version_index,
-                    };
-                    match self.get_implied(version) {
-                        None => signal
-                            .expect_ty(ctx, value.span)
-                            .as_ref_ok()
-                            .map(|ty| ty.inner.as_type()),
-                        Some(implied) => Ok(implied.ty_hw().as_type()),
-                    }
-                }
+            SignalOrVariable::Signal(signal) => match self.signal_get_content(signal) {
+                SignalContent::Compile(content) => Ok(content.ty()),
+                SignalContent::Hardware(content) => match self.get_implied(content.version) {
+                    None => signal
+                        .expect_ty(ctx, value.span)
+                        .as_ref_ok()
+                        .map(|ty| ty.inner.as_type()),
+                    Some(implied) => Ok(implied.ty_hw().as_type()),
+                },
             },
             SignalOrVariable::Variable(var) => {
                 let content = self.var_get_content(Spanned::new(value.span, var))?;
@@ -517,10 +517,7 @@ pub trait Flow: FlowPrivate {
                         VariableValue::Simple(value) => Ok(value.ty()),
                         VariableValue::Compound(value) => Ok(value.ty()),
                         VariableValue::Hardware(value) => {
-                            let version = ValueVersion {
-                                signal: var.into(),
-                                index: value.version_index,
-                            };
+                            let version = value.version;
                             match self.get_implied(version) {
                                 None => Ok(value.value_raw.ty.as_type()),
                                 Some(implied) => Ok(implied.ty_hw().as_type()),
@@ -579,10 +576,10 @@ pub trait Flow: FlowPrivate {
         }
     }
 
-    fn signal_eval_if_compile(&mut self, signal: Spanned<Signal>) -> DiagResult<Option<&CompileValue>> {
-        match self.signal_get_content(signal.inner)? {
-            SignalContent::Compile(value) => Ok(Some(value)),
-            SignalContent::Hardware(_) => Ok(None),
+    fn signal_eval_if_compile(&mut self, signal: Spanned<Signal>) -> Option<CompileValue> {
+        match self.signal_get_content(signal.inner) {
+            SignalContent::Compile(value) => Some(value),
+            SignalContent::Hardware(_) => None,
         }
     }
 
@@ -592,24 +589,17 @@ pub trait Flow: FlowPrivate {
         signal: Spanned<Signal>,
         steps: &TargetSteps,
     ) -> DiagResult<ValueWithImplications> {
-        match self.signal_get_content(signal.inner)? {
+        match self.signal_get_content(signal.inner) {
             SignalContent::Compile(value) => {
                 // compile-time evaluation can skip any hardware checking
                 let value = Spanned::new(signal.span, ValueWithImplications::from(value.clone()));
                 steps.apply_to_value(ctx, &Type::Any, value)
             }
             SignalContent::Hardware(content) => {
-                let &SignalContentHardware {
-                    version_index: full_version_index,
-                    implications: ref full_implications,
-                } = content;
+                let SignalContentHardware { version, implications } = content;
 
                 // get implied info, immediately return if compile-time
-                let full_version = ValueVersion {
-                    signal: signal.inner.into(),
-                    index: full_version_index,
-                };
-                let implied = self.get_implied(full_version);
+                let implied = self.get_implied(version);
                 let implied_int_range = match implied {
                     None => None,
                     Some(implied) => match implied {
@@ -667,8 +657,8 @@ pub trait Flow: FlowPrivate {
                 let value_without_copy = {
                     let base = HardwareValueWithImplications {
                         value: value_full_without_copy,
-                        version: Some(full_version),
-                        implications: full_implications.clone(),
+                        version: Some(version),
+                        implications,
                     };
                     let base = Spanned::new(signal.span, ValueWithImplications::Hardware(base));
                     let result = steps.apply_to_value(ctx, &Type::Any, base)?;
@@ -700,12 +690,13 @@ pub trait Flow: FlowPrivate {
                     ctx.refs,
                     signal.span,
                     Some(debug_info_id),
-                    value_without_copy.value,
+                    &value_without_copy.value.ty,
+                    value_without_copy.value.expr,
                 );
 
                 // add self-implications
                 let mut implications = value_without_copy.implications;
-                if value_var.ty == HardwareType::Bool
+                if value_without_copy.value.ty == HardwareType::Bool
                     && let Some(version) = value_without_copy.version
                 {
                     implications.add_bool_self_implications(version);
@@ -713,7 +704,11 @@ pub trait Flow: FlowPrivate {
 
                 // wrap result
                 let value = HardwareValueWithImplications {
-                    value: value_var.map_expression(IrExpression::Variable),
+                    value: HardwareValue {
+                        ty: value_without_copy.value.ty,
+                        domain: value_without_copy.value.domain,
+                        expr: IrExpression::Variable(value_var),
+                    },
                     version: value_without_copy.version,
                     implications,
                 };
@@ -738,10 +733,6 @@ pub trait Flow: FlowPrivate {
     }
 }
 
-/// We start assigning new versions at at 2,
-///   so we can always safely use 1 as the first version for values that have not yet been assigned.
-const VERSION_INITIAL: VersionIndex = VersionIndex(NON_ZERO_USIZE_ONE);
-
 impl<'d> FlowRoot<'d> {
     pub fn new(diags: &'d Diagnostics, next: &NextFlowRootId) -> FlowRoot<'d> {
         FlowRoot {
@@ -749,7 +740,7 @@ impl<'d> FlowRoot<'d> {
             id: FlowRootId(next.0.fetch_add(1, Ordering::Relaxed)),
             check: RandomCheck::new(),
             next_var_index: Cell::new(NON_ZERO_USIZE_ONE),
-            next_version: Cell::new(NON_ZERO_USIZE_TWO),
+            next_version_index: Cell::new(NON_ZERO_USIZE_ONE),
         }
     }
 
@@ -758,7 +749,7 @@ impl<'d> FlowRoot<'d> {
             id: self.id,
             check: self.check,
             next_var_index: self.next_var_index,
-            next_version: self.next_version,
+            next_version: self.next_version_index,
         }
     }
 
@@ -768,7 +759,7 @@ impl<'d> FlowRoot<'d> {
             id: content.id,
             check: content.check,
             next_var_index: content.next_var_index,
-            next_version: content.next_version,
+            next_version_index: content.next_version,
         }
     }
 
@@ -781,10 +772,27 @@ impl<'d> FlowRoot<'d> {
         }
     }
 
-    fn next_version(&self) -> VersionIndex {
-        let version = self.next_version.get();
-        self.next_version.set(version.checked_add(1).expect("overflow"));
-        VersionIndex(version)
+    fn next_version(&self) -> ValueVersion {
+        let index = self.next_version_index.get();
+        self.next_version_index.set(index.checked_add(1).expect("overflow"));
+        ValueVersion {
+            id: self.id,
+            kind: ValueVersionKind::Index(index),
+        }
+    }
+
+    fn initial_signal_version(&self, signal: Signal) -> ValueVersion {
+        ValueVersion {
+            id: self.id,
+            kind: ValueVersionKind::SignalInitial(signal),
+        }
+    }
+
+    fn initial_signal_content(&self, signal: Signal) -> SignalContent {
+        SignalContent::Hardware(SignalContentHardware {
+            version: self.initial_signal_version(signal),
+            implications: BoolImplications::NONE,
+        })
     }
 }
 
@@ -876,16 +884,16 @@ impl FlowPrivate for FlowCompile<'_> {
         }
     }
 
-    fn signal_get_content(&self, signal: Signal) -> DiagResult<&SignalContent> {
+    fn signal_get_content(&self, signal: Signal) -> SignalContent {
         let mut curr = self;
         loop {
             curr = match &curr.parent {
-                FlowCompileKind::Root => return Ok(SignalContent::INITIAL_REF),
+                FlowCompileKind::Root => {
+                    break curr.root.initial_signal_content(signal);
+                }
                 FlowCompileKind::IsolatedCompile(parent) => parent,
                 FlowCompileKind::ScopedCompile(parent) => parent,
-                FlowCompileKind::ScopedHardware(parent) => {
-                    return parent.signal_get_content(signal);
-                }
+                FlowCompileKind::ScopedHardware(parent) => break parent.signal_get_content(signal),
             }
         }
     }
@@ -1132,7 +1140,6 @@ impl<'p> FlowHardware<'p> {
 
     pub fn new_child_branch(
         &mut self,
-        ctx: &mut CompileItemContext,
         span: Span,
         cond_domain: Spanned<ValueDomain>,
         cond_implications: Vec<Implication>,
@@ -1145,18 +1152,13 @@ impl<'p> FlowHardware<'p> {
             root,
             parent: slf,
             cond_domain,
-            common: FlowHardwareCommon {
-                variables: IndexMap::new(),
-                signals: IndexMap::new(),
-                implied: IndexMap::new(),
-                statements: vec![],
-            },
+            common: FlowHardwareCommon::new(),
         };
 
         // apply implications
         let mut result_hw = result.as_flow();
         for implication in cond_implications {
-            try_inner!(result_hw.add_implication(ctx, span, implication)?);
+            try_inner!(result_hw.add_implication(span, implication)?);
         }
 
         Ok(Ok(result))
@@ -1164,7 +1166,6 @@ impl<'p> FlowHardware<'p> {
 
     pub fn add_implication(
         &mut self,
-        ctx: &mut CompileItemContext,
         span: Span,
         implication: Implication,
     ) -> DiagResult<Result<(), ImplicationContradiction>> {
@@ -1174,45 +1175,6 @@ impl<'p> FlowHardware<'p> {
             version,
             kind: impl_kind,
         } = implication;
-        let ValueVersion {
-            signal,
-            index: version_index,
-        } = version;
-
-        // Check that the version is current and get the underlying type, without any applied implications yet.
-        // Compile-time contents always count as a different version, we can't look at their values for contradictions.
-        let current_ty = match signal {
-            SignalOrVariable::Signal(signal) => match self.signal_get_content(signal)? {
-                SignalContent::Compile(_) => None,
-                SignalContent::Hardware(content) => {
-                    if content.version_index == version_index {
-                        Some(signal.expect_ty(ctx, span)?.inner)
-                    } else {
-                        None
-                    }
-                }
-            },
-            SignalOrVariable::Variable(var) => match self.var_get_content(Spanned::new(span, var))? {
-                VariableContent::Assigned(value) => match &value.inner {
-                    VariableValue::Simple(_) => None,
-                    VariableValue::Compound(_) => None,
-                    VariableValue::Hardware(value) => {
-                        if value.version_index == version_index {
-                            Some(&value.value_raw.ty)
-                        } else {
-                            None
-                        }
-                    }
-                },
-                VariableContent::NotFullyAssigned(_) => {
-                    return Err(diags.report_error_internal(span, "implication on not-fully-assigned variable"));
-                }
-                &VariableContent::Error(e) => return Err(e),
-            },
-        };
-        let Some(current_ty) = current_ty else {
-            return Ok(Ok(()));
-        };
 
         // combine new implication with previous implication if any
         let prev_implied = self.get_implied(version);
@@ -1233,22 +1195,17 @@ impl<'p> FlowHardware<'p> {
                 },
             },
             ImplicationKind::IntIn(impl_range) => {
-                let prev_range = match prev_implied {
+                let new_range = match prev_implied {
+                    None => impl_range,
                     Some(prev_implied) => match prev_implied {
                         Implied::BoolConst(_) => {
                             return Err(diags.report_error_internal(span, "combining bool and int implication"));
                         }
-                        Implied::IntRange(prev_range) => prev_range,
-                    },
-                    None => match current_ty {
-                        HardwareType::Int(prev_range) => prev_range,
-                        _ => {
-                            return Err(diags.report_error_internal(span, "combining int implication and non-int type"));
+                        Implied::IntRange(prev_range) => {
+                            ClosedMultiRange::from(prev_range.clone()).intersect(&MultiRange::from(impl_range))
                         }
                     },
                 };
-
-                let new_range = ClosedMultiRange::from(prev_range.clone()).intersect(&impl_range);
                 let new_range = match ClosedNonEmptyMultiRange::try_from(new_range) {
                     Ok(new_range) => new_range,
                     Err(RangeEmpty) => return Ok(Err(ImplicationContradiction)),
@@ -1447,20 +1404,13 @@ impl<'p> FlowHardware<'p> {
         // TODO ban signal assignments in wire expressions and port connections
 
         let mut hardware_content = |implied, implications| {
-            let version_index = self.root.next_version();
+            let version = self.root.next_version();
 
             if let Some(implied) = implied {
-                let version = ValueVersion {
-                    signal: signal.inner.into(),
-                    index: version_index,
-                };
                 self.first_common_mut().implied.insert(version, implied);
             }
 
-            SignalContent::Hardware(SignalContentHardware {
-                version_index,
-                implications,
-            })
+            SignalContent::Hardware(SignalContentHardware { version, implications })
         };
 
         let content = match value {
@@ -1497,10 +1447,11 @@ impl<'p> FlowHardware<'p> {
         refs: CompileRefs,
         span: Span,
         debug_info_id: Option<String>,
-        value: HardwareValue,
-    ) -> HardwareValue<HardwareType, IrVariable> {
+        ty: &HardwareType,
+        expr: IrExpression,
+    ) -> IrVariable {
         let var_ir_info = IrVariableInfo {
-            ty: value.ty.as_ir(refs),
+            ty: ty.as_ir(refs),
             debug_info_span: span,
             debug_info_id,
         };
@@ -1508,14 +1459,10 @@ impl<'p> FlowHardware<'p> {
         let var_ir = self.new_ir_variable(var_ir_info);
 
         let target = IrAssignmentTarget::simple(var_ir);
-        let stmt_store = IrStatement::Assign(target, value.expr);
+        let stmt_store = IrStatement::Assign(target, expr);
         self.push_ir_statement(Spanned::new(span, stmt_store));
 
-        HardwareValue {
-            ty: value.ty,
-            domain: value.domain,
-            expr: var_ir,
-        }
+        var_ir
     }
 }
 
@@ -1612,19 +1559,22 @@ impl FlowPrivate for FlowHardware<'_> {
         }
     }
 
-    fn signal_get_content(&self, signal: Signal) -> DiagResult<&SignalContent> {
+    fn signal_get_content(&self, signal: Signal) -> SignalContent {
         let mut curr = self;
         loop {
             curr = match &curr.kind {
                 FlowHardwareKind::Root(root) => {
-                    if let Some(content) = root.common.signals.get(&signal) {
-                        break Ok(content);
-                    }
-                    break Ok(SignalContent::INITIAL_REF);
+                    let content = root
+                        .common
+                        .signals
+                        .get(&signal)
+                        .cloned()
+                        .unwrap_or_else(|| self.root.initial_signal_content(signal));
+                    return content;
                 }
                 FlowHardwareKind::Branch(branch) => {
                     if let Some(content) = branch.common.signals.get(&signal) {
-                        break Ok(content);
+                        return content.clone();
                     }
                     branch.parent
                 }
@@ -1725,12 +1675,7 @@ impl<'p> FlowHardwareRoot<'p> {
             process_kind: kind,
             ir_signals,
             ir_variables: IrVariables::new(),
-            common: FlowHardwareCommon {
-                variables: IndexMap::new(),
-                signals: IndexMap::new(),
-                implied: IndexMap::new(),
-                statements: vec![],
-            },
+            common: FlowHardwareCommon::new(),
         }
     }
 
@@ -1860,10 +1805,7 @@ fn merge_branch_variable(
             VariableValue::Compound(_) => Lattice::Different,
             VariableValue::Hardware(value) => {
                 // try getting implication for version
-                let version = ValueVersion {
-                    signal: var.into(),
-                    index: value.version_index,
-                };
+                let version = value.version;
                 let branch_implied = branch
                     .common
                     .implied
@@ -1885,7 +1827,7 @@ fn merge_branch_variable(
 
         merged_compile = merged_compile.merge_eq(branch_compile);
         merged_hardware = merged_hardware.merge(branch_hardware, |a, b| {
-            if a.version_index == b.version_index {
+            if a.version == b.version {
                 debug_assert_eq!(a.value_raw.ty, b.value_raw.ty);
                 debug_assert_eq!(a.value_raw.domain, b.value_raw.domain);
                 LatticeMerge::Defined(a)
@@ -1917,10 +1859,7 @@ fn merge_branch_variable(
         ));
 
         let merged_implied = merged_implied.defined().map(|implied| {
-            let version = ValueVersion {
-                signal: var.into(),
-                index: result_hardware.version_index,
-            };
+            let version = result_hardware.version;
             (version, implied)
         });
         return Ok((content, merged_implied));
@@ -1965,10 +1904,7 @@ fn merge_branch_variable(
                 VariableValue::Simple(v) => v.ty(),
                 VariableValue::Compound(v) => v.ty(),
                 VariableValue::Hardware(v) => {
-                    let version = ValueVersion {
-                        signal: var.into(),
-                        index: v.version_index,
-                    };
+                    let version = v.version;
                     let implied = branch
                         .common
                         .implied
@@ -2094,17 +2030,14 @@ fn merge_branch_variable(
                     ),
                     Value::Hardware(v) => {
                         // get implied info
-                        let version = ValueVersion {
-                            signal: var.into(),
-                            index: v.version_index,
-                        };
+                        let version = v.version;
                         let implied = implied
                             .and_then(|implied| implied.get(&version))
                             .or_else(|| parent_flow.get_implied(version));
 
                         // no need to take a copy here,
                         //   we're immediately using this value in a store operation and then discarding it
-                        let value = v.as_value_without_copy(large, var, implied);
+                        let value = v.as_value_without_copy(large, implied);
 
                         // expand value to result type
                         let expr = value.as_ir_expression_unchecked(refs, large, assigned.span, &ty)?;
@@ -2151,18 +2084,14 @@ fn merge_branch_variable(
         domain,
         expr: var_ir,
     };
-    let result_version_index = parent_flow.root.next_version();
+    let version = parent_flow.root.next_version();
     let result_var_value = VariableValueHardware {
         value_raw: result_value,
-        version_index: result_version_index,
+        version,
         implications: BoolImplications::NONE,
     };
     let content = VariableContent::Assigned(Spanned::new(span_merge, VariableValue::Hardware(result_var_value)));
 
-    let version = ValueVersion {
-        signal: var.into(),
-        index: result_version_index,
-    };
     let implied = merged_implied.defined().map(|implied| (version, implied));
 
     Ok((content, implied))
@@ -2174,13 +2103,13 @@ fn merge_branch_signal(
     branches: &mut [FlowHardwareBranchContent],
 ) -> DiagResult<(SignalContent, Option<(ValueVersion, Implied)>)> {
     let mut merged_compile: Lattice<&CompileValue> = Lattice::Undefined;
-    let mut merged_version_index: Lattice<VersionIndex> = Lattice::Undefined;
+    let mut merged_version: Lattice<ValueVersion> = Lattice::Undefined;
     let mut merged_implied: Lattice<Implied> = Lattice::Undefined;
 
-    let parent_content = parent_flow.signal_get_content(signal)?;
+    let parent_content = parent_flow.signal_get_content(signal);
 
     for branch in branches {
-        let branch_content = branch.common.signals.get(&signal).unwrap_or(parent_content);
+        let branch_content = branch.common.signals.get(&signal).unwrap_or(&parent_content);
 
         match branch_content {
             SignalContent::Compile(branch_value) => {
@@ -2196,18 +2125,14 @@ fn merge_branch_signal(
                 };
 
                 merged_compile = merged_compile.merge_eq(Lattice::Defined(branch_value));
-                merged_version_index = Lattice::Different;
+                merged_version = Lattice::Different;
                 merged_implied = merged_implied.merge(branch_implied, Implied::lattice_merge);
             }
             SignalContent::Hardware(branch_content) => {
                 let &SignalContentHardware {
-                    version_index,
+                    version,
                     implications: _,
                 } = branch_content;
-                let version = ValueVersion {
-                    signal: signal.into(),
-                    index: version_index,
-                };
 
                 let branch_implied = branch
                     .common
@@ -2228,7 +2153,7 @@ fn merge_branch_signal(
                 let branch_implied = branch_implied.map(Lattice::Defined).unwrap_or(Lattice::Different);
 
                 merged_compile = merged_compile.merge_eq(branch_compile);
-                merged_version_index = merged_version_index.merge_eq(Lattice::Defined(version_index));
+                merged_version = merged_version.merge_eq(Lattice::Defined(version));
                 merged_implied = merged_implied.merge(branch_implied, Implied::lattice_merge);
             }
         }
@@ -2241,31 +2166,22 @@ fn merge_branch_signal(
     }
 
     // not compile, figure out the version and implications
-    let (version_index, implications) = match merged_version_index.defined() {
+    let (version, implications) = match merged_version.defined() {
         None => {
-            let version_index = parent_flow.root.next_version();
-            (version_index, BoolImplications::NONE)
+            let version = parent_flow.root.next_version();
+            (version, BoolImplications::NONE)
         }
-        Some(version_index) => {
+        Some(version) => {
             let parent_implications = match parent_content {
                 SignalContent::Compile(_) => BoolImplications::NONE,
                 SignalContent::Hardware(parent_content) => parent_content.implications.clone(),
             };
-            (version_index, parent_implications)
+            (version, parent_implications)
         }
     };
 
-    let content = SignalContent::Hardware(SignalContentHardware {
-        version_index,
-        implications,
-    });
-    let implied = merged_implied.defined().map(|implied| {
-        let version = ValueVersion {
-            signal: signal.into(),
-            index: version_index,
-        };
-        (version, implied)
-    });
+    let content = SignalContent::Hardware(SignalContentHardware { version, implications });
+    let implied = merged_implied.defined().map(|implied| (version, implied));
 
     Ok((content, implied))
 }
@@ -2279,14 +2195,9 @@ impl VariableContent {
 }
 
 impl VariableValueHardware {
-    pub fn as_value_without_copy(
-        &self,
-        large: &mut IrLargeArena,
-        var: Variable,
-        implied: Option<&Implied>,
-    ) -> ValueWithImplications {
+    pub fn as_value_without_copy(&self, large: &mut IrLargeArena, implied: Option<&Implied>) -> ValueWithImplications {
         let &VariableValueHardware {
-            version_index,
+            version,
             ref value_raw,
             ref implications,
         } = self;
@@ -2312,11 +2223,6 @@ impl VariableValueHardware {
 
         // add version and implications, including self-implications
         value.map_hardware(|value| {
-            let version = ValueVersion {
-                signal: var.into(),
-                index: version_index,
-            };
-
             let mut implications = implications.clone();
             if value.ty == HardwareType::Bool {
                 implications.add_bool_self_implications(version);
@@ -2329,16 +2235,6 @@ impl VariableValueHardware {
             }
         })
     }
-}
-
-impl SignalContent {
-    pub const INITIAL_REF: &SignalContent = {
-        const INITIAL: SignalContent = SignalContent::Hardware(SignalContentHardware {
-            version_index: VERSION_INITIAL,
-            implications: BoolImplications::NONE,
-        });
-        &INITIAL
-    };
 }
 
 impl Implied {
@@ -2382,6 +2278,17 @@ impl VariableNotFullyAssigned {
             .add_info(var_info.span_decl, "variable declared here")
             .report(diags),
             VariableNotFullyAssigned::Undefined => diags.report_error_internal(span, "evaluating undefined variable"),
+        }
+    }
+}
+
+impl FlowHardwareCommon {
+    pub fn new() -> Self {
+        FlowHardwareCommon {
+            variables: IndexMap::new(),
+            signals: IndexMap::new(),
+            implied: IndexMap::new(),
+            statements: vec![],
         }
     }
 }

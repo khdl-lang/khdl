@@ -3,14 +3,14 @@ use crate::front::compile::CompileItemContext;
 use crate::front::diagnostic::{DiagResult, DiagnosticError};
 use crate::front::domain::{DomainSignal, ValueDomain};
 use crate::front::expression::eval_binary_expression;
-use crate::front::flow::{Flow, FlowHardware, HardwareProcessKind, VarSetValue};
+use crate::front::flow::{Flow, FlowHardware, HardwareProcessKind};
 use crate::front::implication::{HardwareValueWithImplications, ValueWithImplications};
 use crate::front::scope::Scope;
 use crate::front::signal::{Signal, SignalOrVariable};
 use crate::front::steps::TargetSteps;
 use crate::front::types::{HardwareType, NonHardwareType, Type, Typed};
 use crate::front::value::{CompileValue, HardwareValue, Value, ValueCommon};
-use crate::mid::ir::{IrAssignmentTarget, IrExpression, IrSignalOrVariable, IrStatement};
+use crate::mid::ir::{IrAssignmentTarget, IrSignalOrVariable, IrStatement};
 use crate::syntax::ast::{Assignment, SyncDomain};
 use crate::syntax::pos::{Span, Spanned};
 
@@ -196,10 +196,10 @@ impl CompileItemContext<'_, '_> {
                 let result_value = if target_steps.is_empty() {
                     Some(source_value.inner)
                 } else if let Ok(source_value_compile) = CompileValue::try_from(&source_value.inner)
-                    && let Some(target_base_value) = flow.signal_eval_if_compile(target_base)?
+                    && let Some(target_base_value) = flow.signal_eval_if_compile(target_base)
                     && let Ok(target_steps) = target_steps.try_as_compile()
                 {
-                    let mut result_value = target_base_value.clone();
+                    let mut result_value = target_base_value;
                     target_steps.set_compile_value(
                         refs,
                         Spanned::new(target_base.span, &mut result_value),
@@ -243,7 +243,7 @@ impl CompileItemContext<'_, '_> {
                     // (this is a separate case to avoid evaluating the current value)
                     flow.var_set(refs, target_base_var, stmt.span, Ok(source_value.inner))?;
                 } else {
-                    let target_base_value = flow.var_eval_without_copy(&mut self.large, target_base)?;
+                    let target_base_value = flow.var_eval(refs, &mut self.large, target_base)?;
 
                     // check if we can do this assignment at compile-time
                     if let Ok(target_base_value_compile) = CompileValue::try_from(&target_base_value)
@@ -258,7 +258,7 @@ impl CompileItemContext<'_, '_> {
                             Spanned::new(source_value.span, source_value_compile),
                         )?;
 
-                        flow.var_set_compile(target_base_var, stmt.span, Ok(result_value))?;
+                        flow.var_set(refs, target_base_var, stmt.span, Ok(result_value.into()))?;
                     } else {
                         // we need to do a hardware assignment
                         let flow = flow.require_hardware(stmt.span, "hardware variable assignment")?;
@@ -326,24 +326,19 @@ impl CompileItemContext<'_, '_> {
                             result_domain = result_domain.join(d.inner);
                         });
 
-                        // make sure the target is an ir variable, reusing the existing variable if possible
-                        let target_base_var_ir = match &target_base_value.expr {
-                            &IrExpression::Variable(var) => var,
-                            _ => {
-                                let debug_info_id = flow
-                                    .var_info(target_base)?
-                                    .id
-                                    .str(&refs.shared.interner)
-                                    .map(str::to_owned);
-                                flow.store_hardware_value_in_new_ir_variable(
-                                    refs,
-                                    target_base.span,
-                                    debug_info_id,
-                                    target_base_value,
-                                )
-                                .expr
-                            }
-                        };
+                        // make sure the target is an ir variable
+                        let debug_info_id = flow
+                            .var_info(target_base)?
+                            .id
+                            .str(&refs.shared.interner)
+                            .map(str::to_owned);
+                        let target_base_var_ir = flow.store_hardware_value_in_new_ir_variable(
+                            refs,
+                            target_base.span,
+                            debug_info_id,
+                            &target_base_value.ty,
+                            target_base_value.expr,
+                        );
 
                         // actually do the assignment
                         let ir_target = IrAssignmentTarget {
@@ -361,7 +356,7 @@ impl CompileItemContext<'_, '_> {
                             expr: target_base_var_ir,
                         };
                         let result_value = HardwareValueWithImplications::simple(result_value);
-                        flow.var_set_without_copy(target_base_var, stmt.span, Ok(VarSetValue::Hardware(result_value)))?;
+                        flow.var_set_to_ir_variable(target_base_var, stmt.span, result_value)?;
                     }
                 }
             }

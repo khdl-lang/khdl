@@ -622,6 +622,7 @@ impl CompileItemContext<'_, '_> {
                                 continue;
                             }
                             let value_range = MultiRange::from(Range::single(value.clone()));
+                            let implied_range = rem_range.intersect(&value_range);
                             *rem_range = rem_range.subtract(&value_range);
 
                             let cond = self.large.push_expr(IrExpressionLarge::IntCompare(
@@ -631,7 +632,7 @@ impl CompileItemContext<'_, '_> {
                             ));
 
                             let implications = if let Some(target_version) = target_version {
-                                vec![Implication::new_int(target_version, value_range)]
+                                vec![Implication::new_int(target_version, implied_range)]
                             } else {
                                 vec![]
                             };
@@ -660,12 +661,13 @@ impl CompileItemContext<'_, '_> {
                             );
                             continue;
                         }
+                        let implied_range = rem_range.intersect(&range.inner);
                         *rem_range = rem_range.subtract(&range.inner);
 
                         let cond = build_ir_int_in_multi_range(&mut self.large, &target_value.value.expr, &range.inner);
 
                         let implications = if let Some(target_version) = target_version {
-                            vec![Implication::new_int(target_version, range.inner.clone())]
+                            vec![Implication::new_int(target_version, implied_range)]
                         } else {
                             vec![]
                         };
@@ -765,7 +767,7 @@ impl CompileItemContext<'_, '_> {
 
             let branch_span = branch_pattern.span.join(branch_block.span);
             let mut branch_scope = scope_parent.new_child(branch_span);
-            let mut branch_flow = match flow_parent.new_child_branch(self, branch_span, target_domain, implications)? {
+            let mut branch_flow = match flow_parent.new_child_branch(branch_span, target_domain, implications)? {
                 Ok(branch_flow) => branch_flow,
                 Err(ImplicationContradiction) => continue,
             };

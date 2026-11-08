@@ -403,6 +403,12 @@ pub enum IrExpressionLarge {
     ConstrainIntRange(ClosedNonEmptyRange<BigInt>, IrExpression),
 }
 
+impl From<IrVariable> for IrExpression {
+    fn from(value: IrVariable) -> Self {
+        IrExpression::Variable(value)
+    }
+}
+
 // TODO move to separate utils module?
 impl IrLargeArena {
     pub fn push_expr(&mut self, info: IrExpressionLarge) -> IrExpression {
