@@ -1,3 +1,6 @@
+#[cfg(not(debug_assertions))]
+use std::marker::PhantomData;
+
 /// Wrapper around a type `T` that behaves as `T` when debug assertions are enabled,
 /// and as `PhantomData<T>` when they're not.
 ///
