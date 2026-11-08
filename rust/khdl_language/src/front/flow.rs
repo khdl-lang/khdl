@@ -1914,9 +1914,9 @@ fn merge_branch_variable(
     let branch_tys = branches
         .iter()
         .map(|branch| {
-            let branch_content = match branch.common.variables.get(&var.index) {
-                Some(branch_slot) => unwrap_branch_slot(branch_slot),
-                None => parent_content,
+            let (branch_content, branch_implied) = match branch.common.variables.get(&var.index) {
+                Some(branch_slot) => (unwrap_branch_slot(branch_slot), Some(&branch.common.implied)),
+                None => (parent_content, None),
             };
             let branch_value = unwrap_branch_value(branch_content);
 
@@ -1929,10 +1929,8 @@ fn merge_branch_variable(
                 VariableValue::Compound(v) => v.ty(),
                 VariableValue::Hardware(v) => {
                     let version = v.version;
-                    let implied = branch
-                        .common
-                        .implied
-                        .get(&version)
+                    let implied = branch_implied
+                        .and_then(|implied| implied.get(&version))
                         .or_else(|| parent_flow.get_implied(version));
                     match implied {
                         None => v.value_raw.ty.as_type(),
@@ -2083,20 +2081,24 @@ fn merge_branch_variable(
         }
     };
 
+    // store the values assigned in the branches
     for branch in branches {
-        let store_value = if let Some(branch_slot) = branch.common.variables.get(&var.index) {
-            let branch_content = unwrap_branch_slot(branch_slot);
-            unwrap_branch_value(branch_content)
-        } else {
-            let parent_content = parent_flow.var_get_content(var_spanned)?;
-            unwrap_branch_value(parent_content)
-        };
-
-        if let Some(store) = build_store(store_value, Some(&branch.common.implied))? {
-            branch.common.statements.push(store);
+        if let Some(branch_slot) = branch.common.variables.get(&var.index) {
+            let branch_value = unwrap_branch_value(unwrap_branch_slot(branch_slot));
+            if let Some(store) = build_store(branch_value, Some(&branch.common.implied))? {
+                branch.common.statements.push(store);
+            }
         }
 
         domain_cond = domain_cond.join(branch.cond_domain.inner);
+    }
+
+    // store the parent value once before the branches (if it's actually used)
+    if used_parent_value {
+        let parent_content = parent_flow.var_get_content(var_spanned)?;
+        if let Some(parent_store) = build_store(unwrap_branch_value(parent_content), None)? {
+            parent_flow.push_ir_statement(parent_store);
+        }
     }
 
     domain = domain.join(domain_cond);

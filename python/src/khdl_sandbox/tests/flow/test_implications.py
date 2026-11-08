@@ -1,5 +1,7 @@
 import pytest
+from pathlib import Path
 
+from khdl_sandbox.common.compare import compare_body
 from khdl_sandbox.common.util import compile_custom, diag_error
 
 
@@ -369,6 +371,20 @@ def test_merge_implication_var_int_range():
     """
     c = compile_custom(src)
     _ = c.resolve("top.top")
+
+
+def test_merge_implication_var_int_range_kept_if(tmp_dir: Path):
+    src = """
+    var v = a0;
+    if (a0 < 4) {
+    } else {
+        v = 0;
+    }
+    return v;
+    """
+    c = compare_body(["uint(8)"], "uint(2)", src, tmp_dir)
+    c.eval_assert([3], 3)
+    c.eval_assert([200], 0)
 
 
 def test_merge_implication_signal_int_range_abs():
