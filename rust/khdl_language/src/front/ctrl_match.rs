@@ -3,7 +3,7 @@ use crate::front::check::{TypeContainsReason, check_type_contains_value, check_t
 use crate::front::compile::{CompileItemContext, CompileShared};
 use crate::front::diagnostic::{DiagResult, DiagnosticError, DiagnosticWarning};
 use crate::front::exit::ExitStack;
-use crate::front::flow::{Flow, FlowHardware, ImplicationContradiction};
+use crate::front::flow::{Flow, FlowHardware, ImplicationContradiction, ValueVersion};
 use crate::front::implication::{HardwareValueWithImplications, Implication, ValueWithImplications};
 use crate::front::item::{ElaboratedEnum, HardwareChecked};
 use crate::front::scope::{NamedValue, Scope, ScopedEntry};
@@ -117,6 +117,25 @@ impl MatchCoverage {
                     .join(", ");
                 format!("[{}]", parts)
             }
+        }
+    }
+
+    fn implications_remaining(&self, target_version: Option<ValueVersion>) -> Vec<Implication> {
+        match target_version {
+            None => vec![],
+            Some(target_version) => match self {
+                &MatchCoverage::Bool { rem_false, rem_true } => {
+                    if rem_false && !rem_true {
+                        vec![Implication::new_bool(target_version, false)]
+                    } else if rem_true && !rem_false {
+                        vec![Implication::new_bool(target_version, true)]
+                    } else {
+                        vec![]
+                    }
+                }
+                MatchCoverage::Int { rem_range } => vec![Implication::new_int(target_version, rem_range.clone())],
+                MatchCoverage::Enum { .. } => vec![],
+            },
         }
     }
 
@@ -540,12 +559,13 @@ impl CompileItemContext<'_, '_> {
                         warn_unreachable_branch(branch_pattern.span, &coverage_remaining, None);
                         continue;
                     }
+                    let implications = coverage_remaining.implications_remaining(target_version);
                     coverage_remaining.clear();
 
                     HardwareBranchMatched {
                         cond: None,
                         declare: None,
-                        implications: vec![],
+                        implications,
                     }
                 }
                 EvaluatedMatchPattern::WildcardVal(id) => {
@@ -553,6 +573,7 @@ impl CompileItemContext<'_, '_> {
                         warn_unreachable_branch(branch_pattern.span, &coverage_remaining, None);
                         continue;
                     }
+                    let implications = coverage_remaining.implications_remaining(target_version);
                     coverage_remaining.clear();
 
                     HardwareBranchMatched {
@@ -562,7 +583,7 @@ impl CompileItemContext<'_, '_> {
                             id,
                             value: Value::Hardware(target_value.clone()),
                         }),
-                        implications: vec![],
+                        implications,
                     }
                 }
                 EvaluatedMatchPattern::EqualTo(value) => {

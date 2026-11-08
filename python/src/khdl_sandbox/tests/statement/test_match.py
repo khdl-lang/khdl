@@ -146,3 +146,40 @@ def test_match_enum_after_wildcard():
     """
     with diag_warning("unreachable match branch"):
         compile_custom(body).resolve("top.top")
+
+
+def test_match_remaining_range_val_val(tmp_dir: Path):
+    src = """
+    match (a0) {
+        in 0..4 => { return 4; }
+        val other => { return other; }
+    }
+    """
+    c = compare_body(["int(0..8)"], "int(4..8)", src, tmp_dir)
+    for a0 in range(8):
+        c.eval_assert([a0], max(4, a0))
+
+
+def test_match_remaining_range_val_wildcard(tmp_dir: Path):
+    src = """
+    match (a0) {
+        in 0..4 => { return 4; }
+        _ => { return a0; }
+    }
+    """
+    c = compare_body(["int(0..8)"], "int(4..8)", src, tmp_dir)
+    for a0 in range(8):
+        c.eval_assert([a0], max(4, a0))
+
+
+def test_match_remaining_range_expr_val(tmp_dir: Path):
+    src = """
+    match (a0 + a1) {
+        in 0..4 => { return 4; }
+        val other => { return other; }
+    }
+    """
+    c = compare_body(["int(0..5)", "int(0..4)"], "int(4..8)", src, tmp_dir)
+    for a0 in range(5):
+        for a1 in range(4):
+            c.eval_assert([a0, a1], max(4, a0 + a1))
