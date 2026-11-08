@@ -75,7 +75,7 @@ pub struct Idx {
 pub struct RandomCheck(RandomCheckInner);
 
 #[cfg(debug_assertions)]
-type RandomCheckInner = std::num::NonZeroU16;
+type RandomCheckInner = u16;
 #[cfg(not(debug_assertions))]
 type RandomCheckInner = ();
 
