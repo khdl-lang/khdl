@@ -1,22 +1,24 @@
 use regex_automata::dfa::Automaton;
+use regex_automata::dfa::dense::BuildError;
+use regex_automata::dfa::sparse::DFA;
+use regex_automata::util::primitives::StateID;
+use regex_automata::util::start::Config;
+use regex_automata::{Anchored, Input};
 use std::collections::HashSet;
 
 #[derive(Debug)]
 pub struct RegexDfa {
-    dfa: regex_automata::dfa::sparse::DFA<Vec<u8>>,
+    dfa: DFA<Vec<u8>>,
 }
 
 impl RegexDfa {
-    pub fn new(pattern: &str) -> Result<Self, regex_automata::dfa::dense::BuildError> {
-        let dfa = regex_automata::dfa::sparse::DFA::new(pattern)?;
+    pub fn new(pattern: &str) -> Result<Self, BuildError> {
+        let dfa = DFA::new(pattern)?;
         Ok(Self { dfa })
     }
 
     pub fn could_match_str(&self, input: &str) -> bool {
-        self.dfa
-            .try_search_fwd(&regex_automata::Input::new(input))
-            .unwrap()
-            .is_some()
+        self.dfa.try_search_fwd(&Input::new(input)).unwrap().is_some()
     }
 
     pub fn could_match_pattern(&self, other: &RegexDfa) -> bool {
@@ -24,7 +26,7 @@ impl RegexDfa {
         let dfa_0 = &self.dfa;
         let dfa_1 = &other.dfa;
 
-        let start_config = regex_automata::util::start::Config::new().anchored(regex_automata::Anchored::Yes);
+        let start_config = Config::new().anchored(Anchored::Yes);
         let start_0 = dfa_0.start_state(&start_config).unwrap();
         let start_1 = dfa_1.start_state(&start_config).unwrap();
 
@@ -32,24 +34,32 @@ impl RegexDfa {
             return true;
         }
 
+        let classes_0 = dfa_0.byte_classes();
+        let classes_1 = dfa_1.byte_classes();
+        let class_pair = |b: u8| (classes_0.get(b), classes_1.get(b));
+        let representatives: Vec<u8> = (0..=u8::MAX)
+            .filter(|&b| b == 0 || class_pair(b) != class_pair(b - 1))
+            .collect();
+
         let mut visited_states = HashSet::new();
         let mut to_process = vec![(start_0, start_1)];
         visited_states.insert((start_0, start_1));
 
         while let Some((curr_0, curr_1)) = to_process.pop() {
             let mut handle_next = |next_0, next_1| {
-                // TODO early exit on dead/quit states for some extra performance
                 if dfa_0.is_match_state(next_0) && dfa_1.is_match_state(next_1) {
                     return true;
                 }
-                if visited_states.insert((next_0, next_1)) {
+                fn stuck(dfa: &DFA<Vec<u8>>, s: StateID) -> bool {
+                    dfa.is_dead_state(s) || dfa.is_quit_state(s)
+                }
+                if !stuck(dfa_0, next_0) && !stuck(dfa_1, next_1) && visited_states.insert((next_0, next_1)) {
                     to_process.push((next_0, next_1));
                 }
                 false
             };
 
-            // TODO is there a good way to only iterate over the bytes that appear in either pattern?
-            for input in 0..u8::MAX {
+            for &input in &representatives {
                 let next_0 = dfa_0.next_state(curr_0, input);
                 let next_1 = dfa_1.next_state(curr_1, input);
                 if handle_next(next_0, next_1) {
