@@ -311,6 +311,17 @@ impl<T> ClosedMultiRange<T> {
     }
 
     #[must_use]
+    pub fn union(&self, other: &ClosedMultiRange<T>) -> ClosedMultiRange<T>
+    where
+        T: Ord + Clone,
+    {
+        // the union of two closed ranges is always closed
+        ClosedMultiRange {
+            inner: self.inner.union(&other.inner),
+        }
+    }
+
+    #[must_use]
     pub fn subtract(&self, range: &MultiRange<T>) -> ClosedMultiRange<T>
     where
         T: Ord + Clone,

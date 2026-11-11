@@ -110,6 +110,37 @@ def test_merge_same_version_parent(tmp_dir: Path):
             e.eval_assert([c, x], x)
 
 
+def test_merge_same_version_kept(tmp_dir: Path):
+    # all branches have the same version, so the merged value should also have that version
+    src = """
+    val v = a1;
+    var r = v;
+    if (a0) { r = v; }
+    if (v < 4) { return r; }
+    return 0;
+    """
+    e = compare_body(["bool", "uint(8)"], "uint(0..4)", src, tmp_dir)
+    for c in [False, True]:
+        for x in [0, 3, 4, 255]:
+            e.eval_assert([c, x], x if x < 4 else 0)
+
+
+def test_merge_implications_joined(tmp_dir: Path):
+    # the branches hold different versions but both imply "v < 4",
+    #   so the merged value should also have that implication
+    src = """
+    val v = a1;
+    var b = v < 4;
+    if (a0) { b = v < 2; }
+    if (b) { return v; }
+    return 0;
+    """
+    e = compare_body(["bool", "uint(8)"], "uint(0..4)", src, tmp_dir)
+    for c in [False, True]:
+        for x in [0, 2, 3, 4, 255]:
+            e.eval_assert([c, x], x if x < (2 if c else 4) else 0)
+
+
 def test_merge_not_hardware():
     src = """
     module top ports(c: in async bool) {

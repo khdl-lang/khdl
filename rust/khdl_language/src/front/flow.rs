@@ -1780,7 +1780,8 @@ fn merge_branch_variable(
     let mut used_parent_value = false;
     let mut any_defined_branch = false;
     let mut merged_compile: Lattice<CompileValue> = Lattice::Undefined;
-    let mut merged_hardware: Lattice<&VariableValueHardware> = Lattice::Undefined;
+    let mut merged_version: Lattice<ValueVersion> = Lattice::Undefined;
+    let mut merged_implications: Lattice<BoolImplications> = Lattice::Undefined;
     let mut merged_implied: Lattice<Implied> = Lattice::Undefined;
 
     for branch in &mut *branches {
@@ -1814,9 +1815,12 @@ fn merge_branch_variable(
         let branch_compile = CompileValue::try_from(&value.inner)
             .map(Lattice::Defined)
             .unwrap_or(Lattice::Different);
-        let branch_hardware = match &value.inner {
-            VariableValue::Hardware(hardware_value) => Lattice::Defined(hardware_value),
-            _ => Lattice::Different,
+        let (branch_version, branch_implications) = match &value.inner {
+            VariableValue::Hardware(value) => (
+                Lattice::Defined(value.version),
+                Lattice::Defined(value.implications.clone()),
+            ),
+            _ => (Lattice::Different, Lattice::Different),
         };
         let branch_implied = match &value.inner {
             VariableValue::Simple(value) => match value {
@@ -1850,15 +1854,8 @@ fn merge_branch_variable(
         };
 
         merged_compile = merged_compile.merge_eq(branch_compile);
-        merged_hardware = merged_hardware.merge(branch_hardware, |a, b| {
-            if a.version == b.version {
-                debug_assert_eq!(a.value_raw.ty, b.value_raw.ty);
-                debug_assert_eq!(a.value_raw.domain, b.value_raw.domain);
-                LatticeMerge::Defined(a)
-            } else {
-                LatticeMerge::Different
-            }
-        });
+        merged_version = merged_version.merge_eq(branch_version);
+        merged_implications = merged_implications.merge(branch_implications, |a, b| LatticeMerge::Defined(a.join(&b)));
         merged_implied = merged_implied.merge(branch_implied, Implied::lattice_merge);
     }
 
@@ -1873,20 +1870,6 @@ fn merge_branch_variable(
     if let Some(merged_compile) = merged_compile.defined() {
         let content = VariableContent::Assigned(Spanned::new(span_merge, VariableValue::from(merged_compile)));
         return Ok((content, None));
-    }
-
-    // * all match hardware, only the implications differ
-    if let Some(result_hardware) = merged_hardware.defined() {
-        let content = VariableContent::Assigned(Spanned::new(
-            span_merge,
-            VariableValue::Hardware(result_hardware.clone()),
-        ));
-
-        let merged_implied = merged_implied.defined().map(|implied| {
-            let version = result_hardware.version;
-            (version, implied)
-        });
-        return Ok((content, merged_implied));
     }
 
     // all simple cases have been handled, we need a hardware merge
@@ -2110,11 +2093,14 @@ fn merge_branch_variable(
         domain,
         expr: var_ir,
     };
-    let version = parent_flow.root.next_version();
+    let version = merged_version
+        .defined()
+        .unwrap_or_else(|| parent_flow.root.next_version());
+    let implications = merged_implications.defined().unwrap_or(BoolImplications::NONE);
     let result_var_value = VariableValueHardware {
         value_raw: result_value,
         version,
-        implications: BoolImplications::NONE,
+        implications,
     };
     let content = VariableContent::Assigned(Spanned::new(span_merge, VariableValue::Hardware(result_var_value)));
 

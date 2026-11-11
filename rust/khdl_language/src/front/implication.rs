@@ -8,6 +8,7 @@ use crate::mid::ir::{IrExpression, IrLargeArena};
 use crate::syntax::pos::Span;
 use crate::util::big_int::BigInt;
 use crate::util::range_multi::ClosedMultiRange;
+use itertools::{Itertools, iproduct};
 use std::fmt::Debug;
 
 #[derive(Debug, Clone)]
@@ -79,6 +80,34 @@ impl BoolImplications {
         Self {
             if_true: self.if_false,
             if_false: self.if_true,
+        }
+    }
+
+    pub fn join(&self, other: &Self) -> Self {
+        fn join(a: &[Implication], b: &[Implication]) -> Vec<Implication> {
+            iproduct!(a, b)
+                .filter_map(|(a, b)| {
+                    if a.version != b.version {
+                        return None;
+                    }
+                    let version = a.version;
+
+                    let kind = match (&a.kind, &b.kind) {
+                        (&ImplicationKind::BoolEq(a), &ImplicationKind::BoolEq(b)) if a == b => {
+                            ImplicationKind::BoolEq(a)
+                        }
+                        (ImplicationKind::IntIn(a), ImplicationKind::IntIn(b)) => ImplicationKind::IntIn(a.union(b)),
+                        _ => return None,
+                    };
+
+                    Some(Implication { version, kind })
+                })
+                .collect_vec()
+        }
+
+        BoolImplications {
+            if_true: join(&self.if_true, &other.if_true),
+            if_false: join(&self.if_false, &other.if_false),
         }
     }
 }
