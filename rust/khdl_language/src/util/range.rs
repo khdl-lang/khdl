@@ -48,75 +48,6 @@ pub enum RangeBound<T> {
     OpenEnd,
 }
 
-impl<T> Range<T> {
-    pub fn union<'a>(&'a self, other: Range<&'a T>) -> Range<&'a T>
-    where
-        T: Ord + Clone,
-    {
-        let Range {
-            start: a_start,
-            end: a_end,
-        } = self;
-        let Range {
-            start: b_start,
-            end: b_end,
-        } = other;
-
-        let start = match (a_start, b_start) {
-            (Some(a_start), Some(b_start)) => Some(a_start.min(b_start)),
-            (None, _) | (_, None) => None,
-        };
-        let end = match (a_end, b_end) {
-            (Some(a_end), Some(b_end)) => Some(a_end.max(b_end)),
-            (None, _) | (_, None) => None,
-        };
-
-        Range { start, end }
-    }
-}
-
-impl<T> ClosedRange<T> {
-    pub fn union(self, other: ClosedRange<T>) -> ClosedRange<T>
-    where
-        T: Ord + Clone,
-    {
-        let ClosedRange {
-            start: slf_start,
-            end: slf_end,
-        } = self;
-        let ClosedRange {
-            start: other_start,
-            end: other_end,
-        } = other;
-
-        ClosedRange {
-            start: slf_start.min(other_start),
-            end: slf_end.max(other_end),
-        }
-    }
-}
-
-impl<T> ClosedNonEmptyRange<T> {
-    pub fn union(self, other: ClosedNonEmptyRange<T>) -> ClosedNonEmptyRange<T>
-    where
-        T: Ord + Clone,
-    {
-        let ClosedNonEmptyRange {
-            start: slf_start,
-            end: slf_end,
-        } = self;
-        let ClosedNonEmptyRange {
-            start: other_start,
-            end: other_end,
-        } = other;
-
-        ClosedNonEmptyRange {
-            start: slf_start.min(other_start),
-            end: slf_end.max(other_end),
-        }
-    }
-}
-
 pub struct ClosedIncRangeIterator<T> {
     next: T,
     end: T,
@@ -238,6 +169,22 @@ impl<T> TryFrom<Range<T>> for ClosedRange<T> {
     }
 }
 
+impl<T> TryFrom<NonEmptyRange<T>> for ClosedRange<T> {
+    type Error = RangeOpen;
+
+    fn try_from(value: NonEmptyRange<T>) -> Result<Self, Self::Error> {
+        ClosedRange::try_from(Range::from(value))
+    }
+}
+
+impl<T: Ord> TryFrom<ClosedRange<T>> for NonEmptyRange<T> {
+    type Error = RangeEmpty;
+
+    fn try_from(value: ClosedRange<T>) -> Result<Self, Self::Error> {
+        NonEmptyRange::try_from(Range::from(value))
+    }
+}
+
 impl<T: Ord> TryFrom<Range<T>> for NonEmptyRange<T> {
     type Error = RangeEmpty;
 
@@ -280,7 +227,7 @@ impl<T: Ord> TryFrom<ClosedRange<T>> for ClosedNonEmptyRange<T> {
     }
 }
 
-impl<T: Ord> TryFrom<NonEmptyRange<T>> for ClosedNonEmptyRange<T> {
+impl<T> TryFrom<NonEmptyRange<T>> for ClosedNonEmptyRange<T> {
     type Error = RangeOpen;
 
     fn try_from(value: NonEmptyRange<T>) -> Result<Self, Self::Error> {
@@ -295,12 +242,9 @@ impl<T: Ord> TryFrom<NonEmptyRange<T>> for ClosedNonEmptyRange<T> {
 // Common impls for different ranges
 macro_rules! impl_common {
     ($R:ident) => {
-        impl<T> $R<T> {
+        impl<T: Ord> $R<T> {
             #[must_use]
-            pub fn contains(&self, value: &T) -> bool
-            where
-                T: Ord,
-            {
+            pub fn contains(&self, value: &T) -> bool {
                 let (start, end) = self.as_ref().bounds();
                 start <= RangeBound::Closed(value) && RangeBound::Closed(value) < end
             }
@@ -308,7 +252,6 @@ macro_rules! impl_common {
             #[must_use]
             pub fn contains_range<'o>(&self, other: impl Into<Range<&'o T>>) -> bool
             where
-                T: Ord,
                 T: 'o,
             {
                 let (slf_start, self_end) = self.as_ref().bounds();
@@ -385,11 +328,8 @@ macro_rules! impl_open {
             }
         }
 
-        impl<T> $R<&T> {
-            pub fn cloned(self) -> $R<T>
-            where
-                T: Clone,
-            {
+        impl<T: Clone> $R<&T> {
+            pub fn cloned(self) -> $R<T> {
                 let $R { start, end } = self;
                 $R {
                     start: start.cloned(),
@@ -405,6 +345,30 @@ macro_rules! impl_open {
                     start: Some(value),
                     end: Some(end),
                 }
+            }
+        }
+
+        impl<T: Ord> $R<T> {
+            pub fn union<'a>(&'a self, other: $R<&'a T>) -> $R<&'a T> {
+                let $R {
+                    start: a_start,
+                    end: a_end,
+                } = self;
+                let $R {
+                    start: b_start,
+                    end: b_end,
+                } = other;
+
+                let start = match (a_start, b_start) {
+                    (Some(a_start), Some(b_start)) => Some(a_start.min(b_start)),
+                    (None, _) | (_, None) => None,
+                };
+                let end = match (a_end, b_end) {
+                    (Some(a_end), Some(b_end)) => Some(a_end.max(b_end)),
+                    (None, _) | (_, None) => None,
+                };
+
+                $R { start, end }
             }
         }
     };
@@ -432,15 +396,21 @@ macro_rules! impl_closed {
             }
         }
 
-        impl<T> $R<&T> {
-            pub fn cloned(self) -> $R<T>
-            where
-                T: Clone,
-            {
+        impl<T: Clone> $R<&T> {
+            pub fn cloned(self) -> $R<T> {
                 let $R { start, end } = self;
                 $R {
                     start: start.clone(),
                     end: end.clone(),
+                }
+            }
+        }
+
+        impl<T: Ord> $R<T> {
+            pub fn union(self, other: $R<T>) -> $R<T> {
+                $R {
+                    start: self.start.min(other.start),
+                    end: self.end.max(other.end),
                 }
             }
         }
@@ -456,20 +426,14 @@ macro_rules! impl_closed {
 
 macro_rules! impl_maybe_empty {
     ($R:ident) => {
-        impl<T> $R<T> {
-            pub fn assert_valid(&self)
-            where
-                T: Ord,
-            {
+        impl<T: Ord> $R<T> {
+            pub fn assert_valid(&self) {
                 let (start, end) = self.as_ref().bounds();
                 assert!(start <= end);
             }
 
             #[must_use]
-            pub fn is_empty(&self) -> bool
-            where
-                T: Ord,
-            {
+            pub fn is_empty(&self) -> bool {
                 let (start, end) = self.as_ref().bounds();
                 start == end
             }
@@ -479,11 +443,8 @@ macro_rules! impl_maybe_empty {
 
 macro_rules! impl_non_empty {
     ($R:ident) => {
-        impl<T> $R<T> {
-            pub fn assert_valid(&self)
-            where
-                T: Ord,
-            {
+        impl<T: Ord> $R<T> {
+            pub fn assert_valid(&self) {
                 let (start, end) = self.as_ref().bounds();
                 assert!(start < end);
             }
