@@ -622,7 +622,7 @@ impl CompileItemContext<'_, '_> {
         let params_scope_span = params.span.join(body.span);
         let mut params_scope = scope_captured.new_child(params_scope_span);
 
-        // declare self, stored in a variable like the other parameters so its expression is not repeated for every use
+        // declare self
         if let Some(arg_self) = arg_self {
             let self_id = Spanned::new(arg_self.span, self.refs.shared.interner.push("self"));
             let self_var = flow.var_new_immutable_init(
