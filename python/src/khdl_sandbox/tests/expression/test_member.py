@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from khdl_sandbox.common.compare import compare_body
 from khdl_sandbox.common.util import compile_custom, diag_error
 
 
@@ -203,3 +204,19 @@ def test_member_self_hardware(tmp_dir: Path):
         inst.ports.x = v
         inst.step(1)
         assert inst.ports.y == v
+
+
+def test_member_struct_self_hardware_bound(tmp_dir: Path):
+    prefix = """
+    struct Foo {
+        x: uint(8),
+        fn get(self) -> uint(8) { return self.x; }
+    }
+    """
+    src = """
+    val m = Foo.new(x=a0).get;
+    return m();
+    """
+    e = compare_body(["uint(8)"], "uint(8)", src, tmp_dir, prefix=prefix)
+    for x in [0, 5, 255]:
+        e.eval_assert([x], x)

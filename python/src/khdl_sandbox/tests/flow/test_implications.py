@@ -541,3 +541,27 @@ def test_implication_through_alias():
     }
     """
     compile_custom(src).resolve("top.top")
+
+
+def test_implied_contradiction_bool():
+    src = """
+    module top ports(p: in async bool) {
+        comb {
+            val c = !p;
+            if (p) { if (c) { const { assert(false); } } }
+        }
+    }
+    """
+    compile_custom(src).resolve("top.top")
+
+
+def test_implied_contradiction_int():
+    src = """
+    module top ports(a: in async uint(0..16)) {
+        comb {
+            val d = a < 8;
+            if (a < 4) { if (d) {} else { const { assert(false); } } }
+        }
+    }
+    """
+    compile_custom(src).resolve("top.top")

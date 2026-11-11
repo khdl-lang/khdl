@@ -318,3 +318,73 @@ def test_read_implied_bool_from_signal_with_steps():
     """
     with diag_error("cannot index non-array type"):
         _ = compile_custom(src).resolve("top.top")
+
+
+def test_read_const_from_signal_parent_of_branch():
+    src = """
+    module top ports(c: in async bool, y: out async uint(8)) {
+        comb {
+            y = 3;
+            if (c) { const { assert(y == 3); } }
+        }
+    }
+    """
+    compile_custom(src).resolve("top.top")
+
+
+def test_read_const_from_signal_index_error():
+    src = """
+    module top ports(y: out async [2]uint(8)) {
+        comb {
+            y = [1, 2];
+            const { val _ = y[5]; }
+        }
+    }
+    """
+    with diag_error("array index out of bounds"):
+        compile_custom(src).resolve("top.top")
+
+
+def test_type_of_signal_const():
+    src = """
+    module top ports(y: out async uint(8)) {
+        comb {
+            y = 3;
+            const { print(type(y)); }
+        }
+    }
+    """
+    c = compile_custom(src)
+    with c.capture_prints() as cap:
+        c.resolve("top.top")
+    assert cap.prints == ["int(3..4)\n"]
+
+
+def test_type_of_var():
+    src = """
+    fn f() -> int {
+        val a = 3;
+        val t = (1, false);
+        print(type(a));
+        print(type(t));
+        return 0;
+    }
+    """
+    c = compile_custom(src)
+    with c.capture_prints() as cap:
+        c.resolve("top.f")()
+    assert cap.prints == ["int(3..4)\n", "Tuple(int(1..2), bool)\n"]
+
+
+def test_var_not_yet_assigned_eval():
+    src = "fn f() -> int { val a; return a; }"
+    f = compile_custom(src).resolve("top.f")
+    with diag_error("variable has not yet been assigned a value", has_info="variable declared here"):
+        f()
+
+
+def test_var_not_yet_assigned_type_of():
+    src = "fn f() -> int { val a; print(type(a)); return 0; }"
+    f = compile_custom(src).resolve("top.f")
+    with diag_error("variable has not yet been assigned a value", has_info="variable declared here"):
+        f()

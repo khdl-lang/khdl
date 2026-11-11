@@ -208,3 +208,19 @@ def test_range_multi_slice():
     assert f([1, 2, 3], khdl.Range(5, 5)) == []
     with diag_error("array slice range must be a single contiguous range"):
         f([1, 2, 3], khdl.Range(0, 1).union(khdl.Range(2, 3)))
+
+
+def test_range_hardware_bounds_in_var():
+    src = """
+    module top ports(x: in async int(0..8)) {
+        comb {
+            val r = x..;
+            val s = x..8;
+            const { print(type(r)); print(type(s)); }
+        }
+    }
+    """
+    c = compile_custom(src)
+    with c.capture_prints() as cap:
+        c.resolve("top.top")
+    assert cap.prints == ["Range\n", "Range\n"]

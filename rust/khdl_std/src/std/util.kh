@@ -5,7 +5,8 @@ pub fn print(value: any = "", end: str = "\n") {
 
 // TODO report the call location, not the body of this function
 // TODO include elaboration stack trace in all errors
-// TODO add "todo()" function, similar to Rust's macro
+// TODO add "todo()" and "unreachable()" functions, similar to Rust's macro.
+//   this info is also useful for flow and early exit checking, beyond asser(false)
 pub fn assert(cond: bool, msg: str = "") {
     if (!cond) {
         __builtin("fn", "assert_fail", msg);

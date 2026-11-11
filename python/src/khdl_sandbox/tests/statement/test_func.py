@@ -75,3 +75,17 @@ def test_func_param_default_only_evaluated_if_used():
     assert g(1) == 1
     with diag_error("undeclared identifier `undeclared`"):
         g()
+
+
+def test_func_capture_not_yet_assigned():
+    src = "fn f() -> int { val a; fn g() -> int { return a; } return g(); }"
+    f = compile_custom(src).resolve("top.f")
+    with diag_error("cannot access captured value because it was not fully initialized"):
+        f()
+
+
+def test_func_return_wrong_type():
+    src = "fn f() -> bool { return 3; }"
+    f = compile_custom(src).resolve("top.f")
+    with diag_error("type mismatch"):
+        f()

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from khdl_sandbox.common.compare import compare_body
-from khdl_sandbox.common.util import diag_error
+from khdl_sandbox.common.util import compile_custom, diag_error
 
 
 def test_simple_return(tmp_dir: Path):
@@ -178,3 +178,19 @@ def test_while_break_index_stays_compile(tmp_dir: Path):
         _ = compare_body(["bool"], "int(0..8)", src, tmp_dir)
     # e.eval_assert([True], 0)
     # e.eval_assert([False], 4)
+
+
+def test_return_in_wire_expression(tmp_dir: Path):
+    src = """
+    fn f(c: bool) -> uint(8) { if (c) { return 1; } return 2; }
+    module top ports(c: in async bool, y: out async uint(8)) {
+        wire w = f(c);
+        comb { y = w; }
+    }
+    """
+    inst = compile_custom(src).resolve_module("top.top").as_verilated(tmp_dir).instance()
+
+    for c in [True, False]:
+        inst.ports.c = c
+        inst.step(1)
+        assert inst.ports.y == (1 if c else 2)
