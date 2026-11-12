@@ -528,7 +528,7 @@ impl CompileItemContext<'_, '_> {
 
         let mut field_values = vec![];
         for &(field_id, ref field_ty) in fields.values() {
-            let value = args.require_value(self, flow, Param::Named(field_id), field_ty.as_ref())?;
+            let value = args.require_value(self, flow, Param::PositionalOrNamed(field_id), field_ty.as_ref())?;
             field_values.push(value.inner.into_value());
         }
         args.finish(self, flow, span_body)?;

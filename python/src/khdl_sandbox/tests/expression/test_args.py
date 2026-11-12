@@ -79,10 +79,9 @@ def test_args_order_struct():
     c = compile_custom(src)
 
     c.resolve("top.ok")()
+    c.resolve("top.positional")()
     with diag_error("argument name does not match the parameter at this position", has_info="parameter `x` declared here"):
         c.resolve("top.out_of_order")()
-    with diag_error("positional arguments are not allowed for this call target"):
-        c.resolve("top.positional")()
     with diag_error("missing argument for parameter `y`"):
         c.resolve("top.missing")()
     with diag_error("argument does not match any parameter"):
