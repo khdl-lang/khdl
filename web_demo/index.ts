@@ -18,7 +18,6 @@ import {oneDark} from "@codemirror/theme-one-dark";
 import {diff} from "@codemirror/merge";
 import * as khdl_wasm from "khdl_wasm";
 import {verilog as mode_verilog} from "@codemirror/legacy-modes/mode/verilog";
-import {cpp as mode_cpp} from "@codemirror/legacy-modes/mode/clike";
 
 import AnsiToHtmlClass from "ansi-to-html";
 import Cookies from "js-cookie";
@@ -91,7 +90,6 @@ let language = new Language(null, new KhdlParser(), [], "KHDL");
 
 const element_editor_input = document.getElementById("div-editor-input");
 const element_editor_output_verilog = document.getElementById("div-editor-output-verilog");
-const element_editor_output_cpp = document.getElementById("div-editor-output-cpp");
 const element_editor_output_format = document.getElementById("div-editor-output-format");
 const element_editor_output_ir = document.getElementById("div-editor-output-ir");
 const element_diags_compile = document.getElementById("div-diags-compile");
@@ -201,7 +199,6 @@ function handle_compile_response(response: CompileResponse) {
             compile_diags_ansi: `compiler panicked\nsee console for the stack trace\n${response.message}`,
             compile_prints: [],
             lowered_verilog: "",
-            lowered_cpp: "",
             format_diags_ansi: `compiler panicked\n${response.message}`,
             format_debug_str: "",
             ir_debug_str: "",
@@ -211,7 +208,6 @@ function handle_compile_response(response: CompileResponse) {
 
 function apply_compile_result(result: CompileResult) {
     let lowered_verilog = result.lowered_verilog;
-    let lowered_cpp = result.lowered_cpp;
     let format_debug_str = result.format_debug_str;
     let ir_debug_str = result.ir_debug_str;
 
@@ -236,9 +232,6 @@ function apply_compile_result(result: CompileResult) {
     if (lowered_verilog.length == 0) {
         lowered_verilog = EMPTY_DOC;
     }
-    if (lowered_cpp.length == 0) {
-        lowered_cpp = EMPTY_DOC;
-    }
     if (format_debug_str.length == 0) {
         format_debug_str = EMPTY_DOC;
     }
@@ -251,13 +244,6 @@ function apply_compile_result(result: CompileResult) {
             from: 0,
             to: editor_view_output_verilog.state.doc.length,
             insert: lowered_verilog,
-        }
-    })
-    editor_view_output_cpp.dispatch({
-        changes: {
-            from: 0,
-            to: editor_view_output_cpp.state.doc.length,
-            insert: lowered_cpp,
         }
     })
     editor_view_output_format.dispatch({
@@ -346,17 +332,6 @@ let editor_state_output_verilog = EditorState.create({
 let editor_view_output_verilog = new EditorView({
     state: editor_state_output_verilog,
     parent: element_editor_output_verilog
-})
-let editor_state_output_cpp = EditorState.create({
-    doc: EMPTY_DOC,
-    extensions: common_extensions().concat([
-        EditorState.readOnly.of(true),
-        StreamLanguage.define(mode_cpp)
-    ]),
-})
-let editor_view_output_cpp = new EditorView({
-    state: editor_state_output_cpp,
-    parent: element_editor_output_cpp
 })
 let editor_state_output_format = EditorState.create({
     doc: EMPTY_DOC,
@@ -578,9 +553,8 @@ function show_output_tab(tab: string) {
         }
     }
 
-    set_element_display("div-diags-compile", ["verilog", "cpp", "ir"])
+    set_element_display("div-diags-compile", ["verilog", "ir"])
     set_element_display("div-editor-output-verilog", ["verilog"])
-    set_element_display("div-editor-output-cpp", ["cpp"])
 
     set_element_display("div-diags-format", ["format"])
     set_element_display("div-editor-output-format", ["format"])
@@ -608,7 +582,7 @@ document.querySelectorAll<HTMLButtonElement>(".output-tab").forEach(button => {
 // react to light/dark mode changes
 dark_mode_query.addEventListener("change", () => {
     const effects = color_scheme_compartment.reconfigure(color_scheme_extension());
-    for (const view of [editor_view_input, editor_view_output_verilog, editor_view_output_cpp, editor_view_output_format, editor_view_output_ir]) {
+    for (const view of [editor_view_input, editor_view_output_verilog, editor_view_output_format, editor_view_output_ir]) {
         view.dispatch({effects});
     }
     force_update();

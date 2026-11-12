@@ -1,5 +1,4 @@
 use itertools::Itertools;
-use khdl_language::back::lower_cpp::lower_to_cpp;
 use khdl_language::back::lower_verilog::lower_to_verilog;
 use khdl_language::front::compile::{
     CompileFixed, CompileRefs, CompileSettings, CompileShared, ImportValue, QueueItems,
@@ -43,7 +42,6 @@ pub struct RunAllResult {
     pub compile_prints: Vec<String>,
 
     pub lowered_verilog: String,
-    pub lowered_cpp: String,
 
     pub format_diags_ansi: String,
     pub format_debug_str: String,
@@ -124,9 +122,6 @@ pub fn run_all(top_src: String, include_format: bool, include_ir: bool) -> RunAl
             .then(|| lower_to_verilog(&diags, db, tops))
             .transpose()
     });
-    let lowered_cpp = compiled
-        .as_ref_ok()
-        .and_then(|(db, tops)| (!tops.is_empty()).then(|| lower_to_cpp(&diags, db, tops)).transpose());
 
     // ir
     let ir_debug_str = if include_ir {
@@ -157,10 +152,6 @@ pub fn run_all(top_src: String, include_format: bool, include_ir: bool) -> RunAl
         |_| fallback_error.to_owned(),
         |lowered| lowered.map_or_else(|| fallback_empty.to_owned(), |v| v.source),
     );
-    let lowered_cpp = lowered_cpp.map_or_else(
-        |_| fallback_error.to_owned(),
-        |lowered| lowered.unwrap_or_else(|| fallback_empty.to_owned()),
-    );
 
     let format_diags_ansi = diags_to_string(&source, &diags_format.finish(), true);
     let format_debug_str = formatted.map_or_else(String::new, |f| f.unwrap_or_else(|_| fallback_error.to_owned()));
@@ -169,7 +160,6 @@ pub fn run_all(top_src: String, include_format: bool, include_ir: bool) -> RunAl
         compile_diags_ansi,
         compile_prints: print_handler.finish(),
         lowered_verilog,
-        lowered_cpp,
         format_diags_ansi,
         format_debug_str,
         ir_debug_str,

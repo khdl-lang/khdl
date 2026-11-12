@@ -12,7 +12,6 @@ export interface CompileResult {
     compile_diags_ansi: string;
     compile_prints: string[];
     lowered_verilog: string;
-    lowered_cpp: string;
     format_diags_ansi: string;
     format_debug_str: string;
     ir_debug_str: string;

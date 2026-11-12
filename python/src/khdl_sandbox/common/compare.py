@@ -7,7 +7,6 @@ import khdl
 from khdl_sandbox.common.util import compile_custom
 
 
-# TODO also include the result of the C++ backend once that's properly integrated
 @dataclass
 class CompiledCompare:
     input_count: int

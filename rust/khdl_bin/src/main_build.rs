@@ -2,7 +2,6 @@ use crate::args::ArgsBuild;
 use crate::command_file::CommandLineFile;
 use crate::util::{ErrorExit, manifest_find_read_parse, print_diagnostics};
 use itertools::Itertools;
-use khdl_language::back::lower_cpp::lower_to_cpp;
 use khdl_language::back::lower_verilog::lower_to_verilog;
 use khdl_language::front::compile::{
     CompileFixed, CompileRefs, CompileSettings, CompileShared, ImportValue, QueueItems,
@@ -33,7 +32,6 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
         top,
         top_only,
         output_verilog,
-        output_cpp,
         debug_output_ir,
         thread_count,
         debug_profile,
@@ -191,7 +189,6 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
     // lower and write outputs
     let mut time_lower_ir = None;
     let mut time_lower_verilog = None;
-    let mut time_lower_cpp = None;
     let mut outputs = vec![];
 
     if let Ok(ir_db) = ir_db {
@@ -217,22 +214,6 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
                 }
             }
             time_lower_verilog = Some(start_lower_verilog.elapsed());
-        }
-
-        // output c++
-        if let Some(output_cpp) = output_cpp {
-            let start_lower_cpp = Instant::now();
-            match lower_to_cpp(&diags, &ir_db, &top_modules) {
-                Ok(lowered_cpp) => {
-                    // TODO expose module mapping?
-                    outputs.push((output_cpp, lowered_cpp));
-                }
-                Err(e) => {
-                    // will be reported later, we can ignore it here
-                    let _: DiagError = e;
-                }
-            }
-            time_lower_cpp = Some(start_lower_cpp.elapsed());
         }
     }
 
@@ -292,7 +273,6 @@ pub fn main_build(args: ArgsBuild) -> ExitCode {
         eprintln!("compile:          {time_compile:?}");
         eprintln!("lower ir:         {}", fmt_duration(time_lower_ir));
         eprintln!("lower verilog:    {}", fmt_duration(time_lower_verilog));
-        eprintln!("lower c++:        {}", fmt_duration(time_lower_cpp));
         eprintln!("write outputs:    {time_output:?}");
         eprintln!("-----------------------------------------------");
         eprintln!("total:            {time_all:?}");

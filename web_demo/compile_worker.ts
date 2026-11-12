@@ -21,7 +21,6 @@ worker_scope.onmessage = (event) => {
             compile_diags_ansi: result.compile_diags_ansi,
             compile_prints: result.compile_prints,
             lowered_verilog: result.lowered_verilog,
-            lowered_cpp: result.lowered_cpp,
             format_diags_ansi: result.format_diags_ansi,
             format_debug_str: result.format_debug_str,
             ir_debug_str: result.ir_debug_str,
