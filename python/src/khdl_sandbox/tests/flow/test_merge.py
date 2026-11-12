@@ -168,6 +168,100 @@ def test_merge_union_not_hardware():
         compile_custom(src).resolve("top.top")
 
 
+def test_merge_struct_non_hardware_field_same():
+    src = """
+    struct S { s: str, x: uint(8) }
+    module top ports(c: in async bool, y: in async uint(8)) {
+        comb {
+            var a = S.new(s="a", x=0);
+            if (c) { a = S.new(s="a", x=y); }
+            print(a);
+        }
+    }
+    """
+    compile_custom(src).resolve("top.top")
+
+
+def test_merge_struct_non_hardware_field_different():
+    src = """
+    struct S { s: str, x: uint(8) }
+    module top ports(c: in async bool, y: in async uint(8)) {
+        comb {
+            var a = S.new(s="a", x=0);
+            if (c) { a = S.new(s="b", x=y); }
+        }
+    }
+    """
+    with diag_error(
+            "branch assignment merging only works for hardware types",
+            has_info="field `a.s` of value in branch assigned here has type `str`",
+    ):
+        compile_custom(src).resolve("top.top")
+
+
+def test_merge_struct_field_union_not_hardware():
+    src = """
+    struct S { s: any, x: uint(8) }
+    module top ports(c: in async bool, y: in async uint(8)) {
+        comb {
+            var a = S.new(s=1, x=0);
+            if (c) { a = S.new(s=true, x=y); }
+        }
+    }
+    """
+    with diag_error(
+            "branch assignment merging needs hardware type",
+            has_info="field `a.s` of value before branch assigned here has type `int(1..2)`",
+    ):
+        compile_custom(src).resolve("top.top")
+
+
+def test_merge_nested_field_path():
+    src = """
+    struct S { s: str, x: uint(8) }
+    module top ports(c: in async bool, y: in async uint(8)) {
+        comb {
+            var a = (y, S.new(s="a", x=0));
+            if (c) { a = (y, S.new(s="b", x=y)); }
+        }
+    }
+    """
+    with diag_error(
+            "branch assignment merging only works for hardware types",
+            has_info="field `a.1.s` of value in branch assigned here has type `str`",
+    ):
+        compile_custom(src).resolve("top.top")
+
+
+def test_merge_tuple_length_mismatch_non_hardware():
+    src = """
+    module top ports(c: in async bool, y: in async uint(8)) {
+        comb {
+            var a = ("a", y);
+            if (c) { a = ("a", y, y); }
+        }
+    }
+    """
+    with diag_error("branch assignment merging needs hardware type", has_info="for this variable"):
+        compile_custom(src).resolve("top.top")
+
+
+def test_merge_tuple_vs_int():
+    src = """
+    module top ports(c: in async bool, y: in async uint(8)) {
+        comb {
+            var a = ("a", y);
+            if (c) { a = 5; }
+        }
+    }
+    """
+    with diag_error(
+            "branch assignment merging needs hardware type",
+            has_info="value in branch assigned here has type `int(5..6)`",
+    ):
+        compile_custom(src).resolve("top.top")
+
+
 def test_merge_partially_assigned():
     src = """
     module top ports(c: in async bool) {
