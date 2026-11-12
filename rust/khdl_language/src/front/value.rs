@@ -23,6 +23,8 @@ use crate::util::range::Range;
 use crate::util::range_multi::{AnyMultiRange, ClosedNonEmptyMultiRange, MultiRange};
 use crate::util::{Never, ResultNeverExt};
 use itertools::{Itertools, zip_eq};
+use khdl_util::swrite;
+use std::fmt::Display;
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -985,6 +987,211 @@ impl<S, C, H> Value<S, C, H> {
             Value::Compound(v) => Ok(Value::Compound(v)),
             Value::Hardware(v) => Ok(Value::Hardware(f(v)?)),
         }
+    }
+}
+
+impl<E: Clone> MixedValue<E> {
+    /// Map every hardware value contained in this value (recursively) through `f`,
+    /// keeping the compile-time parts unchanged.
+    pub fn map_hardware_recursive<U>(
+        &self,
+        refs: CompileRefs,
+        name: Option<&str>,
+        mut f: impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> U,
+    ) -> MixedValue<U> {
+        let mut name = name.map(str::to_owned);
+        self.map_hardware_recursive_impl::<U, Never>(refs, &mut name, &mut |v, name| Ok(f(v, name)))
+            .remove_never()
+    }
+
+    /// Fallible version of [Self::map_hardware_recursive].
+    pub fn try_map_hardware_recursive<U, V>(
+        &self,
+        refs: CompileRefs,
+        name: Option<&str>,
+        mut f: impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> Result<U, V>,
+    ) -> Result<MixedValue<U>, V> {
+        let mut name = name.map(str::to_owned);
+        self.map_hardware_recursive_impl(refs, &mut name, &mut f)
+    }
+
+    fn map_hardware_recursive_impl<U, V>(
+        &self,
+        refs: CompileRefs,
+        name: &mut Option<String>,
+        f: &mut impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> Result<U, V>,
+    ) -> Result<MixedValue<U>, V> {
+        let result = match self {
+            Value::Simple(v) => Value::Simple(v.clone()),
+            Value::Compound(v) => Value::Compound(v.map_hardware_recursive_impl(refs, name, f)?),
+            Value::Hardware(v) => Value::Hardware(HardwareValue {
+                ty: v.ty.clone(),
+                domain: v.domain,
+                expr: f(v, name.as_deref())?,
+            }),
+        };
+        Ok(result)
+    }
+}
+
+impl<E: Clone> MixedCompoundValue<E> {
+    /// See [MixedValue::map_hardware_recursive].
+    pub fn map_hardware_recursive<U>(
+        &self,
+        refs: CompileRefs,
+        name: Option<&str>,
+        mut f: impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> U,
+    ) -> MixedCompoundValue<U> {
+        let mut name = name.map(str::to_owned);
+        self.map_hardware_recursive_impl::<U, Never>(refs, &mut name, &mut |v, name| Ok(f(v, name)))
+            .remove_never()
+    }
+
+    /// See [MixedValue::try_map_hardware_recursive].
+    pub fn try_map_hardware_recursive<U, V>(
+        &self,
+        refs: CompileRefs,
+        name: Option<&str>,
+        mut f: impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> Result<U, V>,
+    ) -> Result<MixedCompoundValue<U>, V> {
+        let mut name = name.map(str::to_owned);
+        self.map_hardware_recursive_impl(refs, &mut name, &mut f)
+    }
+
+    fn map_hardware_recursive_impl<U, V>(
+        &self,
+        refs: CompileRefs,
+        name: &mut Option<String>,
+        f: &mut impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> Result<U, V>,
+    ) -> Result<MixedCompoundValue<U>, V> {
+        /// run `f` with `name` temporarily extended by `_{suffix}`.
+        fn with_child_name<R>(
+            name: &mut Option<String>,
+            suffix: impl Display,
+            f: impl FnOnce(&mut Option<String>) -> R,
+        ) -> R {
+            let len = name.as_ref().map(String::len);
+            if let Some(name) = name {
+                swrite!(name, "_{suffix}");
+            }
+            let result = f(name);
+            if let (Some(name), Some(len)) = (name, len) {
+                name.truncate(len);
+            }
+            result
+        }
+
+        fn map_int<E: Clone, U, V>(
+            value: &HardwareInt<E>,
+            name: &Option<String>,
+            f: &mut impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> Result<U, V>,
+        ) -> Result<HardwareInt<U>, V> {
+            Ok(HardwareValue {
+                ty: value.ty.clone(),
+                domain: value.domain,
+                expr: f(&value.clone().into(), name.as_deref())?,
+            })
+        }
+
+        fn map_bound<E: Clone, U, V>(
+            bound: &Option<MaybeCompile<BigInt, HardwareInt<E>>>,
+            name: &Option<String>,
+            f: &mut impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> Result<U, V>,
+        ) -> Result<Option<MaybeCompile<BigInt, HardwareInt<U>>>, V> {
+            bound
+                .as_ref()
+                .map(|bound| match bound {
+                    MaybeCompile::Compile(b) => Ok(MaybeCompile::Compile(b.clone())),
+                    MaybeCompile::Hardware(b) => Ok(MaybeCompile::Hardware(map_int(b, name, f)?)),
+                })
+                .transpose()
+        }
+
+        let result = match self {
+            MixedCompoundValue::String(s) => {
+                let mut sub_index = 0;
+                let pieces = s
+                    .pieces
+                    .iter()
+                    .map(|p| match p {
+                        StringPiece::Literal(l) => Ok(StringPiece::Literal(l.clone())),
+                        StringPiece::Substitute(v) => {
+                            let suffix = format_args!("sub{sub_index}");
+                            let expr = with_child_name(name, suffix, |name| f(v, name.as_deref()))?;
+                            sub_index += 1;
+                            Ok(StringPiece::Substitute(HardwareValue {
+                                ty: v.ty.clone(),
+                                domain: v.domain,
+                                expr,
+                            }))
+                        }
+                    })
+                    .try_collect_vec()?;
+                MixedCompoundValue::String(Arc::new(MixedString { pieces }))
+            }
+            MixedCompoundValue::Range(r) => {
+                let r = match r {
+                    RangeValue::Compile(r) => RangeValue::Compile(r.clone()),
+                    RangeValue::HardwareBounds(r) => RangeValue::from_range(Range {
+                        start: with_child_name(name, "start", |name| map_bound(&r.range().start, name, f))?,
+                        end: with_child_name(name, "end", |name| map_bound(&r.range().end, name, f))?,
+                    }),
+                    RangeValue::HardwareStartLength { start, length } => RangeValue::HardwareStartLength {
+                        start: with_child_name(name, "start", |name| map_int(start, name, f))?,
+                        length: length.clone(),
+                    },
+                };
+                MixedCompoundValue::Range(r)
+            }
+            MixedCompoundValue::Tuple(values) => MixedCompoundValue::Tuple(
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| with_child_name(name, i, |name| v.map_hardware_recursive_impl(refs, name, f)))
+                    .try_collect_vec()?,
+            ),
+            MixedCompoundValue::Struct(v) => {
+                let ty_info = refs.shared.elaboration_arenas.struct_info(v.ty);
+                let fields = zip_eq(ty_info.fields.keys(), &v.fields)
+                    .map(|(field_id, v)| {
+                        let suffix = field_id.str(&refs.shared.interner);
+                        with_child_name(name, suffix, |name| v.map_hardware_recursive_impl(refs, name, f))
+                    })
+                    .try_collect_vec()?;
+                MixedCompoundValue::Struct(StructValue { ty: v.ty, fields })
+            }
+            MixedCompoundValue::Enum(v) => {
+                let payload = v
+                    .payload
+                    .as_ref()
+                    .map(|payload| {
+                        let ty_info = refs.shared.elaboration_arenas.enum_info(v.ty);
+                        let (variant_id, _) = ty_info.variants.get_index(v.variant).unwrap();
+                        let suffix = variant_id.str(&refs.shared.interner);
+                        let p =
+                            with_child_name(name, suffix, |name| payload.map_hardware_recursive_impl(refs, name, f))?;
+                        Ok(Box::new(p))
+                    })
+                    .transpose()?;
+
+                MixedCompoundValue::Enum(EnumValue {
+                    ty: v.ty,
+                    variant: v.variant,
+                    payload,
+                })
+            }
+            MixedCompoundValue::BoundMethod(m) => {
+                let self_value = with_child_name(name, "self", |name| {
+                    m.self_value.map_hardware_recursive_impl(refs, name, f)
+                })?;
+                MixedCompoundValue::BoundMethod(BoundMethod {
+                    self_type: m.self_type.clone(),
+                    self_value: Box::new(self_value),
+                    method: Arc::clone(&m.method),
+                })
+            }
+        };
+        Ok(result)
     }
 }
 

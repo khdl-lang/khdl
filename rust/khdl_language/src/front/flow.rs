@@ -9,14 +9,13 @@ use crate::front::signal::{Signal, SignalOrVariable};
 use crate::front::steps::TargetSteps;
 use crate::front::types::{HardwareType, NonHardwareType, Type, Typed};
 use crate::front::value::{
-    BoundMethod, CompileValue, EnumValue, HardwareInt, HardwareValue, MaybeCompile, MaybeUndefined, MixedCompoundValue,
-    MixedString, MixedValue, NotCompile, RangeValue, SimpleCompileValue, StructValue, Value, ValueCommon,
+    CompileValue, HardwareValue, MaybeUndefined, MixedCompoundValue, NotCompile, SimpleCompileValue, Value, ValueCommon,
 };
 use crate::mid::ir::{
     IrAssignmentTarget, IrBlock, IrExpression, IrExpressionLarge, IrLargeArena, IrSignal, IrSignals, IrStatement,
     IrVariable, IrVariableInfo, IrVariables, IrWires,
 };
-use crate::syntax::ast::{MaybeIdentifier, StringPiece, SyncDomain};
+use crate::syntax::ast::{MaybeIdentifier, SyncDomain};
 use crate::syntax::pos::{HasSpan, Span, Spanned};
 use crate::try_inner;
 use crate::util::arena::RandomCheck;
@@ -26,16 +25,13 @@ use crate::util::debug::DebugOnly;
 use crate::util::intern::{Id, MaybeId};
 use crate::util::iter::IterExt;
 use crate::util::lattice::{Lattice, LatticeMerge};
-use crate::util::range::{Range, RangeEmpty};
+use crate::util::range::RangeEmpty;
 use crate::util::range_multi::{ClosedMultiRange, ClosedNonEmptyMultiRange, MultiRange};
-use crate::util::{NON_ZERO_USIZE_ONE, Never, ResultExt, ResultNeverExt};
+use crate::util::{NON_ZERO_USIZE_ONE, ResultExt};
 use indexmap::{IndexMap, IndexSet};
 use itertools::{Itertools, zip_eq};
-use khdl_util::swrite;
 use std::cell::Cell;
-use std::fmt::Display;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub enum FlowKind<C, H> {
@@ -362,9 +358,9 @@ pub trait Flow: FlowPrivate {
                     Value::Simple(value) => VariableValue::Simple(value),
                     Value::Compound(value) => {
                         let var_info = self.var_info(Spanned::new(assignment_span, var))?;
-                        let mut name = Some(var_info.id.str(&refs.shared.interner).unwrap_or("").to_owned());
+                        let name = var_info.id.str(&refs.shared.interner).unwrap_or("").to_owned();
 
-                        let result = map_compound_hardware(refs, &value, &mut name, &mut |e, name| {
+                        let result = value.try_map_hardware_recursive(refs, Some(&name), |e, name| {
                             let flow = self.require_hardware(assignment_span, "assigning hardware value")?;
                             let value = flow.store_hardware_value_in_new_ir_variable(
                                 refs,
@@ -470,10 +466,7 @@ pub trait Flow: FlowPrivate {
             VariableContent::Assigned(value) => match &value.inner {
                 Value::Simple(v) => Value::Simple(v.clone()),
                 Value::Compound(v) => {
-                    let result = map_compound_hardware::<_, _, Never>(refs, v, &mut None, &mut |e, _| {
-                        Ok(IrExpression::Variable(e.expr))
-                    });
-                    Value::Compound(result.remove_never())
+                    Value::Compound(v.map_hardware_recursive(refs, None, |e, _| IrExpression::Variable(e.expr)))
                 }
                 Value::Hardware(v) => {
                     let version = v.version;
@@ -2196,156 +2189,6 @@ fn merge_branch_signal(
     let implied = merged_implied.defined().map(|implied| (version, implied));
 
     Ok((content, implied))
-}
-
-/// Map every hardware value (recursively) contained in a compound value through `f`,
-///   keeping the compile-time parts unchanged.
-fn map_compound_hardware<E: Clone, U, V>(
-    refs: CompileRefs,
-    value: &MixedCompoundValue<E>,
-    name: &mut Option<String>,
-    f: &mut impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> Result<U, V>,
-) -> Result<MixedCompoundValue<U>, V> {
-    fn with_child_name<R>(
-        name: &mut Option<String>,
-        suffix: impl Display,
-        f: impl FnOnce(&mut Option<String>) -> R,
-    ) -> R {
-        let len = name.as_ref().map(String::len);
-        if let Some(name) = name {
-            swrite!(name, "_{suffix}");
-        }
-        let result = f(name);
-        if let (Some(name), Some(len)) = (name, len) {
-            name.truncate(len);
-        }
-        result
-    }
-
-    fn map_value<E: Clone, U, V>(
-        refs: CompileRefs,
-        value: &MixedValue<E>,
-        name: &mut Option<String>,
-        f: &mut impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> Result<U, V>,
-    ) -> Result<MixedValue<U>, V> {
-        match value {
-            Value::Simple(v) => Ok(Value::Simple(v.clone())),
-            Value::Compound(v) => Ok(Value::Compound(map_compound_hardware(refs, v, name, f)?)),
-            Value::Hardware(v) => Ok(Value::Hardware(map_hardware(v, name, f)?)),
-        }
-    }
-
-    fn map_hardware<E: Clone, U, V>(
-        value: &HardwareValue<HardwareType, E>,
-        name: &Option<String>,
-        f: &mut impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> Result<U, V>,
-    ) -> Result<HardwareValue<HardwareType, U>, V> {
-        Ok(HardwareValue {
-            ty: value.ty.clone(),
-            domain: value.domain,
-            expr: f(value, name.as_deref())?,
-        })
-    }
-
-    fn map_int<E: Clone, U, V>(
-        value: &HardwareInt<E>,
-        name: &Option<String>,
-        f: &mut impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> Result<U, V>,
-    ) -> Result<HardwareInt<U>, V> {
-        let value_hw: HardwareValue<HardwareType, E> = value.clone().into();
-        Ok(HardwareValue {
-            ty: value.ty.clone(),
-            domain: value.domain,
-            expr: f(&value_hw, name.as_deref())?,
-        })
-    }
-
-    fn map_bound<E: Clone, U, V>(
-        bound: &Option<MaybeCompile<BigInt, HardwareInt<E>>>,
-        name: &Option<String>,
-        f: &mut impl FnMut(&HardwareValue<HardwareType, E>, Option<&str>) -> Result<U, V>,
-    ) -> Result<Option<MaybeCompile<BigInt, HardwareInt<U>>>, V> {
-        Ok(match bound {
-            None => None,
-            Some(MaybeCompile::Compile(b)) => Some(MaybeCompile::Compile(b.clone())),
-            Some(MaybeCompile::Hardware(b)) => Some(MaybeCompile::Hardware(map_int(b, name, f)?)),
-        })
-    }
-
-    let result = match value {
-        MixedCompoundValue::String(s) => {
-            // name substitutions by their index among the substitutions
-            let mut sub_index = 0;
-            let pieces = s
-                .pieces
-                .iter()
-                .map(|p| {
-                    Ok(match p {
-                        StringPiece::Literal(l) => StringPiece::Literal(l.clone()),
-                        StringPiece::Substitute(v) => {
-                            let suffix = format_args!("sub{sub_index}");
-                            let v = with_child_name(name, suffix, |name| map_hardware(v, name, f))?;
-                            sub_index += 1;
-                            StringPiece::Substitute(v)
-                        }
-                    })
-                })
-                .try_collect_vec()?;
-            MixedCompoundValue::String(Arc::new(MixedString { pieces }))
-        }
-        MixedCompoundValue::Range(r) => MixedCompoundValue::Range(match r {
-            RangeValue::Compile(r) => RangeValue::Compile(r.clone()),
-            RangeValue::HardwareBounds(r) => RangeValue::from_range(Range {
-                start: with_child_name(name, "start", |name| map_bound(&r.range().start, name, f))?,
-                end: with_child_name(name, "end", |name| map_bound(&r.range().end, name, f))?,
-            }),
-            RangeValue::HardwareStartLength { start, length } => RangeValue::HardwareStartLength {
-                start: with_child_name(name, "start", |name| map_int(start, name, f))?,
-                length: length.clone(),
-            },
-        }),
-        MixedCompoundValue::Tuple(values) => MixedCompoundValue::Tuple(
-            values
-                .iter()
-                .enumerate()
-                .map(|(i, v)| with_child_name(name, i, |name| map_value(refs, v, name, f)))
-                .try_collect_vec()?,
-        ),
-        MixedCompoundValue::Struct(v) => {
-            let ty_info = refs.shared.elaboration_arenas.struct_info(v.ty);
-            MixedCompoundValue::Struct(StructValue {
-                ty: v.ty,
-                fields: zip_eq(ty_info.fields.keys(), &v.fields)
-                    .map(|(field_id, v)| {
-                        let suffix = field_id.str(&refs.shared.interner);
-                        with_child_name(name, suffix, |name| map_value(refs, v, name, f))
-                    })
-                    .try_collect_vec()?,
-            })
-        }
-        MixedCompoundValue::Enum(v) => MixedCompoundValue::Enum(EnumValue {
-            ty: v.ty,
-            variant: v.variant,
-            payload: match &v.payload {
-                None => None,
-                Some(p) => {
-                    let ty_info = refs.shared.elaboration_arenas.enum_info(v.ty);
-                    let (variant_id, _) = ty_info.variants.get_index(v.variant).unwrap();
-                    let suffix = variant_id.str(&refs.shared.interner);
-                    let p = with_child_name(name, suffix, |name| map_value(refs, p, name, f))?;
-                    Some(Box::new(p))
-                }
-            },
-        }),
-        MixedCompoundValue::BoundMethod(m) => MixedCompoundValue::BoundMethod(BoundMethod {
-            self_type: m.self_type.clone(),
-            self_value: Box::new(with_child_name(name, "self", |name| {
-                map_value(refs, &m.self_value, name, f)
-            })?),
-            method: Arc::clone(&m.method),
-        }),
-    };
-    Ok(result)
 }
 
 impl VariableContent {
