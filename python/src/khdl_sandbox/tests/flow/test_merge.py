@@ -262,6 +262,21 @@ def test_merge_tuple_vs_int():
         compile_custom(src).resolve("top.top")
 
 
+def test_merge_split_hardware_parent(tmp_dir: Path):
+    # this was a bug at some point:
+    #   when the parent value was a hardware tuple that had to be split into fields,
+    #   the fields were extracted in the branches but read in the parent
+    src = """
+    var r = a1;
+    if (a0) { r = (a2, true); }
+    return r.0;
+    """
+    e = compare_body(["bool", "Tuple(uint(8), bool)", "uint(8)"], "uint(8)", src, tmp_dir)
+    for c in [False, True]:
+        for x in [0, 5, 255]:
+            e.eval_assert([c, (x, False), 7], 7 if c else x)
+
+
 def test_merge_partially_assigned():
     src = """
     module top ports(c: in async bool) {

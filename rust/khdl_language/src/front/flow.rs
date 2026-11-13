@@ -1746,12 +1746,38 @@ impl FlowHardwareBranch<'_> {
     }
 }
 
+struct MergeContents {
+    /// only set if one of the branches is [BranchContent::AssignedBranch]
+    parent: Option<Spanned<VariableValue>>,
+    branches: Vec<BranchContent>,
+}
+
 enum BranchContent {
     Undefined,
-    Assigned {
-        parent: bool,
-        value: Spanned<VariableValue>,
-    },
+    AssignedParent,
+    AssignedBranch(Spanned<VariableValue>),
+}
+
+impl MergeContents {
+    fn branch_value<'s>(&'s self, branch: &'s BranchContent) -> MaybeUndefined<(bool, &'s Spanned<VariableValue>)> {
+        match branch {
+            BranchContent::Undefined => MaybeUndefined::Undefined,
+            BranchContent::AssignedParent => {
+                let parent = self.parent.as_ref().expect("parent must exist");
+                MaybeUndefined::Defined((true, parent))
+            }
+            BranchContent::AssignedBranch(value) => MaybeUndefined::Defined((false, value)),
+        }
+    }
+
+    fn distinct_values(&self) -> impl Iterator<Item = (bool, &Spanned<VariableValue>)> {
+        let parent = self.parent.iter().map(|value| (true, value));
+        let branches = self.branches.iter().filter_map(|branch| match branch {
+            BranchContent::AssignedBranch(value) => Some((false, value)),
+            BranchContent::Undefined | BranchContent::AssignedParent => None,
+        });
+        parent.chain(branches)
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -1815,13 +1841,16 @@ fn merge_branch_variable(
     parent_flow: &mut FlowHardware,
     branch_flows: &mut [FlowHardwareBranchContent],
 ) -> DiagResult<VariableContent> {
+    // extract info
     let var_spanned = Spanned::new(span_merge, var);
     let var_info = parent_flow.var_info(var_spanned)?;
+
+    // collect branch (and maybe parent) contents
     let parent_content = parent_flow.var_get_content(var_spanned)?;
+    let mut any_parent_content = None;
+    let mut branch_contents = Vec::with_capacity(branch_flows.len());
     let mut all_undefined = true;
 
-    // collect branch contents
-    let mut branch_contents = Vec::with_capacity(branch_flows.len());
     for branch in &*branch_flows {
         let (parent, content) = match branch.common.variables.get(&var.index) {
             Some(branch_slot) => {
@@ -1832,27 +1861,29 @@ fn merge_branch_variable(
                 let content = branch_slot.content.as_ref().unwrap();
                 (false, content)
             }
-            None => {
-                // fallback to parent
-                (true, parent_content)
-            }
+            None => (true, parent_content),
         };
 
-        // early exit for special cases
         let content = match content {
-            VariableContent::Assigned(value) => BranchContent::Assigned {
-                parent,
-                value: value.clone(),
-            },
-            VariableContent::NotFullyAssigned(kind) => match kind {
-                VariableNotFullyAssigned::NotYetAssigned | VariableNotFullyAssigned::PartiallyAssigned => {
-                    // we know this variable is partially assigned: at least one branch must have a new value,
-                    //   otherwise this merge function would not have been called at all
-                    let content = VariableContent::NotFullyAssigned(VariableNotFullyAssigned::PartiallyAssigned);
-                    return Ok(content);
+            VariableContent::Assigned(value) => {
+                if parent {
+                    // only clone the parent value once
+                    any_parent_content.get_or_insert_with(|| value.clone());
+                    BranchContent::AssignedParent
+                } else {
+                    BranchContent::AssignedBranch(value.clone())
                 }
-                VariableNotFullyAssigned::Undefined => BranchContent::Undefined,
-            },
+            }
+            VariableContent::NotFullyAssigned(kind) => {
+                match kind {
+                    VariableNotFullyAssigned::Undefined => BranchContent::Undefined,
+                    VariableNotFullyAssigned::NotYetAssigned | VariableNotFullyAssigned::PartiallyAssigned => {
+                        // we know the variable is partially assigned, otherwise merging would never have started
+                        let contente = VariableContent::NotFullyAssigned(VariableNotFullyAssigned::PartiallyAssigned);
+                        return Ok(contente);
+                    }
+                }
+            }
             &VariableContent::Error(e) => return Err(e),
         };
 
@@ -1865,7 +1896,11 @@ fn merge_branch_variable(
         return Ok(VariableContent::NotFullyAssigned(VariableNotFullyAssigned::Undefined));
     }
 
-    // start merging, top-down
+    // start merging, recursively
+    let contents = MergeContents {
+        parent: any_parent_content,
+        branches: branch_contents,
+    };
     let result = merge_branch_variable_part(
         refs,
         large,
@@ -1875,7 +1910,7 @@ fn merge_branch_variable(
         var_info.join_ir_variable,
         parent_flow,
         branch_flows,
-        branch_contents,
+        contents,
     )?;
     Ok(VariableContent::Assigned(Spanned::new(span_merge, result)))
 }
@@ -1889,7 +1924,7 @@ fn merge_branch_variable_part(
     join_var: Option<IrVariable>,
     parent_flow: &mut FlowHardware,
     branch_flows: &mut [FlowHardwareBranchContent],
-    branch_contents: Vec<BranchContent>,
+    contents: MergeContents,
 ) -> DiagResult<VariableValue> {
     let elab = &refs.shared.elaboration_arenas;
 
@@ -1898,12 +1933,7 @@ fn merge_branch_variable_part(
     let mut merged_type = Type::Undefined;
 
     // compare contents
-    for content in &branch_contents {
-        let value = match content {
-            BranchContent::Undefined => continue,
-            BranchContent::Assigned { parent: _, value } => value,
-        };
-
+    for (_, value) in contents.distinct_values() {
         let is_compound = matches!(value.inner, VariableValue::Compound(_));
         let is_compile = match CompileValue::try_from(&value.inner) {
             Ok(v) => Lattice::Defined(v),
@@ -1940,8 +1970,8 @@ fn merge_branch_variable_part(
                         span_decl,
                         path,
                         parent_flow,
-                        branch_contents,
                         branch_flows,
+                        contents,
                         ty.len(),
                         MergeStep::TupleIndex,
                         |base, index| match base {
@@ -1979,8 +2009,8 @@ fn merge_branch_variable_part(
                     span_decl,
                     path,
                     parent_flow,
-                    branch_contents,
                     branch_flows,
+                    contents,
                     info.fields.len(),
                     |index| MergeStep::StructField(info.fields[index].0.inner),
                     |base, index| match base {
@@ -2021,7 +2051,7 @@ fn merge_branch_variable_part(
     let ty = match merged_type.as_hardware_type(elab) {
         Ok(ty) => ty,
         Err(NonHardwareType) => {
-            let e = error_merge_non_hardware(refs, span_merge, span_decl, path, &merged_type, &branch_contents);
+            let e = error_merge_non_hardware(refs, span_merge, span_decl, path, &merged_type, &contents);
             return Err(e);
         }
     };
@@ -2041,76 +2071,70 @@ fn merge_branch_variable_part(
     let mut merged_version = Lattice::Undefined;
     let mut merged_implications: Lattice<BoolImplications> = Lattice::Undefined;
     let mut merged_implied: Lattice<Implied> = Lattice::Undefined;
-    let mut any_parent = None;
 
-    for (flow, content) in zip_eq(branch_flows, branch_contents) {
+    for (flow, content) in zip_eq(branch_flows, &contents.branches) {
         merged_domain = merged_domain.join(flow.cond_domain.inner);
 
-        match content {
-            BranchContent::Undefined => {
+        let (value_parent, value) = match contents.branch_value(content) {
+            MaybeUndefined::Undefined => {
                 // TODO store undef or skip the store entirely?
+                continue;
             }
-            BranchContent::Assigned { parent, ref value } => {
-                let (branch_version, branch_implications) = match &value.inner {
-                    Value::Hardware(v) => (
-                        Lattice::Defined(v.expr.version),
-                        Lattice::Defined(v.expr.implications.clone()),
-                    ),
-                    Value::Simple(_) | Value::Compound(_) => (Lattice::Different, Lattice::Different),
-                };
-                let branch_implied = match &value.inner {
-                    // compile values give us full info
-                    Value::Simple(SimpleCompileValue::Bool(v)) => Lattice::Defined(Implied::BoolConst(*v)),
-                    Value::Simple(SimpleCompileValue::Int(v)) => {
-                        Lattice::Defined(Implied::IntRange(ClosedNonEmptyMultiRange::single(v.clone())))
-                    }
-                    // hardware values might contain info
-                    Value::Hardware(v) => {
-                        let version = v.expr.version;
-                        let implied = flow
-                            .common
-                            .implied
-                            .get(&version)
-                            .or_else(|| parent_flow.get_implied(version));
+            MaybeUndefined::Defined(value) => value,
+        };
 
-                        if let Some(implied) = implied {
-                            Lattice::Defined(implied.clone())
-                        } else {
-                            if let HardwareType::Int(range) = &v.ty {
-                                Lattice::Defined(Implied::IntRange(range.clone()))
-                            } else {
-                                Lattice::Different
-                            }
-                        }
-                    }
-                    Value::Simple(_) | Value::Compound(_) => Lattice::Different,
-                };
+        let (branch_version, branch_implications) = match &value.inner {
+            Value::Hardware(v) => (
+                Lattice::Defined(v.expr.version),
+                Lattice::Defined(v.expr.implications.clone()),
+            ),
+            Value::Simple(_) | Value::Compound(_) => (Lattice::Different, Lattice::Different),
+        };
+        let branch_implied = match &value.inner {
+            // compile values give us full info
+            Value::Simple(SimpleCompileValue::Bool(v)) => Lattice::Defined(Implied::BoolConst(*v)),
+            Value::Simple(SimpleCompileValue::Int(v)) => {
+                Lattice::Defined(Implied::IntRange(ClosedNonEmptyMultiRange::single(v.clone())))
+            }
+            // hardware values might contain info
+            Value::Hardware(v) => {
+                let version = v.expr.version;
+                let implied = flow
+                    .common
+                    .implied
+                    .get(&version)
+                    .or_else(|| parent_flow.get_implied(version));
 
-                merged_version = merged_version.merge_eq(branch_version);
-                merged_implications =
-                    merged_implications.merge(branch_implications, |a, b| LatticeMerge::Defined(a.join(&b)));
-                merged_implied = merged_implied.merge(branch_implied, Implied::lattice_merge);
-
-                if parent {
-                    // all parent values will point to the same value, just remember one
-                    if any_parent.is_none() {
-                        any_parent = Some(value.inner.clone());
-                    }
+                if let Some(implied) = implied {
+                    Lattice::Defined(implied.clone())
                 } else {
-                    let value = variable_value_as_value(refs, &value.inner);
-                    merged_domain = merged_domain.join(value.domain());
-
-                    let value = value.as_ir_expression_unchecked(refs, large, span_merge, &ty)?;
-                    let stmt = IrStatement::Assign(IrAssignmentTarget::simple(var_ir), value);
-                    flow.common.statements.push(Spanned::new(span_merge, stmt));
+                    if let HardwareType::Int(range) = &v.ty {
+                        Lattice::Defined(Implied::IntRange(range.clone()))
+                    } else {
+                        Lattice::Different
+                    }
                 }
             }
+            Value::Simple(_) | Value::Compound(_) => Lattice::Different,
+        };
+
+        merged_version = merged_version.merge_eq(branch_version);
+        merged_implications = merged_implications.merge(branch_implications, |a, b| LatticeMerge::Defined(a.join(&b)));
+        merged_implied = merged_implied.merge(branch_implied, Implied::lattice_merge);
+
+        if !value_parent {
+            let value = variable_value_as_value(refs, &value.inner);
+            merged_domain = merged_domain.join(value.domain());
+
+            let value = value.as_ir_expression_unchecked(refs, large, span_merge, &ty)?;
+            let stmt = IrStatement::Assign(IrAssignmentTarget::simple(var_ir), value);
+            flow.common.statements.push(Spanned::new(span_merge, stmt));
         }
     }
 
     // * store parent value if necessary
-    if let Some(value) = any_parent {
-        let value = variable_value_as_value(refs, &value);
+    if let Some(value) = &contents.parent {
+        let value = variable_value_as_value(refs, &value.inner);
         merged_domain = merged_domain.join(value.domain());
 
         let value = value.as_ir_expression_unchecked(refs, large, span_merge, &ty)?;
@@ -2137,15 +2161,15 @@ fn merge_branch_variable_part(
     }))
 }
 
-fn merge_branch_variable_part_compound<'a>(
+fn merge_branch_variable_part_compound(
     refs: CompileRefs,
     large: &mut IrLargeArena,
     span_merge: Span,
     span_decl: Span,
     path: MergePath,
-    flow_parent: &mut FlowHardware,
-    branch_contents: Vec<BranchContent>,
+    parent_flow: &mut FlowHardware,
     branch_flows: &mut [FlowHardwareBranchContent],
+    contents: MergeContents,
     field_count: usize,
     field_step: impl Fn(usize) -> MergeStep,
     field_extract_compound: impl Fn(&MixedCompoundValue<VariableAtom>, usize) -> DiagResult<VariableValue>,
@@ -2158,56 +2182,66 @@ fn merge_branch_variable_part_compound<'a>(
         .map(|field_index| {
             let child_path = path.child(field_step(field_index));
 
-            // TODO avoid allocation?
-            let child_contents = branch_contents
+            // extract the field from a value,
+            //   `branch_index` is the branch to store extracted hardware fields in, or `None` for the parent flow
+            let mut extract = |value: &Spanned<VariableValue>, branch_index: Option<usize>| {
+                let value_span = value.span;
+                let value = match &value.inner {
+                    VariableValue::Compound(value) => field_extract_compound(value, field_index)?,
+                    VariableValue::Hardware(value) => {
+                        // extract field
+                        let HardwareValue { ty, domain, expr } = field_extract_hardware(value, field_index)?;
+                        let expr = large.push_expr(expr);
+
+                        // create variable
+                        let var_ir_info = IrVariableInfo {
+                            ty: ty.as_ir(refs),
+                            debug_info_span: span_decl,
+                            debug_info_id: child_path.debug_id(&refs.shared.interner),
+                        };
+                        let var_ir = parent_flow.new_ir_variable(var_ir_info);
+
+                        // store into variable
+                        let target = IrAssignmentTarget::simple(var_ir);
+                        let stmt_store = Spanned::new(span_merge, IrStatement::Assign(target, expr));
+                        match branch_index {
+                            None => parent_flow.push_ir_statement(stmt_store),
+                            Some(branch_index) => branch_flows[branch_index].common.statements.push(stmt_store),
+                        }
+
+                        // wrap as value again
+                        let expr = VariableAtom {
+                            var_ir,
+                            version: parent_flow.root().next_version(),
+                            implications: BoolImplications::NONE,
+                        };
+                        MixedValue::Hardware(HardwareValue { ty, domain, expr })
+                    }
+                    VariableValue::Simple(_) => {
+                        return Err(refs.diags.report_error_internal(value_span, "expected struct or tuple"));
+                    }
+                };
+                Ok(Spanned::new(value_span, value))
+            };
+
+            let child_parent = contents.parent.as_ref().map(|value| extract(value, None)).transpose()?;
+            let child_branches = contents
+                .branches
                 .iter()
                 .enumerate()
                 .map(|(branch_index, content)| match content {
                     BranchContent::Undefined => Ok(BranchContent::Undefined),
-                    &BranchContent::Assigned { parent, ref value } => {
-                        let value_span = value.span;
-                        let value = match &value.inner {
-                            VariableValue::Compound(value) => field_extract_compound(value, field_index)?,
-                            VariableValue::Hardware(value) => {
-                                // extract field
-                                let HardwareValue { ty, domain, expr } = field_extract_hardware(value, field_index)?;
-                                let expr = large.push_expr(expr);
-
-                                // create variable
-                                let var_ir_info = IrVariableInfo {
-                                    ty: ty.as_ir(refs),
-                                    debug_info_span: span_decl,
-                                    debug_info_id: child_path.debug_id(&refs.shared.interner),
-                                };
-                                let var_ir = flow_parent.new_ir_variable(var_ir_info);
-
-                                // store into variable
-                                let target = IrAssignmentTarget::simple(var_ir);
-                                let stmt_store = IrStatement::Assign(target, expr);
-                                branch_flows[branch_index]
-                                    .common
-                                    .statements
-                                    .push(Spanned::new(span_merge, stmt_store));
-
-                                // wrap as value again
-                                let expr = VariableAtom {
-                                    var_ir,
-                                    version: flow_parent.root().next_version(),
-                                    implications: BoolImplications::NONE,
-                                };
-                                MixedValue::Hardware(HardwareValue { ty, domain, expr })
-                            }
-                            VariableValue::Simple(_) => {
-                                return Err(refs.diags.report_error_internal(value_span, "expected struct or tuple"));
-                            }
-                        };
-
-                        let value = Spanned::new(value_span, value);
-                        Ok(BranchContent::Assigned { parent, value })
+                    BranchContent::AssignedParent => Ok(BranchContent::AssignedParent),
+                    BranchContent::AssignedBranch(value) => {
+                        Ok(BranchContent::AssignedBranch(extract(value, Some(branch_index))?))
                     }
                 })
                 .try_collect_vec()?;
 
+            let child_contents = MergeContents {
+                parent: child_parent,
+                branches: child_branches,
+            };
             merge_branch_variable_part(
                 refs,
                 large,
@@ -2215,7 +2249,7 @@ fn merge_branch_variable_part_compound<'a>(
                 span_decl,
                 child_path,
                 None,
-                flow_parent,
+                parent_flow,
                 branch_flows,
                 child_contents,
             )
@@ -2229,7 +2263,7 @@ fn error_merge_non_hardware(
     span_decl: Span,
     path: MergePath,
     merged_type: &Type,
-    branch_contents: &[BranchContent],
+    contents: &MergeContents,
 ) -> DiagError {
     let elab = &refs.shared.elaboration_arenas;
 
@@ -2241,40 +2275,25 @@ fn error_merge_non_hardware(
         problematic: bool,
     }
 
-    let mut infos: Vec<ValueInfo> = vec![];
-    let mut any_parent = false;
+    let infos = contents
+        .distinct_values()
+        .map(|(parent, value)| {
+            let ty = value.inner.ty();
 
-    for content in branch_contents {
-        match content {
-            BranchContent::Undefined => {
-                // do nothing
+            let splittable = matches!(
+                value.inner,
+                VariableValue::Compound(MixedCompoundValue::Tuple(_) | MixedCompoundValue::Struct(_))
+            );
+            let problematic = !splittable && ty.as_hardware_type(elab).is_err();
+
+            ValueInfo {
+                span: value.span,
+                parent,
+                ty,
+                problematic,
             }
-            &BranchContent::Assigned { parent, ref value } => {
-                // record parent value only once
-                if parent {
-                    if any_parent {
-                        continue;
-                    }
-                    any_parent = true;
-                }
-
-                let ty = value.inner.ty();
-
-                let splittable = matches!(
-                    value.inner,
-                    VariableValue::Compound(MixedCompoundValue::Tuple(_) | MixedCompoundValue::Struct(_))
-                );
-                let problematic = !splittable && ty.as_hardware_type(elab).is_err();
-
-                infos.push(ValueInfo {
-                    span: value.span,
-                    parent,
-                    ty,
-                    problematic,
-                });
-            }
-        }
-    }
+        })
+        .collect_vec();
 
     // describe what is being merged
     let path_str = path.to_string(&refs.shared.interner);
